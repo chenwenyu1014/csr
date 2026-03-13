@@ -37,9 +37,17 @@ from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, HTTPException, Form
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Windows Bridge Service", version="1.0.0")
-logger = logging.getLogger(__name__)
+# 配置详细日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s(%(lineno)s) - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 
+# 设置本模块的logger级别
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+app = FastAPI(title="Windows Bridge Service", version="1.0.0")
 # ============================================================
 # Windows 串行任务锁（防止 win32/Office COM 并发导致崩溃）
 #
@@ -866,7 +874,10 @@ def _content_control_insert_direct_impl(*, template_file: str, data_json: str, r
             })
         else:
             raise HTTPException(status_code=500, detail=f"插入失败: {result.error}")
-            
+
+    except HTTPException as e:
+        logger.error(f"❌ 处理失败: {e.detail}")
+        raise e
     except FileNotFoundError as e:
         error_msg = f"文件不存在: {str(e)}"
         logger.error(f"❌ {error_msg}")
@@ -1254,18 +1265,7 @@ def _preprocessing_process_impl(
 
 if __name__ == "__main__":
     import uvicorn
-    
-    # 配置详细日志
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler()
-        ]
-    )
-    
-    # 设置本模块的logger级别
-    logger.setLevel(logging.INFO)
+
     
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8081"))

@@ -62,14 +62,26 @@ async def preprocess_batch_simple(
           "task_id": "batch_20241206_123456",
           "total_files": 1
         }
-    
-    完成后回调到callback_url：
+
+    完成后回调到 callback_url（每个文件一个请求）：
+        Content-Type: application/json
+
+        成功场景:
         {
-          "dataJson": [{
-            "id": "f1",
-            "status": "success",
-            "preprocessed_json": "..."
-          }]
+          "id": "f1",
+          "filename": "test.docx",
+          "status": "success",
+          "sha256": "a1b2c3d4e5f6...",
+        }
+
+        失败场景:
+        {
+          "id": "f1",
+          "filename": "test.docx",
+          "status": "fail",
+          "sha256": "",
+          "err_msg": "处理异常",
+          "error": "File format not supported"
         }
     """
     try:
