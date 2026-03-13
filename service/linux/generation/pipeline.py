@@ -632,15 +632,16 @@ class CSRGenerationPipeline:
                         # TFL占位符
                         all_parts.extend(tfl_placeholders)
                         logger.info(f"✅ 已附加{len(tfl_placeholders)}个TFL占位符到段落末尾: {tfl_placeholders}")
-                    if placeholders_to_insert:
-                        # 图表占位符
-                        all_parts.extend(placeholders_to_insert)
-                        logger.info(f"✅ 已附加{len(placeholders_to_insert)}个图表占位符到段落末尾: {placeholders_to_insert}")
+                    # word 可以提取到表格占位符，不需要手动添加
+                    # if placeholders_to_insert:
+                    #     # 图表占位符
+                    #     all_parts.extend(placeholders_to_insert)
+                    #     logger.info(f"✅ 已附加{len(placeholders_to_insert)}个图表占位符到段落末尾: {placeholders_to_insert}")
 
 
                 generated_content = "\n\n".join(all_parts).strip()
                 # 去掉MD格式
-                # generated_content = self._remove_md_formatting(generated_content)
+                generated_content = self._remove_md_formatting(generated_content)
 
                 # 流式事件：生成阶段（跳过模型）也推送汇总文本预览
                 try:

@@ -333,6 +333,8 @@ class DataSourceValidator:
         model_output_raw = None
         model_output_path: Optional[Path] = None
         parsed: Optional[Dict[str, Any]] = None
+        max_retries = 2
+        retry_count = 0
         try:
             logger.info("[异步] 调用模型生成...")
             # 使用异步版本的 LLM 调用
@@ -343,20 +345,29 @@ class DataSourceValidator:
             model_output_path = self._save_model_output(model_output_raw, prefix="data_source_validation_output", task_name=task_name)
             if model_output_path:
                 logger.info(f"[异步] 模型原始输出已保存: {model_output_path}")
-            
-            parsed = self._parse_json_response(model_output_raw)
-            
-            # 如果解析失败，记录详细错误信息
+
+            while retry_count <= max_retries:
+                parsed = self._parse_json_response(model_output_raw)
+                if parsed is not None:
+                    logger.info(f"[异步] ✓ JSON 解析成功，包含 {len(parsed)} 个顶层键 (尝试 {retry_count + 1}/{max_retries + 1})")
+                    break
+
+                # 如果解析失败，记录详细错误信息
+                if retry_count < max_retries:
+                    retry_count += 1
+                    logger.info(f"[异步] 发起第 {retry_count} 次重试...")
+                    model_output_raw = await self.llm.generate_single_async(prompt_text)
+                    logger.info(f"[异步] 模型返回完成，输出长度={len(model_output_raw) if model_output_raw else 0}")
+                    # 保存模型原始输出
+                    model_output_path = self._save_model_output(model_output_raw,prefix="data_source_validation_output",task_name=task_name)
+                else:
+                    logger.error(f"[异步] ❌ JSON 解析失败 - 已达最大重试次数 ({max_retries}) - 模型输出前 500 字符：{model_output_raw[:500] if model_output_raw else 'None'}")
+                    break
             if parsed is None:
-                logger.error(
-                    f"[异步] ❌ JSON解析失败 - 模型输出前500字符: {model_output_raw[:500] if model_output_raw else 'None'}"
-                )
                 logger.error(f"[异步] 提示词路径: {prompt_path}")
                 if model_output_path:
                     logger.error(f"[异步] 模型输出路径: {model_output_path}")
-            else:
-                logger.info(f"[异步] ✓ JSON解析成功，包含 {len(parsed)} 个顶层键")
-            
+
             return ValidationResult(
                 success=(parsed is not None),
                 prompt_path=str(prompt_path) if prompt_path else None,

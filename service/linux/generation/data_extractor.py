@@ -613,17 +613,21 @@ class DataExtractorV2:
             from service.linux.generation.extraction.two_stage_extraction_service import two_stage_extraction_service
             from service.linux.generation.extraction.validated_extraction_service import validated_extraction_service
 
-            # 若是原文模式，在提示词中附加保留占位符说明
+            # 若是原文模式，在提示词中附加保证提取原文本内容
             if original_mode:
                 extraction_query_with_instruction = (
                     f"{extract_prompt}\n\n"
-                    "【重要1】请保留原文中的所有占位符标签，如 {{Table_1_Start}}、{{Table_1_End}}、"
-                    "{{Image_1_Start}}、{{Image_1_End}} 等。不要删除或修改这些标签，保持原样。\n"
-                    "【重要2】请仅识别并筛选出与上述需求相关的段落/分块ID。"
-                    "不需要生成新的总结文本，后续系统将直接提取这些分块的原文。"
+                    "【重要】当前为原文模式，请保留原文措辞，不要改写或总结。"
                 )
             else:
                 extraction_query_with_instruction = extract_prompt
+            # 若是引用图表，在提示词中附加保留占位符说明
+            if insert_original:
+                extraction_query_with_instruction = (
+                    f"{extraction_query_with_instruction}\n\n"
+                    "【重要】当前为引用图表模式，请保留原文中的所有占位符标签，如 {{Table_1_Start}}、{{Table_1_End}}、"
+                    "{{Image_1_Start}}、{{Image_1_End}} 等。不要删除或修改这些标签，保持原样。\n"
+                )
 
             # 环境上下文：段落ID
             import os
