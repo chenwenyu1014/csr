@@ -226,33 +226,92 @@ class WordControlContentInserter:
             pass
     
     @staticmethod
-    def _clean_text_for_word(text: str) -> str:
+    def _clean_text_for_word(self, text: str) -> str:
         """
-        清理文本中可能导致 Word COM 错误的特殊字符
-        
-        Word 的 Range.Text 属性对某些字符敏感：
-        - 控制字符（\x00-\x08, \x0B, \x0C, \x0E-\x1F）
-        - 段落标记（\x07）
-        - 零宽字符（\u200B-\u200D, \uFEFF）
+        清理文本中可能导致 Word COM 报错的字符
+
+        Word COM 的 InsertAfter / Range.Text 对以下字符零容忍：
+        - 不间断空格 \u00A0
+        - 零宽字符 \u200B \u200C \u200D \uFEFF
+        - 软连字符 \u00AD
+        - 行尾不可见空格（Markdown two-space line break）
+        - 其他 Unicode 特殊空白和控制字符
         """
-        import re
-        
         if not text:
             return ""
-        
-        # 移除常见的控制字符（保留 \t=0x09, \n=0x0A, \r=0x0D）
-        cleaned = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', text)
-        
-        # 移除段落标记（Word 特殊字符 \x07 是单元格结束标记）
-        cleaned = cleaned.replace('\x07', '')
-        
-        # 移除零宽字符
-        cleaned = re.sub(r'[\u200B-\u200D\uFEFF]', '', cleaned)
-        
-        # 移除其他可能有问题的 Unicode 控制字符
-        cleaned = re.sub(r'[\u0000-\u0008\u000B\u000C\u000E-\u001F]', '', cleaned)
-        
-        return cleaned
+        original_text = text
+        import re
+
+        # 1. 统一换行符
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+        # 2. 替换各种特殊空白为普通空格
+        special_spaces = [
+            '\u00A0',  # 不间断空格 (Non-Breaking Space)
+            '\u2002',  # En Space
+            '\u2003',  # Em Space
+            '\u2004',  # Three-Per-Em Space
+            '\u2005',  # Four-Per-Em Space
+            '\u2006',  # Six-Per-Em Space
+            '\u2007',  # Figure Space
+            '\u2008',  # Punctuation Space
+            '\u2009',  # Thin Space
+            '\u200A',  # Hair Space
+            '\u202F',  # Narrow No-Break Space
+            '\u205F',  # Medium Mathematical Space
+            '\u3000',  # 全角空格 (Ideographic Space)
+        ]
+        for sp in special_spaces:
+            text = text.replace(sp, ' ')
+
+        # 3. 删除零宽字符和不可见字符
+        invisible_chars = [
+            '\u200B',  # 零宽空格 (Zero Width Space)
+            '\u200C',  # 零宽不连字 (Zero Width Non-Joiner)
+            '\u200D',  # 零宽连字 (Zero Width Joiner)
+            '\u200E',  # 从左到右标记
+            '\u200F',  # 从右到左标记
+            '\uFEFF',  # BOM / 零宽不间断空格
+            '\u00AD',  # 软连字符 (Soft Hyphen)
+            '\u2028',  # 行分隔符 (Line Separator)
+            '\u2029',  # 段分隔符 (Paragraph Separator)
+        ]
+        for ch in invisible_chars:
+            text = text.replace(ch, '')
+
+        # 4. 清理 Markdown 行尾两个空格（LLM 常见输出，会产生不可见尾部空格）
+        #    "内容  \n" -> "内容\n"
+        text = re.sub(r'  +\n', '\n', text)
+        text = re.sub(r' +\n', '\n', text)
+
+        # 5. 逐字符过滤残余控制字符
+        #    保留：普通可打印字符、\n（换行）、\t（制表符）
+        #    替换：其他 ASCII 控制字符（\x00-\x1F 中除 \t \n 外）
+        cleaned = []
+        for ch in text:
+            code = ord(ch)
+            if ch in ('\n', '\t'):
+                cleaned.append(ch)
+            elif code < 0x20:
+                # 其他控制字符用空格替代（不直接删除，避免词语粘连）
+                cleaned.append(' ')
+            elif code == 0xFFFD:
+                # Unicode 替换字符
+                cleaned.append(' ')
+            else:
+                cleaned.append(ch)
+        text = ''.join(cleaned)
+
+        # 6. 压缩连续空行（超过2个换行压缩为2个）
+        text = re.sub(r'\n{3,}', '\n\n', text)
+
+        # 7. 去掉首尾空白
+        text = text.strip()
+
+        if text != original_text:
+            logger.debug(f"  文本清洗: {len(original_text)} -> {len(text)} 字符")
+
+        return text
     
     def detect_file_orientation(self, file_path: str) -> str:
         """
@@ -822,7 +881,7 @@ class WordControlContentInserter:
                             logger.error(f"  内容长度: {len(generated_content)} 字符")
                             logger.error(f"  内容前200字符: {generated_content[:200]}")
                             raise
-                        continue
+                    continue
                 
                 # 检测方向并分类
                 logger.info("  检测文件方向...")
@@ -840,13 +899,14 @@ class WordControlContentInserter:
                 logger.info(f"  分类结果: 纵向{len(portrait_list)}个, 横向{len(landscape_list)}个")
                 
                 # 在控件内插入内容（占位符作为文本插入）
-                self.insert_to_control(
-                    doc,
-                    control,
-                    generated_content,
-                    portrait_list,
-                    landscape_list
-                )
+                for control in controls:
+                    self.insert_to_control(
+                        doc,
+                        control,
+                        generated_content,
+                        portrait_list,
+                        landscape_list
+                    )
                 
                 inserted_controls.append(control_title)
             
@@ -989,6 +1049,13 @@ class WordControlContentInserter:
             logger.error(f"❌ 插入失败: {e}")
             import traceback
             traceback.print_exc()
+            # ✅ 出错时也要尝试关闭文档，否则文件会被锁定
+            try:
+                if 'doc' in dir() or 'doc' in locals():
+                    doc.Close(SaveChanges=False)  # False = 不保存，直接关闭
+                    logger.info("🔒 异常退出：文档已关闭（不保存）")
+            except Exception as close_err:
+                logger.warning(f"异常退出时关闭文档失败: {close_err}")
             
             return ContentInsertResult(
                 success=False,
