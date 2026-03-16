@@ -143,6 +143,8 @@ class AllocationService:
                 else:
                     matched_files = []
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 logger.error(f"匹配执行失败 ({item.get('id', 'unknown')}): {e}")
                 matched_files = []
 

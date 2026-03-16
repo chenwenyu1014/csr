@@ -108,6 +108,8 @@ class ParagraphGenerationService:
             logger.debug(f"生成提示词已保存: {prompt_file}")
             return prompt_file
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"保存生成提示词失败: {e}")
             return None
 
@@ -131,6 +133,8 @@ class ParagraphGenerationService:
             logger.debug(f"生成原始输出已保存: {out_file}")
             return out_file
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"保存生成原始输出失败: {e}")
             return None
 
@@ -216,6 +220,8 @@ class ParagraphGenerationService:
                 debug_data = json.dumps(extracted_data, ensure_ascii=False, indent=2)
                 logger.info(f"📋 extracted_data结构预览:\n{debug_data[:1000]}...")
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 logger.warning(f"无法序列化extracted_data: {e}")
 
             # ✅ 遍历extracted_items，处理每个提取结果
@@ -425,6 +431,8 @@ class ParagraphGenerationService:
             }
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             para_timer.stop()
             logger.error(f"✗ 生成失败: {e} [耗时: {para_timer.duration_str}]")
             _task_log_error(f"段落生成失败: {paragraph_id}", exc=e, paragraph_id=paragraph_id)
@@ -656,6 +664,8 @@ class ParagraphGenerationService:
             return filepath
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"保存生成溯源数据失败: {e}")
             return None
 

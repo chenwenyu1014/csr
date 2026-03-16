@@ -104,6 +104,8 @@ async def allocate_datasource(
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         logger.error(f"数据匹配失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 

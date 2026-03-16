@@ -391,6 +391,8 @@ def generate_raw(prompt: str,
         _logger.info(f"✅ LLM API调用完成 [模型: {model_name}, 耗时: {api_timer.duration_str}, prompt: {prompt_len}字符]")
         return result
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         api_timer.stop()
         _logger.error(f"❌ LLM API调用失败 [模型: {model_name}, 耗时: {api_timer.duration_str}]: {e}", exc_info=True)
         raise
@@ -520,6 +522,8 @@ def generate(prompt: str,
         _logger.info(f"✅ 文本生成完成 [模型: {model_name}, 耗时: {gen_timer.duration_str}, 输入: {prompt_len}字符, 输出: {content_len}字符]")
         return content
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         gen_timer.stop()
         _logger.error(f"❌ 文本生成失败 [模型: {model_name}, 耗时: {gen_timer.duration_str}]: {e}")
         if isinstance(e, KeyError):
@@ -595,7 +599,9 @@ def stream_generate(prompt: str,
                 # 解析 JSON
                 try:
                     obj = json.loads(line)
-                except Exception:
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     # 非JSON行忽略（保持健壮）
                     continue
                 chunk_parts: List[str] = []
@@ -611,7 +617,9 @@ def stream_generate(prompt: str,
                                 chunk_parts.append(ct)
                         elif isinstance(delta, str) and delta:
                             chunk_parts.append(delta)
-                except Exception:
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     pass
                 if not chunk_parts:
                     # 兜底字段
@@ -625,7 +633,9 @@ def stream_generate(prompt: str,
         if not _skip_rl:
             try:
                 rl.release()
-            except Exception:
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
                 pass
 
 
@@ -751,6 +761,8 @@ def vision_infer(image: Union[str, bytes],
         _logger.info(f"✅ 视觉模型推理完成 [耗时: {vision_timer.duration_str}, 图片大小: {image_size}bytes]")
         return data
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         vision_timer.stop()
         _logger.error(f"❌ 视觉模型推理失败 [耗时: {vision_timer.duration_str}]: {e}")
         raise

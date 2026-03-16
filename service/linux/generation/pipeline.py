@@ -378,6 +378,8 @@ class CSRGenerationPipeline:
                         if enriched:
                             data_item.update(enriched)  # 合并enriched数据，不覆盖已有的quote
                     except Exception as e:
+                        import traceback
+                        traceback.print_exc()
                         logger.warning(f"Enrichment失败: {e}")
 
                     enriched_data.append(data_item)
@@ -423,6 +425,8 @@ class CSRGenerationPipeline:
                 return result
 
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 stack_trace = traceback.format_exc()
                 print(stack_trace)
                 # 提取过程中遇到异常，记录错误并标记标签失败
@@ -518,6 +522,8 @@ class CSRGenerationPipeline:
                     try:
                         extracted = future.result()
                     except Exception as e:
+                        import traceback
+                        traceback.print_exc()
                         stack_trace = traceback.format_exc()
                         print(stack_trace)
                         # ✅ 修复：并发执行异常时也要标记标签失败
@@ -548,6 +554,8 @@ class CSRGenerationPipeline:
             try:
                 self.on_extraction_completed()
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 logger.warning(f"提取完毕回调执行失败: {e}")
 
         # ===== 阶段B开始：触发"开始生成"回调 =====
@@ -556,6 +564,8 @@ class CSRGenerationPipeline:
             try:
                 self.on_generation_started()
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 logger.warning(f"开始生成回调执行失败: {e}")
 
         # 阶段B：全部提取完成后，并发生成全部段落
@@ -669,7 +679,9 @@ class CSRGenerationPipeline:
                             "skipped_generation": True,
                             "content_preview": preview,
                         })
-                except Exception:
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     pass
 
                 # 标记标签成功（跳过生成也算成功）
@@ -726,6 +738,8 @@ class CSRGenerationPipeline:
 
                         generated_content = generation_result.get('generated_content', '')
                 except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     # 生成过程中遇到异常，记录错误并标记标签失败
                     stack_trace = traceback.format_exc()
                     print(stack_trace)
@@ -772,7 +786,9 @@ class CSRGenerationPipeline:
                             "skipped_generation": False,
                             "content_preview": preview,
                         })
-                except Exception:
+                except Exception as  e:
+                    import traceback
+                    traceback.print_exc()
                     pass
 
                 # 标记标签成功
@@ -854,6 +870,8 @@ class CSRGenerationPipeline:
                     try:
                         res = future.result()
                     except Exception as e:
+                        import traceback
+                        traceback.print_exc()
                         stack_trace = traceback.format_exc()
                         print(stack_trace)
                         # ✅ 修复：并发执行异常时也要标记标签失败
@@ -1088,8 +1106,12 @@ class CSRGenerationPipeline:
                         matched_files.append((file_name, local_pp, pp_data))
                         found_file_names.add(file_name)  # ✅ 记录已找到
                     except Exception as _e:
+                        import traceback
+                        traceback.print_exc()
                         logger.debug(f"读取preprocessed.json失败(file_mappings): {_e}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.debug(f"读取file_mappings失败: {e}")
 
         # 方式1：使用索引文件快速查找（若0未命中或需补充）
@@ -1118,6 +1140,8 @@ class CSRGenerationPipeline:
                                 matched_files.append((file_name, preprocessed_file, pp_data))
                                 continue
                             except Exception as e:
+                                import traceback
+                                traceback.print_exc()
                                 logger.warning(f"读取preprocessed.json失败: {e}")
 
                 # 如果索引查找失败，fallback到遍历目录
@@ -1158,6 +1182,8 @@ class CSRGenerationPipeline:
                             break
 
                     except Exception as e:
+                        import traceback
+                        traceback.print_exc()
                         logger.warning(f"读取preprocessed.json失败: {e}")
                         continue
 
@@ -1180,6 +1206,8 @@ class CSRGenerationPipeline:
                             break
 
                     except Exception as e:
+                        import traceback
+                        traceback.print_exc()
                         logger.debug(f"读取preprocessed.json失败: {e}")
                         continue
 
@@ -1365,7 +1393,9 @@ class CSRGenerationPipeline:
                                 candidate = Path('AAA') / Path(rel)
                                 if candidate.exists():
                                     full_path = candidate
-                        except Exception:
+                        except Exception as e:
+                            import traceback
+                            traceback.print_exc()
                             pass
 
                         # 方式1: POSIX绝对路径
@@ -1395,7 +1425,9 @@ class CSRGenerationPipeline:
                                 full_path = candidate
                                 try:
                                     logger.info(f"  ✓ 使用回退路径: {candidate.relative_to(Path.cwd())}")
-                                except Exception:
+                                except Exception as e:
+                                    import traceback
+                                    traceback.print_exc()
                                     logger.info(f"  ✓ 使用回退路径: {candidate}")
 
                         if full_path:
@@ -1403,7 +1435,9 @@ class CSRGenerationPipeline:
                                 aaa_base = Path.cwd() / 'AAA'
                                 rel = full_path.absolute().resolve().relative_to(aaa_base)
                                 res_path = str(Path('AAA') / rel)
-                            except Exception:
+                            except Exception as e:
+                                import traceback
+                                traceback.print_exc()
                                 res_path = str(full_path.absolute())
                             available_resources.append({
                                 'label': label,  # "Table_1_Start"
@@ -1628,6 +1662,8 @@ class CSRGenerationPipeline:
                             f"找到匹配的preprocessed.json: {preprocessed_file.parent.name}, file_type={file_type}")
 
                 except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     logger.debug(f"读取preprocessed.json失败 ({preprocessed_file}): {e}")
                     continue
 
@@ -1653,6 +1689,8 @@ class CSRGenerationPipeline:
             return None
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"Enrichment过程异常: {e}", exc_info=True)
             return None
 

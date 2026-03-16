@@ -51,6 +51,8 @@ class SystemPromptManager:
             with open(self.system_config_file, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             raise Exception(f"加载系统提示词配置失败: {str(e)}")
     
     def get_prompt_template(self, template_id: str) -> Optional[Dict[str, Any]]:
@@ -156,137 +158,137 @@ class SystemPromptManager:
                 logger.debug(f"[PromptFetch] CURRENT_COMBINATION_ID not set; using local template for {template_id}")
             except Exception:
                 pass
-        # if combination_id:
-        #     # 远程提示词获取计时
-        #     remote_timer = Timer(f"远程获取提示词({template_id})", parent="提示词")
-        #     remote_timer.start()
-        #     try:
-        #         service_url = os.getenv(
-        #             "PROMPT_SERVICE_URL",
-        #             "http://192.168.3.32:8088/ky/sys/projectPromptDetailTable/findByCombinationAndUsedBy",
-        #         )
-        #         # 先尝试 POST（表单），失败或空则回退 GET
-        #         try:
-        #             logger.info(
-        #                 f"[PromptFetch] POST requesting usedBy={template_id} combinationId={combination_id} url={service_url}"
-        #             )
-        #             post_timer = Timer("POST请求提示词", parent="远程提示词")
-        #             post_timer.start()
-        #             resp_post = requests.post(
-        #                 service_url,
-        #                 data={
-        #                     "combinationId": combination_id,
-        #                     "usedBy": template_id,
-        #                 },
-        #                 timeout=10,
-        #             )
-        #             post_timer.stop()
-        #             logger.info(f"[PromptFetch] POST response status={resp_post.status_code} [耗时: {post_timer.duration_str}]")
-        #             if resp_post.status_code == 200:
-        #                 data = resp_post.json() if hasattr(resp_post, "json") else None
-        #                 if isinstance(data, dict):
-        #                     result = data.get("result") or {}
-        #                     content = result.get("promptContent")
-        #                     try:
-        #                         logger.info(
-        #                             f"[PromptFetch] remote promptContent length={len(content) if isinstance(content, str) else 0}"
-        #                         )
-        #                     except Exception:
-        #                         pass
-        #                     if isinstance(content, str) and content.strip():
-        #                         remote_timer.stop()
-        #                         build_timer.stop()
-        #                         if generation_timer:
-        #                             generation_timer.record(f"提示词构建(远程POST)-{template_id}", build_timer.duration, parent="提示词")
-        #                         logger.info(f"✅ 提示词构建完成(远程POST) [模板: {template_id}, 耗时: {build_timer.duration_str}]")
-        #                         return _with_project_desc(_safe_format(content, variables), variables)
-        #                     else:
-        #                         try:
-        #                             logger.info(
-        #                                 f"[PromptFetch] POST returned empty promptContent, try GET fallback for {template_id}"
-        #                             )
-        #                         except Exception:
-        #                             pass
-        #             else:
-        #                 try:
-        #                     logger.warning(
-        #                         f"[PromptFetch] POST non-200 status: {resp_post.status_code}; try GET fallback"
-        #                     )
-        #                 except Exception:
-        #                     pass
-        #         except Exception as e_post:
-        #             try:
-        #                 logger.warning(
-        #                     f"[PromptFetch] POST request failed: {e_post}; try GET fallback", exc_info=True
-        #                 )
-        #             except Exception:
-        #                 pass
-        #
-        #         # GET 回退
-        #         try:
-        #             logger.info(
-        #                 f"[PromptFetch] GET requesting usedBy={template_id} combinationId={combination_id} url={service_url}"
-        #             )
-        #             get_timer = Timer("GET请求提示词", parent="远程提示词")
-        #             get_timer.start()
-        #             resp_get = requests.get(
-        #                 service_url,
-        #                 params={
-        #                     "combinationId": combination_id,
-        #                     "usedBy": template_id,
-        #                 },
-        #                 timeout=10,
-        #             )
-        #             get_timer.stop()
-        #             logger.info(f"[PromptFetch] GET response status={resp_get.status_code} [耗时: {get_timer.duration_str}]")
-        #             if resp_get.status_code == 200:
-        #                 data = resp_get.json() if hasattr(resp_get, "json") else None
-        #                 if isinstance(data, dict):
-        #                     result = data.get("result") or {}
-        #                     content = result.get("promptContent")
-        #                     try:
-        #                         logger.info(
-        #                             f"[PromptFetch] remote promptContent length={len(content) if isinstance(content, str) else 0}"
-        #                         )
-        #                     except Exception:
-        #                         pass
-        #                     if isinstance(content, str) and content.strip():
-        #                         remote_timer.stop()
-        #                         build_timer.stop()
-        #                         if generation_timer:
-        #                             generation_timer.record(f"提示词构建(远程GET)-{template_id}", build_timer.duration, parent="提示词")
-        #                         logger.info(f"✅ 提示词构建完成(远程GET) [模板: {template_id}, 耗时: {build_timer.duration_str}]")
-        #                         return _with_project_desc(_safe_format(content, variables), variables)
-        #                     else:
-        #                         try:
-        #                             logger.info(
-        #                                 f"[PromptFetch] empty promptContent, will fallback to local for {template_id}"
-        #                             )
-        #                         except Exception:
-        #                             pass
-        #             else:
-        #                 try:
-        #                     logger.warning(
-        #                         f"[PromptFetch] GET non-200 status: {resp_get.status_code}; will fallback to local"
-        #                     )
-        #                 except Exception:
-        #                     pass
-        #         except Exception as e_get:
-        #             try:
-        #                 logger.warning(
-        #                     f"[PromptFetch] GET request failed: {e_get}; falling back to local", exc_info=True
-        #                 )
-        #             except Exception:
-        #                 pass
-        #         remote_timer.stop()
-        #     except Exception as e:
-        #         # 忽略远端异常，回退到本地模板
-        #         remote_timer.stop()
-        #         try:
-        #             logger.warning(f"[PromptFetch] remote fetch failed: {e}; falling back to local", exc_info=True)
-        #         except Exception:
-        #             pass
-        #         pass
+        if combination_id:
+            # 远程提示词获取计时
+            remote_timer = Timer(f"远程获取提示词({template_id})", parent="提示词")
+            remote_timer.start()
+            try:
+                service_url = os.getenv(
+                    "PROMPT_SERVICE_URL",
+                    "http://192.168.3.32:8088/ky/sys/projectPromptDetailTable/findByCombinationAndUsedBy",
+                )
+                # 先尝试 POST（表单），失败或空则回退 GET
+                try:
+                    logger.info(
+                        f"[PromptFetch] POST requesting usedBy={template_id} combinationId={combination_id} url={service_url}"
+                    )
+                    post_timer = Timer("POST请求提示词", parent="远程提示词")
+                    post_timer.start()
+                    resp_post = requests.post(
+                        service_url,
+                        data={
+                            "combinationId": combination_id,
+                            "usedBy": template_id,
+                        },
+                        timeout=10,
+                    )
+                    post_timer.stop()
+                    logger.info(f"[PromptFetch] POST response status={resp_post.status_code} [耗时: {post_timer.duration_str}]")
+                    if resp_post.status_code == 200:
+                        data = resp_post.json() if hasattr(resp_post, "json") else None
+                        if isinstance(data, dict):
+                            result = data.get("result") or {}
+                            content = result.get("promptContent")
+                            try:
+                                logger.info(
+                                    f"[PromptFetch] remote promptContent length={len(content) if isinstance(content, str) else 0}"
+                                )
+                            except Exception:
+                                pass
+                            if isinstance(content, str) and content.strip():
+                                remote_timer.stop()
+                                build_timer.stop()
+                                if generation_timer:
+                                    generation_timer.record(f"提示词构建(远程POST)-{template_id}", build_timer.duration, parent="提示词")
+                                logger.info(f"✅ 提示词构建完成(远程POST) [模板: {template_id}, 耗时: {build_timer.duration_str}]")
+                                return _with_project_desc(_safe_format(content, variables), variables)
+                            else:
+                                try:
+                                    logger.info(
+                                        f"[PromptFetch] POST returned empty promptContent, try GET fallback for {template_id}"
+                                    )
+                                except Exception:
+                                    pass
+                    else:
+                        try:
+                            logger.warning(
+                                f"[PromptFetch] POST non-200 status: {resp_post.status_code}; try GET fallback"
+                            )
+                        except Exception:
+                            pass
+                except Exception as e_post:
+                    try:
+                        logger.warning(
+                            f"[PromptFetch] POST request failed: {e_post}; try GET fallback", exc_info=True
+                        )
+                    except Exception:
+                        pass
+
+                # GET 回退
+                try:
+                    logger.info(
+                        f"[PromptFetch] GET requesting usedBy={template_id} combinationId={combination_id} url={service_url}"
+                    )
+                    get_timer = Timer("GET请求提示词", parent="远程提示词")
+                    get_timer.start()
+                    resp_get = requests.get(
+                        service_url,
+                        params={
+                            "combinationId": combination_id,
+                            "usedBy": template_id,
+                        },
+                        timeout=10,
+                    )
+                    get_timer.stop()
+                    logger.info(f"[PromptFetch] GET response status={resp_get.status_code} [耗时: {get_timer.duration_str}]")
+                    if resp_get.status_code == 200:
+                        data = resp_get.json() if hasattr(resp_get, "json") else None
+                        if isinstance(data, dict):
+                            result = data.get("result") or {}
+                            content = result.get("promptContent")
+                            try:
+                                logger.info(
+                                    f"[PromptFetch] remote promptContent length={len(content) if isinstance(content, str) else 0}"
+                                )
+                            except Exception:
+                                pass
+                            if isinstance(content, str) and content.strip():
+                                remote_timer.stop()
+                                build_timer.stop()
+                                if generation_timer:
+                                    generation_timer.record(f"提示词构建(远程GET)-{template_id}", build_timer.duration, parent="提示词")
+                                logger.info(f"✅ 提示词构建完成(远程GET) [模板: {template_id}, 耗时: {build_timer.duration_str}]")
+                                return _with_project_desc(_safe_format(content, variables), variables)
+                            else:
+                                try:
+                                    logger.info(
+                                        f"[PromptFetch] empty promptContent, will fallback to local for {template_id}"
+                                    )
+                                except Exception:
+                                    pass
+                    else:
+                        try:
+                            logger.warning(
+                                f"[PromptFetch] GET non-200 status: {resp_get.status_code}; will fallback to local"
+                            )
+                        except Exception:
+                            pass
+                except Exception as e_get:
+                    try:
+                        logger.warning(
+                            f"[PromptFetch] GET request failed: {e_get}; falling back to local", exc_info=True
+                        )
+                    except Exception:
+                        pass
+                remote_timer.stop()
+            except Exception as e:
+                # 忽略远端异常，回退到本地模板
+                remote_timer.stop()
+                try:
+                    logger.warning(f"[PromptFetch] remote fetch failed: {e}; falling back to local", exc_info=True)
+                except Exception:
+                    pass
+                pass
 
         # 若配置了 md_file，则优先读取并渲染整份MD
         md_file = template.get("md_file") or template_parts.get("md_file")

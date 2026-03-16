@@ -103,6 +103,8 @@ class ExtractionValidationService:
                 "provenance_file": str(provenance_file)
             }
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"保存校验提示词失败: {e}")
             return {}
     
@@ -149,6 +151,8 @@ class ExtractionValidationService:
             try:
                 model_output = self.llm.generate_single(prompt)
             except Exception as llm_error:
+                import traceback
+                traceback.print_exc()
                 logger.error(f"LLM 调用异常: {llm_error}")
                 # 保存失败的提示词（用于排查）
                 self._save_prompt_and_output(prompt, str(llm_error), extraction_query)
@@ -209,6 +213,8 @@ class ExtractionValidationService:
             }
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"校验提取结果失败: {e}")
             return {
                 "success": False,
@@ -266,6 +272,8 @@ class ExtractionValidationService:
                 return None
             
         except json.JSONDecodeError as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"JSON解析失败: {e}")
             
             # 方法2：正则提取JSON
@@ -275,10 +283,14 @@ class ExtractionValidationService:
                     result = json.loads(json_match.group())
                     return result
             except Exception as e2:
+                import traceback
+                traceback.print_exc()
                 logger.error(f"正则提取JSON失败: {e2}")
             
             return None
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"解析校验结果失败: {e}")
             return None
 

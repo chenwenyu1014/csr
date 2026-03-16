@@ -173,6 +173,8 @@ class DataSourceValidationService:
                 "provenance_path": str(prov_path) if prov_path else None,
             }
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"[异步] 数据源纯校验执行失败: {e}", exc_info=True)
             return {
                 "success": False,

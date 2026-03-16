@@ -377,7 +377,9 @@ class GenerationService:
                 # notify_complete 会保证终态，但这里提前打点，避免调用方只看阶段回调时漏掉“生成完毕”。
                 try:
                     callback.notify_generation_completed()
-                except Exception:
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     pass
                 
                 # 通知完成
@@ -388,6 +390,8 @@ class GenerationService:
                 controller.cleanup()
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"异步任务执行失败: {e}", exc_info=True)
             if task_logger:
                 task_logger.error("异步任务执行失败", exc=e, task_id=task_id)
@@ -532,6 +536,8 @@ class GenerationService:
                 controller.cleanup()
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"[Compose异步] 任务执行失败: {e}", exc_info=True)
             if task_logger:
                 task_logger.error("Compose异步任务执行失败", exc=e, task_id=task_id)
@@ -612,6 +618,8 @@ class GenerationService:
                     run_json = json.load(f)
                 results = run_json.get('results', []) or []
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"读取运行结果失败: {e}")
         
         # 构建返回数据
@@ -683,6 +691,8 @@ class GenerationService:
                     "data_source": data_source
                 })
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"构建溯源失败: {e}")
         
         return prov_items
@@ -713,7 +723,9 @@ class GenerationService:
                     title0 = cu[0].get("heading")
                     if title0:
                         used_data["title"] = title0
-            except Exception:
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
                 pass
                 
         elif data_type in ("excel", "rtf"):
@@ -838,6 +850,8 @@ class GenerationService:
                 else:
                     logger.warning(f"[Compose回调] 回调返回非200: {response.status_code} - {response.text[:200]}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"[Compose回调] 回调发送失败: {e}")
 
 

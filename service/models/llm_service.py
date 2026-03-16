@@ -427,6 +427,8 @@ class LLMService:
                 extra=self._get_model_extra_params()
             )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"生成单个响应失败: {e}")
             _task_log_error("LLM生成失败", exc=e)
             return f"[生成失败] {str(e)}"

@@ -105,5 +105,7 @@ async def insert_content_to_template(
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         logger.error(f"模板插入失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

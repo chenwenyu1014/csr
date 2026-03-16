@@ -211,6 +211,8 @@ class CSRFlowController:
                 except Exception as _e:
                     logger.warning(f"复制配置文件失败 {self.config.config_path}: {_e}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"保存环境与配置快照失败: {e}")
 
     def _attach_file_loggers(self) -> None:
@@ -313,6 +315,8 @@ class CSRFlowController:
             
             logger.info("文件日志已挂载（实时写入模式，支持子线程）")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"挂载文件日志失败: {e}")
 
     def _setup_logging(self):
@@ -380,6 +384,8 @@ class CSRFlowController:
                 logger.info("配置解析器未初始化（无config_path）")
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"服务初始化失败: {e}")
             _task_log_error("服务初始化失败", exc=e)
             raise
@@ -402,6 +408,8 @@ class CSRFlowController:
             self.pipeline.paragraph_generation_service.detailed_logger = None
             logger.info("流水线初始化完成")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"流水线初始化失败: {e}")
             _task_log_error("流水线初始化失败", exc=e)
             raise
@@ -438,6 +446,8 @@ class CSRFlowController:
         try:
             return self.pipeline.get_paragraph_list()
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"获取段落列表失败: {e}")
             return []
     

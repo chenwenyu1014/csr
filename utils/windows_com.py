@@ -56,6 +56,8 @@ def repair_win32com_gen_py_cache(*, logger: Optional[Any] = None) -> bool:
         try:
             import win32com.client.gencache as gencache  # type: ignore
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             if logger:
                 logger.warning(f"WIN32COM auto-repair skipped: cannot import gencache ({_str_exc(e)})")
             return False
@@ -80,6 +82,8 @@ def repair_win32com_gen_py_cache(*, logger: Optional[Any] = None) -> bool:
             try:
                 shutil.rmtree(gen_path, ignore_errors=True)
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 if logger:
                     logger.warning(f"WIN32COM auto-repair: failed to remove gen_py ({_str_exc(e)})")
 
@@ -87,6 +91,8 @@ def repair_win32com_gen_py_cache(*, logger: Optional[Any] = None) -> bool:
         try:
             gencache.Rebuild()
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             if logger:
                 logger.warning(f"WIN32COM auto-repair: gencache.Rebuild failed ({_str_exc(e)})")
 

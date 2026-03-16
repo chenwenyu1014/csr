@@ -233,6 +233,8 @@ class ProgressCallback:
                         f"状态回调返回非200: {response.status_code} - {response.text[:200]}"
                     )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"状态回调发送失败: {e}")
     
     def _send_result_callback_sync(self, payload: dict):
@@ -255,6 +257,8 @@ class ProgressCallback:
                         f"结果回调返回非200: {response.status_code} - {response.text[:200]}"
                     )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"结果回调发送失败: {e}")
     
     def _update_tag_status_sync(self, tag_id: str, status: str):
@@ -298,6 +302,8 @@ class ProgressCallback:
                         f"标签状态更新失败: {response.status_code} - {response.text[:200]}"
                     )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"标签状态更新失败: {e}")
     
     def _send_tag_result_sync(self, tag_id: str, result_data: dict):
@@ -347,6 +353,8 @@ class ProgressCallback:
                         f"标签结果发送失败: {response.status_code} - {response.text[:200]}"
                     )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"标签结果发送失败: {e}", exc_info=True)
             _task_log_error("标签结果发送失败", exc=e)
     
@@ -382,6 +390,8 @@ class ProgressCallback:
                         f"回调返回非200: {response.status_code} - {response.text[:200]}"
                     )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"回调发送失败: {e}")
     
     def _update_and_send(
@@ -534,7 +544,9 @@ class ProgressCallback:
         # 之前依赖外部显式调用 notify_generation_completed，但异步链路里经常遗漏，导致Java侧状态停留在“开始生成”。
         try:
             self._update_all_tags_status_with_custom("生成完毕")
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             # 标签状态更新失败不应影响最终完成回调
             pass
 
@@ -675,6 +687,8 @@ class ProgressCallback:
             logger.info(f"所有段落结果已提交队列")
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"发送标签结果失败: {e}", exc_info=True)
     
     def notify_error(self, error: str, message: str = "生成失败"):

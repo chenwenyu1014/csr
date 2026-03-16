@@ -274,6 +274,8 @@ class ValidatedExtractionService:
             }
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"提取服务错误: {e}", exc_info=True)
             _task_log_error("提取服务错误", exc=e, doc_type=doc_type)
             return {

@@ -119,6 +119,8 @@ async def validate_data_source(
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         logger.error(f"数据源校验失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"校验失败: {str(e)}")
 
@@ -146,6 +148,8 @@ async def _parse_spec(
         try:
             spec_obj = json.loads(spec_json)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             raise HTTPException(status_code=400, detail=f"spec_json 无法解析: {e}")
     
     elif spec_file is not None:

@@ -196,6 +196,8 @@ async def run_flow_text_only(
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         logger.error(f"创建异步任务失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"创建任务失败: {str(e)}")
 
@@ -224,6 +226,8 @@ async def _parse_config(
             cfg_obj = json.loads(config_json)
             logger.info(f"✓ 从 config_json 参数解析配置成功")
         except json.JSONDecodeError as e:
+            import traceback
+            traceback.print_exc()
             raise HTTPException(status_code=400, detail=f"config_json JSON格式错误: {str(e)}")
     
     elif config_file:
@@ -232,8 +236,12 @@ async def _parse_config(
             cfg_obj = json.loads(raw.decode('utf-8'))
             logger.info(f"✓ 从 config_file 文件解析配置成功")
         except json.JSONDecodeError as e:
+            import traceback
+            traceback.print_exc()
             raise HTTPException(status_code=400, detail=f"config_file JSON格式错误: {str(e)}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             raise HTTPException(status_code=400, detail=f"读取config_file失败: {str(e)}")
     
     else:
@@ -243,9 +251,13 @@ async def _parse_config(
             if body:
                 cfg_obj = json.loads(body.decode('utf-8'))
                 logger.info(f"✓ 从 request.body 解析配置成功")
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            import traceback
+            traceback.print_exc()
             pass
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             pass
     
     if cfg_obj is None:

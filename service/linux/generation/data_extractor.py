@@ -183,7 +183,9 @@ class DataExtractorV2:
         try:
             try:
                 from utils.request_context import get_request_id  # type: ignore
-            except Exception:
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
                 from utils.request_context import get_request_id  # type: ignore
             rid0 = get_request_id()
             if not rid0:
@@ -191,7 +193,9 @@ class DataExtractorV2:
                 rid0 = _os.getenv("CURRENT_REQUEST_ID")
             if rid0:
                 setattr(self._context, 'request_id', rid0)
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             pass
 
         # 获取并发配置
@@ -210,13 +214,17 @@ class DataExtractorV2:
             # 记录当前数据项索引，供流式事件(extraction_delta)引用
             try:
                 setattr(self._context, 'current_item_index', item_index)
-            except Exception:
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
                 pass
             # 同步段落级提示词上下文，供TFL增强阶段使用
             try:
                 setattr(self._context, 'generate_prompt', paragraph_data.get('generate'))
                 setattr(self._context, 'example', paragraph_data.get('example'))
-            except Exception:
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
                 pass
 
             # 请求间隔控制：避免瞬时高并发
@@ -230,6 +238,8 @@ class DataExtractorV2:
                 res = self.extract_single_data_item(item)
                 return res
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 error_msg = f"提取数据项失败: {item.get('type', '未知类型')} - {e}"
                 logger.error(error_msg, exc_info=True)
                 _task_log_error(error_msg, exc=e, item_type=item.get('type'))
@@ -251,16 +261,22 @@ class DataExtractorV2:
         try:
             try:
                 from utils.request_context import get_request_id  # type: ignore
-            except Exception:
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
                 from utils.request_context import get_request_id  # type: ignore
             _rid_for_agg = get_request_id()
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             _rid_for_agg = None
         if not _rid_for_agg:
             try:
                 import os as _os
                 _rid_for_agg = _os.getenv("CURRENT_REQUEST_ID")
-            except Exception:
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
                 _rid_for_agg = None
 
         if max_workers > 0:
@@ -272,6 +288,8 @@ class DataExtractorV2:
                         res = future.result()
                         results_buffer[idx] = res
                     except Exception as e:
+                        import traceback
+                        traceback.print_exc()
                         stack_trace = traceback.format_exc()
                         results_buffer[idx] = {
                             "item": items[idx][1],
@@ -551,6 +569,8 @@ class DataExtractorV2:
             return result
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"全文加载失败: {e}", exc_info=True)
             return {"status": "error",
                     "error": str(e),
@@ -674,7 +694,9 @@ class DataExtractorV2:
                     if not _secs and 'chunks' in _data:
                         _secs = _data.get('chunks') or []
                     sections_cnt = len(_secs)
-                except Exception:
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     sections_cnt = 0
 
                 # 请求间隔控制：避免瞬时高并发
@@ -721,6 +743,8 @@ class DataExtractorV2:
                             result = future.result()
                             results_list.append(result)
                         except Exception as e:
+                            import traceback
+                            traceback.print_exc()
                             cf = future_to_cf[future]
                             logger.error(f"❌ 文件提取异常: {cf} - {e}", exc_info=True)
                             results_list.append({"success": False, "error": str(e), "cf": cf})
@@ -752,7 +776,9 @@ class DataExtractorV2:
                     try:
                         _ids = [c.get("chunk_id") for c in (_er.get("chunks_used", []) or []) if c.get("chunk_id")]
                         aggregated_ids.extend(_ids)
-                    except Exception:
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
                         pass
                     total_sections_sum += sections_cnt
                     full_prompts.append(_er.get("full_prompt", result.get("full_prompt", "")) or "")
@@ -832,6 +858,8 @@ class DataExtractorV2:
             return return_data
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"{doc_type.upper()}文档提取失败: {e}", exc_info=True)
             _task_log_error(f"{doc_type.upper()}文档提取失败", exc=e, doc_type=doc_type)
             error_data = {"status": "error", "error": str(e), "content": ""}
@@ -1025,6 +1053,8 @@ class DataExtractorV2:
             }
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"{doc_type.upper()}提取失败: {e}", exc_info=True)
             _task_log_error(f"{doc_type.upper()}提取失败", exc=e, doc_type=doc_type)
             return {"status": "error", "error": str(e), "content": ""}
@@ -1043,6 +1073,8 @@ class DataExtractorV2:
 
             return "\n---\n".join(content_parts)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"加载源内容失败: {e}")
             return ""
 
@@ -1112,6 +1144,8 @@ class DataExtractorV2:
                     logger.warning(f"⚠️ 未知的source_item格式: {type(source_item)}")
 
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 logger.warning(f"构建TFL占位符失败: {source_item} - {e}")
 
         logger.info(f"📊 TFL占位符构建完成: 共 {len(tfl_insert_mappings)} 个")
@@ -1257,6 +1291,8 @@ class DataExtractorV2:
                 all_placeholders.update(placeholders)
             return list(all_placeholders)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"从分块提取占位符失败: {e}")
             return []
     def _clean_placeholder_content(self, content: str) -> str:
@@ -1325,6 +1361,8 @@ class DataExtractorV2:
             return cleaned
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"清理占位符内容失败: {e}")
             return content
     #

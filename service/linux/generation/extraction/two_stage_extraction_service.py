@@ -197,6 +197,8 @@ class TwoStageExtractionService:
             }
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"两阶段提取失败: {e}", exc_info=True)
             _task_log_error("两阶段提取失败", exc=e)
             return {
@@ -318,6 +320,8 @@ class TwoStageExtractionService:
             }
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"仅执行筛选阶段: {e}", exc_info=True)
             _task_log_error("仅执行筛选阶段", exc=e)
             return {
@@ -337,6 +341,8 @@ class TwoStageExtractionService:
             with open(index_file, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"加载分块索引失败: {e}")
             return None
     
@@ -470,6 +476,8 @@ class TwoStageExtractionService:
             return filtering_result
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"筛选相关分块失败: {e}", exc_info=True)
             # ✅ 异常时也保存溯源数据
             from datetime import datetime
@@ -614,7 +622,9 @@ class TwoStageExtractionService:
                             # 再尝试0基
                             if not ch and n > 0:
                                 ch = index_map.get(str(n - 1))
-                        except Exception:
+                        except Exception as e:
+                            import traceback
+                            traceback.print_exc()
                             pass
 
                 if not ch:
@@ -709,6 +719,8 @@ class TwoStageExtractionService:
             return extraction_result
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"从分块中提取内容失败: {e}", exc_info=True)
             # ✅ 异常时也保存溯源数据
             from datetime import datetime
@@ -770,6 +782,8 @@ class TwoStageExtractionService:
             try:
                 return json.loads(json_str)
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 logger.warning(f"JSON代码块解析失败: {e}")
         
         # 方法2: 提取 ``` ... ``` 代码块（可能没有json标记）
@@ -779,6 +793,8 @@ class TwoStageExtractionService:
             try:
                 return json.loads(json_str)
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 logger.warning(f"普通代码块解析失败: {e}")
         
         # 方法3: 查找第一个完整的JSON对象（贪婪匹配）
@@ -788,6 +804,8 @@ class TwoStageExtractionService:
             try:
                 return json.loads(json_str)
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 logger.warning(f"裸JSON解析失败: {e}")
         
         logger.error("无法解析JSON响应")
@@ -853,6 +871,8 @@ class TwoStageExtractionService:
             
             logger.info(f"✅ 读取的chunks数据已保存: {json_filepath.name}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"保存chunks数据失败: {e}")
     
     def _save_filtering_result(self, result: Dict[str, Any]) -> None:
@@ -892,6 +912,8 @@ class TwoStageExtractionService:
             
             logger.info(f"✅ 筛选阶段溯源数据已保存: {json_filepath.name}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"保存筛选溯源数据失败: {e}")
     
     def _save_extraction_result(self, result: Dict[str, Any]) -> None:
@@ -933,6 +955,8 @@ class TwoStageExtractionService:
             
             logger.info(f"✅ 提取阶段溯源数据已保存: {json_filepath.name}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"保存提取溯源数据失败: {e}")
     
     def _calculate_avg_score(self, chunks: List[Dict[str, Any]]) -> float:

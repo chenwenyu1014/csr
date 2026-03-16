@@ -122,24 +122,23 @@ class PreprocessingTaskService:
                 logger.info(f"  ✅ [异步] 成功: {filename}")
                 
             except Exception as e:
-                error_msg = str(e)
-                logger.error(f"  ❌ [异步] 失败：{filename}, 错误：{e}", exc_info=True)
+                import traceback
+                traceback.print_exc()
+                logger.error(f"  ❌ [异步] 失败: {filename}, 错误: {e}", exc_info=True)
                 results.append({
                     "id": file_id or filename,
                     "filename": filename,
                     "status": "fail",
-                    "sha256": "",
-                    "err_msg": "处理异常",
-                    "error": error_msg,
+                    "sha256": sha256_val,
                 })
                 failed += 1
-
+        
         logger.info(f"✅ [异步] 任务完成: {task_id}, 成功: {succeeded}, 失败: {failed}")
-
+        
         # 异步回调通知
         if callback_url:
             await self._send_callback(callback_url, results)
-
+    
     # ============================================================
     # 私有辅助方法
     # ============================================================
@@ -176,6 +175,8 @@ class PreprocessingTaskService:
                     h.update(chunk)
             sha256_val = h.hexdigest()
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.debug(f"计算sha256失败: {filename}, {e}")
         return sha256_val
     
@@ -186,60 +187,23 @@ class PreprocessingTaskService:
         Args:
             callback_url: 回调URL
             results: 处理结果列表
-
-        回调格式 (application/json):
-        POST {callback_url}
-        Content-Type: application/json
-
-        {
-            "id": "file_001",
-            "filename": "document.pdf",
-            "status": "success",
-            "sha256": "a1b2c3d4e5f6...",
-            "err_msg": "",
-            "error": ""
-        }
-
-        失败场景:
-        {
-            "id": "file_001",
-            "filename": "document.pdf",
-            "status": "fail",
-            "sha256": "",
-            "err_msg": "处理异常",
-            "error": "File format not supported"
-        }
-        """
-        try:
-            logger.info(f"📤 [异步] 回调通知：{callback_url}")
-
-            # 逐个文件发送回调（每个文件一个请求）
-            for result in results:
-                await self._send_single_callback(callback_url, result)
-
-        except Exception as e:
-            logger.error(f"[异步] 回调失败：{e}", exc_info=True)
-
-    async def _send_single_callback(self, callback_url: str, result: dict):
-        """
-        发送单个文件的回调通知
-
-        Args:
-            callback_url: 回调 URL
-            result: 单个文件的处理结果
         """
         try:
             logger.info(f"📤 [异步] 回调通知: {callback_url}")
-
+            
             # 使用 aiohttp 进行异步回调
             try:
                 import aiohttp
-
+                json_str = json.dumps(results, ensure_ascii=False)
+                
                 async with aiohttp.ClientSession() as session:
+                    # 使用 form-data 格式
+                    data = aiohttp.FormData()
+                    data.add_field('dataJson', json_str)
+                    
                     async with session.post(
-                        callback_url,
-                        json=result,
-                        headers={"Content-Type": "application/json"},
+                        callback_url, 
+                        data=data, 
                         timeout=aiohttp.ClientTimeout(total=30)
                     ) as resp:
                         status = resp.status
@@ -247,27 +211,27 @@ class PreprocessingTaskService:
                             resp_json = await resp.json()
                         except Exception:
                             resp_json = None
-
+                        
                         ok = (status == 200) and (
                             not isinstance(resp_json, dict) or bool(resp_json.get("success", True))
                         )
                         if ok:
-                            logger.info(f"✅ [异步] 回调成功：id={result.get('id')}, status={result.get('status')}")
+                            ids = ",".join([str(item.get("id")) for item in results])
+                            logger.info(f"✅ [异步] 回调成功: 上报 {len(results)} 条, ids=[{ids}]")
                         else:
                             text = await resp.text()
                             logger.warning(f"[异步] 回调失败: status={status}, body={text[:200]}")
             except ImportError:
                 # 如果 aiohttp 不可用，回退到同步 requests
                 import requests
-                response = requests.post(
-                    callback_url,
-                    json=result,
-                    headers={"Content-Type": "application/json"},
-                    timeout=30
-                )
-                logger.info(f"回调响应 (同步回退): {response.status_code}")
-
+                json_str = json.dumps(results, ensure_ascii=False)
+                files = {"dataJson": (None, json_str)}
+                response = requests.post(callback_url, files=files, timeout=30)
+                logger.info(f"回调响应(同步回退): {response.status_code}")
+                
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"[异步] 回调失败: {e}", exc_info=True)
 
 

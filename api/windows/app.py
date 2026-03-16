@@ -37,17 +37,9 @@ from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, HTTPException, Form
 from fastapi.responses import JSONResponse
 
-# 配置详细日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s(%(lineno)s) - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
-
-# 设置本模块的logger级别
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 app = FastAPI(title="Windows Bridge Service", version="1.0.0")
+logger = logging.getLogger(__name__)
+
 # ============================================================
 # Windows 串行任务锁（防止 win32/Office COM 并发导致崩溃）
 #
@@ -392,6 +384,8 @@ def _clean_content_controls_preserve_content(file_path: str, output_path: str, r
                     cc.Delete(False)
                     controls_count += 1
                 except Exception as e:
+                    import traceback
+                    traceback.print_exc()
                     logger.warning(f"删除控件 {i} 失败: {e}")
             
             result["controls_removed"] = controls_count
@@ -401,6 +395,8 @@ def _clean_content_controls_preserve_content(file_path: str, output_path: str, r
             else:
                 logger.info(f"✅ 已清理 {controls_count}/{total_controls} 个Content Control控件")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"清理Content Control失败: {e}")
         
         # 2. 删除首行（水印）
@@ -425,6 +421,8 @@ def _clean_content_controls_preserve_content(file_path: str, output_path: str, r
                     result["first_line_removed"] = True
                     logger.info("✅ 已删除首行")
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 logger.warning(f"删除首行失败: {e}")
         
         # 保存到输出路径
@@ -440,6 +438,8 @@ def _clean_content_controls_preserve_content(file_path: str, output_path: str, r
         result["output_file"] = output_path
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         logger.error(f"清理文档失败: {e}", exc_info=True)
         result["error"] = str(e)
     
@@ -536,6 +536,8 @@ def _clear_first_line_with_com_bytes(src_bytes: bytes, suffix: str) -> Optional[
                     pass
             return data
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         logger.warning(f"COM 清理首行失败: {e}")
         return None
 
@@ -874,10 +876,7 @@ def _content_control_insert_direct_impl(*, template_file: str, data_json: str, r
             })
         else:
             raise HTTPException(status_code=500, detail=f"插入失败: {result.error}")
-
-    except HTTPException as e:
-        logger.error(f"❌ 处理失败: {e.detail}")
-        raise e
+            
     except FileNotFoundError as e:
         error_msg = f"文件不存在: {str(e)}"
         logger.error(f"❌ {error_msg}")
@@ -885,6 +884,8 @@ def _content_control_insert_direct_impl(*, template_file: str, data_json: str, r
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=error_msg)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         error_msg = str(e) if str(e) else f"未知错误: {type(e).__name__}"
         logger.error(f"❌ 处理失败: {error_msg}")
         import traceback
@@ -1265,7 +1266,18 @@ def _preprocessing_process_impl(
 
 if __name__ == "__main__":
     import uvicorn
-
+    
+    # 配置详细日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler()
+        ]
+    )
+    
+    # 设置本模块的logger级别
+    logger.setLevel(logging.INFO)
     
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8081"))

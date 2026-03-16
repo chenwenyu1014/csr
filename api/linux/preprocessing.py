@@ -62,26 +62,14 @@ async def preprocess_batch_simple(
           "task_id": "batch_20241206_123456",
           "total_files": 1
         }
-
-    完成后回调到 callback_url（每个文件一个请求）：
-        Content-Type: application/json
-
-        成功场景:
+    
+    完成后回调到callback_url：
         {
-          "id": "f1",
-          "filename": "test.docx",
-          "status": "success",
-          "sha256": "a1b2c3d4e5f6...",
-        }
-
-        失败场景:
-        {
-          "id": "f1",
-          "filename": "test.docx",
-          "status": "fail",
-          "sha256": "",
-          "err_msg": "处理异常",
-          "error": "File format not supported"
+          "dataJson": [{
+            "id": "f1",
+            "status": "success",
+            "preprocessed_json": "..."
+          }]
         }
     """
     try:
@@ -133,6 +121,8 @@ async def preprocess_batch_simple(
         logger.error(f"文件列表JSON解析失败: {e}")
         raise HTTPException(status_code=400, detail=f"files参数JSON格式错误: {e}")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         logger.error(f"接受预处理任务失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 

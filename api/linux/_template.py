@@ -41,5 +41,7 @@ async def example_endpoint(
         return JSONResponse(result)
     
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         logger.error(f"处理失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

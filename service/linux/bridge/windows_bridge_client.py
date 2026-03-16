@@ -129,6 +129,8 @@ class WindowsBridgeClient:
             with open(file_path, 'rb') as f:
                 return f.read()
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.warning(f"读取文件失败 {file_path}: {e}")
             return None
 

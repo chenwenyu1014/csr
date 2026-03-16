@@ -115,5 +115,7 @@ async def clean_document(
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         logger.error(f"文档清理失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"清理失败: {str(e)}")
