@@ -96,6 +96,8 @@ class WordRegionExtractor:
                 results.append({"name": output_name, "path": str(output_file)})
                 logger.info(f"成功导出: {output_file.name}")
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 logger.error(f"导出区域 {region['name']} 失败: {e}", exc_info=True)
 
         return results
