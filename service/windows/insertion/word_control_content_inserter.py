@@ -517,6 +517,13 @@ class WordControlContentInserter:
         # 清理可能导致 COM 错误的字符
         portrait_content = self._clean_text_for_word(portrait_content)
 
+        # 🆕 解锁控件（防止因控件锁定导致插入失败）
+        try:
+            control.LockContents = False
+            control.LockContentControl = False
+        except Exception:
+            pass  # 某些控件类型可能不支持这些属性
+
         # 清空控件并插入纵向内容（按照原始设计）
         # control.Range.Text = ""
         control.Range.Delete()
@@ -526,6 +533,13 @@ class WordControlContentInserter:
         # 应用格式
         control.Range.Font.Name = font_name
         control.Range.Font.Size = font_size
+
+        # 重新锁定控件（可选）
+        try:
+            control.LockContents = True
+            control.LockContentControl = True
+        except Exception:
+            pass
 
         logger.info(f"  ✅ 插入纵向内容 ({len(portrait_content)} 字符)")
 
@@ -876,7 +890,21 @@ class WordControlContentInserter:
                         try:
                             # 清理内容中可能导致 COM 错误的字符
                             cleaned_content = self._clean_text_for_word(generated_content)
-                            control.Range.Text = cleaned_content
+                            
+                            # 🆕 解锁控件（防止因控件锁定导致插入失败）
+                            try:
+                                control.LockContents = False
+                                control.LockContentControl = False
+                            except Exception:
+                                pass  # 某些控件类型可能不支持这些属性
+                            
+                            # 设置文本
+                            # 🆕 使用 Selection 对象插入文本（最稳定的方法）
+                            # 1. 选中控件并清空内容
+                            control.Range.Select()
+                            self.word.Selection.TypeText('')  # 清空选中内容
+                            # 2. 使用 Selection.TypeText 插入文本
+                            self.word.Selection.TypeText(cleaned_content)
                             logger.info(f"  ✅ 文本插入成功 ({len(cleaned_content)} 字符)")
                             inserted_controls.append(control_title)
                         except Exception as e:
