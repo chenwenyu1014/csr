@@ -84,13 +84,15 @@ class Settings(BaseSettings):
     # ========== 并发控制配置 ==========
     # 文件级并发提取的最大并发数（避免API限流）
     # 适用于：多个chunks文件提取、多个Excel Sheet提取
-    max_file_extraction_workers: int = 3
+    max_file_extraction_workers: int = 10
     # LLM请求间隔（秒），避免短时间内高频请求
     llm_request_interval: float = 0.5
     # 标签（段落）级并发的最大并发数
-    max_paragraph_workers: int = 5
+    max_paragraph_workers: int = 10
     # 标签内数据项的最大并发数
-    max_data_item_workers: int = 3
+    max_data_item_workers: int = 5
+    # 摘要生成的最大并发数
+    max_summary_workers: int = 10
     
     # Pydantic配置：指定环境变量文件和相关设置
     model_config = SettingsConfigDict(

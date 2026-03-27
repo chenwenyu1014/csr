@@ -55,9 +55,12 @@ async def insert_content_to_template(
         }
     """
     try:
+        import traceback
         # 参数验证
         if not template_file or not data_json:
-            raise HTTPException(status_code=400, detail="缺少必需参数")
+            logger.error("缺少必需参数")
+            return {"success": False, "error": "缺少必需参数"}
+            # raise HTTPException(status_code=400, detail="缺少必需参数")
         
         logger.info(f"模板插入请求: template={template_file}")
         
@@ -66,10 +69,13 @@ async def insert_content_to_template(
         
         # 检查 Windows Bridge 配置
         if not settings.windows_bridge_url:
-            raise HTTPException(
-                status_code=500,
-                detail="需要配置WINDOWS_BRIDGE_URL用于Word文档处理"
-            )
+            logger.error("需要配置WINDOWS_BRIDGE_URL用于Word文档处理")
+            return {"success": False, "error": "需要配置WINDOWS_BRIDGE_URL用于Word文档处理"}
+
+            # raise HTTPException(
+            #     status_code=500,
+            #     detail="需要配置WINDOWS_BRIDGE_URL用于Word文档处理"
+            # )
         
         # 调用 Windows Bridge（异步）
         from service.linux.bridge.windows_bridge_client import WindowsBridgeClient
@@ -86,26 +92,33 @@ async def insert_content_to_template(
         
         if result is None:
             logger.error(f"❌ Windows Bridge调用失败")
-            raise HTTPException(
-                status_code=500,
-                detail="Windows Bridge插入失败: 无响应"
-            )
+            traceback.print_exc()
+            return {"success": False, "error": "Windows Bridge调用失败"}
+            # raise HTTPException(
+            #     status_code=500,
+            #     detail="Windows Bridge插入失败: 无响应"
+            # )
         
         if not result.get("success"):
             logger.error(f"❌ Windows Bridge返回错误: {result.get('error')}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Windows Bridge插入失败: {result.get('error', '未知错误')}"
-            )
+            traceback.print_exc()
+            return {"success": False, "error": "Windows Bridge插入失败"}
+            # raise HTTPException(
+            #     status_code=500,
+            #     detail=f"Windows Bridge插入失败: {result.get('error', '未知错误')}"
+            # )
         
         logger.info("✅ [异步] Windows Bridge插入成功")
         
         return JSONResponse(result)
     
-    except HTTPException:
-        raise
+    except HTTPException as e:
+        logger.error(f"模板插入失败: {e}", exc_info=True)
+        traceback.print_exc()
+        return {"success": False, "error": "模板插入失败"}
     except Exception as e:
         import traceback
         traceback.print_exc()
         logger.error(f"模板插入失败: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"success": False, "error": "模板插入失败"}
+        # raise HTTPException(status_code=500, detail=str(e))

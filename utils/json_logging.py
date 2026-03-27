@@ -34,13 +34,15 @@ def setup_json_logging(service: str = "csr-api", level: str = "INFO"):
     """
     # 创建handler
     handler = logging.StreamHandler(sys.stdout)
-    
     # 设置JSON格式化器
-    formatter = CustomJsonFormatter(
-        "%(timestamp)s %(level)s %(name)s %(message)s",
-        timestamp=True,
-        json_ensure_ascii=False
-    )
+    formatter=logging.Formatter(
+        '%(asctime)s - %(name)s(%(lineno)s) - %(levelname)s - %(message)s')
+
+    # formatter = CustomJsonFormatter(
+    #     "%(timestamp)s %(level)s %(name)s %(message)s",
+    #     timestamp=True,
+    #     json_ensure_ascii=False
+    # )
     handler.setFormatter(formatter)
     
     # 配置root logger
@@ -49,7 +51,7 @@ def setup_json_logging(service: str = "csr-api", level: str = "INFO"):
     if root_logger.handlers:
         root_logger.handlers.clear()
     root_logger.addHandler(handler)
-    
+
     # 配置特定logger
     for logger_name in ["uvicorn", "uvicorn.access", "uvicorn.error"]:
         logger = logging.getLogger(logger_name)
