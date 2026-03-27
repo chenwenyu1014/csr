@@ -396,21 +396,19 @@ class TwoStageExtractionService:
             current_output = model_output
             # 解析结果 带重试
             max_retries = 2
-            retry_count = 0
             parsed = None
             all_attempts_outputs = [model_output]
-            while retry_count <= max_retries:
+            for attempt in range(max_retries + 1):
                 parsed = self._parse_json_response(current_output)
                 if parsed:
-                    logger.info(f"✅ JSON 解析成功 (第 {retry_count + 1} 次尝试)")
+                    logger.info(f"✅ JSON 解析成功 (第 {attempt + 1} 次尝试)")
                     model_output = current_output
                     break
                 # 2. 解析失败处理
-                logger.warning(f"⚠️ 第 {retry_count + 1} 次解析失败。")
+                logger.warning(f"⚠️ 第 {attempt + 1} 次解析失败。")
 
-                if retry_count < max_retries:
-                    retry_count += 1
-                    logger.info(f"🔄 发起第 {retry_count} 次重试 ...")
+                if attempt < max_retries:
+                    logger.info(f"🔄 发起第 {attempt + 1} 次重试 ...")
                     current_output = self.llm.generate_single(prompt)
                     logger.info(f"🔍 重试后 LLM 输出长度: {len(current_output)}")
                     all_attempts_outputs.append(current_output)
@@ -426,7 +424,7 @@ class TwoStageExtractionService:
                     "success": False,
                     "stage": "chunk_filtering",
                     "timestamp": datetime.now().isoformat(),
-                    "error": f"无法解析模型输出为JSON (已重试{max_retries}次)",
+                    "error": f"无法解析模型输出为JSON (已重试{len(all_attempts_outputs)}次)",
                     "input_data": {
                         "extraction_query": extraction_query,
                         "task_name": task_name or "分块筛选",
@@ -439,7 +437,7 @@ class TwoStageExtractionService:
                     "model_output": current_output,  # 保存最后一次尝试的输出
                     "output_length": len(current_output),
                     "parse_error": "JSON解析失败",
-                    "retry_attempts": retry_count,
+                    "retry_attempts": len(all_attempts_outputs),
                 }
                 self._save_filtering_result(error_result)
                 return error_result
@@ -821,7 +819,8 @@ class TwoStageExtractionService:
         output_dir = get_current_output_dir(default="output")
         
         # 尝试从paragraph_id环境变量获取
-        paragraph_id = os.getenv("CURRENT_PARAGRAPH_ID", "")
+        from utils.context_manager import get_paragraph_id
+        paragraph_id = get_paragraph_id("")
         if not paragraph_id:
             # fallback: 使用默认目录
             paragraph_id = "default"

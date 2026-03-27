@@ -612,8 +612,16 @@ class CSRGenerationPipeline:
                             # 清理可能的调试信息（如 ## Source: xxx）
                             cleaned_content = content
                             # 移除 "## Source: xxx" 行
-                            import re
                             cleaned_content = re.sub(r'^##\s*Source:.*$', '', cleaned_content, flags=re.MULTILINE)
+                            # 新增：无 generate 时直接展示给用户，去掉 Excel Sheet 标头
+                            # 去除 "### Sheet: xxx" 行
+                            cleaned_content = re.sub(r'^###\s*Sheet:\s*.+\n?', '', cleaned_content, flags=re.MULTILINE)
+                            # 去除多 Sheet 之间的分隔线 "---"
+                            cleaned_content = re.sub(r'^\s*---\s*\n?', '', cleaned_content, flags=re.MULTILINE)
+                            # 去除 "## 来源: xxx" 行
+                            cleaned_content = re.sub(r'^##\s*来源:\s*.+\n?', '', cleaned_content, flags=re.MULTILINE)
+                            # 收拢多余空行
+                            cleaned_content = re.sub(r'\n{3,}', '\n\n', cleaned_content)
                             # ✅ 清理模型可能幻觉出的无效占位符（如 {{ORIGINAL_CONTENT:...}}）
                             cleaned_content = re.sub(r'\{\{ORIGINAL_CONTENT:[^}]*\}\}', '', cleaned_content)
                             cleaned_content = cleaned_content.strip()
@@ -652,6 +660,9 @@ class CSRGenerationPipeline:
                 generated_content = "\n\n".join(all_parts).strip()
                 # 去掉MD格式
                 generated_content = self._remove_md_formatting(generated_content)
+                if not para.insert_original:
+                    # word在提取的时候文本中可能包含了占位符，非图表引用模式要移除掉文件中原有的占位符{{}}
+                    generated_content = re.sub(r"\{\{(Table|Image)_\d+_start\}\}", "", generated_content)
 
                 # 流式事件：生成阶段（跳过模型）也推送汇总文本预览
                 try:

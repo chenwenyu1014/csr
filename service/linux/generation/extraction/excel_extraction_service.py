@@ -249,8 +249,8 @@ class ExcelExtractionService:
             for result in successful_sheets:
                 sheet_name = result.get("sheet_name")
                 content = result.get("content", "")
-                
-                combined_parts.append(f"### Sheet: {sheet_name}\n\n{content}\n")
+                if content:
+                    combined_parts.append(f"### Sheet: {sheet_name}\n\n{content}\n")
             
             combined_content = "\n---\n\n".join(combined_parts)
             

@@ -138,23 +138,48 @@ class DataSourceValidator:
         # 3) 模型匹配
         try:
             model_output_raw = self.llm.generate_single(prompt_text)
+
+            current_output = model_output_raw
+            all_attempts_outputs = [model_output_raw]
+            max_retries = 2
+            parsed = None
+
+            for attempt in range(max_retries + 1):
+                parsed = self._parse_json_response(current_output)
+                if parsed:
+                    logger.info(f"成功解析模型输出，第{attempt + 1}次尝试")
+                    model_output_raw = current_output
+                    break
+
+                logger.warning(f"⚠️ 第 {attempt + 1} 次尝试解析失败 - "
+                               f"输出前500字符: {current_output[:500] if current_output else 'None'}")
+                if attempt < max_retries:
+                    logger.info(f"正在尝试第 {attempt + 1} 次尝试解析")
+                    current_output = self.llm.generate_single(prompt_text)
+                    logger.info(f"🔍 重试后输出长度: {len(current_output) if current_output else 0}")
+                    all_attempts_outputs.append(current_output)
+                else:
+                    logger.error(f"已达最大重试次数（{max_retries}）,均解析失败。")
+                    break
+
             model_output_path = self._save_model_output(model_output_raw, prefix="data_source_matching_output", task_name=task_name)
-            parsed = self._parse_json_response(model_output_raw)
-            
+
             if parsed:
                 return {
                     "success": True,
                     "result": parsed,
                     "prompt_path": str(prompt_path) if prompt_path else None,
                     "raw_output": model_output_raw,
-                    "raw_output_path": str(model_output_path) if model_output_path else None
+                    "raw_output_path": str(model_output_path) if model_output_path else None,
+                    "total_attempts" : len(all_attempts_outputs)
                 }
             else:
                 return {
                     "success": False,
                     "error": "无法解析模型输出",
                     "raw_output": model_output_raw,
-                    "raw_output_path": str(model_output_path) if model_output_path else None
+                    "raw_output_path": str(model_output_path) if model_output_path else None,
+                    "total_attempts" : len(all_attempts_outputs)
                 }
         except Exception as e:
             import traceback
@@ -340,32 +365,47 @@ class DataSourceValidator:
             # 使用异步版本的 LLM 调用
             model_output_raw = await self.llm.generate_single_async(prompt_text)
             logger.info(f"[异步] 模型返回完成，输出长度={len(model_output_raw) if model_output_raw else 0}")
-            
+
+            current_output = model_output_raw
+            all_attempts_outputs = [model_output_raw]
+
+            max_retries = 2
+
+            for attempt in range(max_retries + 1):
+                parsed = self._parse_json_response(model_output_raw)
+
+                if parsed:
+                    logger.info(f"[异步] ✓ JSON解析成功（第 {attempt + 1} 次尝试），包含 {len(parsed)} 个顶层键")
+                    model_output_raw = current_output  # 以成功的那次输出为准
+                    break
+                logger.warning(f"[异步] ⚠️ 第 {attempt + 1} 次尝试解析失败 - "
+                               f"输出前500字符: {current_output[:500] if current_output else 'None'}")
+                # 如果解析失败，重试
+                if attempt < max_retries:
+                    logger.info(f"[异步] 发起第 {attempt + 1} 次重试...")
+                    current_output = await self.llm.generate_single_async(prompt_text)
+                    logger.info(f"[异步] 模型返回完成，输出长度={len(current_output) if current_output else 0}")
+                    all_attempts_outputs.append(current_output)
+                else:
+                    logger.error(f"[异步] ❌ JSON 解析失败 - 已达最大重试次数 ({max_retries}) - 模型输出前 500 字符：{model_output_raw[:500] if model_output_raw else 'None'}")
+                    break
+
             # 保存模型原始输出
             model_output_path = self._save_model_output(model_output_raw, prefix="data_source_validation_output", task_name=task_name)
             if model_output_path:
                 logger.info(f"[异步] 模型原始输出已保存: {model_output_path}")
-            
-            parsed = self._parse_json_response(model_output_raw)
-            
-            # 如果解析失败，记录详细错误信息
             if parsed is None:
-                logger.error(
-                    f"[异步] ❌ JSON解析失败 - 模型输出前500字符: {model_output_raw[:500] if model_output_raw else 'None'}"
-                )
                 logger.error(f"[异步] 提示词路径: {prompt_path}")
                 if model_output_path:
                     logger.error(f"[异步] 模型输出路径: {model_output_path}")
-            else:
-                logger.info(f"[异步] ✓ JSON解析成功，包含 {len(parsed)} 个顶层键")
-            
+
             return ValidationResult(
                 success=(parsed is not None),
                 prompt_path=str(prompt_path) if prompt_path else None,
                 model_output_raw=model_output_raw,
                 model_output_path=str(model_output_path) if model_output_path else None,
                 model_result=parsed,
-                pre_checks={"skipped": True},
+                pre_checks={"skipped": True,"total_attempts": len(all_attempts_outputs)},
             )
         except Exception as e:
             import traceback

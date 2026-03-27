@@ -112,33 +112,40 @@ class PreprocessingTaskService:
                     )
                 
                 # 成功
-                results.append({
+                result = {
                     "id": file_id or filename,
                     "filename": filename,
                     "status": "success",
                     "sha256": sha256_val,
-                })
+                }
+                if callback_url:
+                    await self._send_single_callback(callback_url, result)
                 succeeded += 1
                 logger.info(f"  ✅ [异步] 成功: {filename}")
                 
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                logger.error(f"  ❌ [异步] 失败: {filename}, 错误: {e}", exc_info=True)
-                results.append({
+                error_msg = str(e)
+                logger.error(f"  ❌ [异步] 失败：{filename}, 错误：{e}", exc_info=True)
+                result={
                     "id": file_id or filename,
                     "filename": filename,
                     "status": "fail",
-                    "sha256": sha256_val,
-                })
+                    "sha256": "",
+                    "err_msg": "预处理异常",
+                    "error": error_msg,
+                }
+                if callback_url:
+                    await self._send_single_callback(callback_url, result)
                 failed += 1
         
         logger.info(f"✅ [异步] 任务完成: {task_id}, 成功: {succeeded}, 失败: {failed}")
         
-        # 异步回调通知
-        if callback_url:
-            await self._send_callback(callback_url, results)
-    
+        # # 异步回调通知
+        # if callback_url:
+        #     await self._send_callback(callback_url, results)
+
     # ============================================================
     # 私有辅助方法
     # ============================================================
@@ -190,7 +197,7 @@ class PreprocessingTaskService:
         """
         try:
             logger.info(f"📤 [异步] 回调通知: {callback_url}")
-            
+
             # 使用 aiohttp 进行异步回调
             try:
                 import aiohttp
@@ -234,6 +241,61 @@ class PreprocessingTaskService:
             traceback.print_exc()
             logger.error(f"[异步] 回调失败: {e}", exc_info=True)
 
+    async def _send_single_callback(self, callback_url: Optional[str], result: dict):
+        """
+        发送单个文件的回调通知
+
+        Args:
+            callback_url: 回调 URL
+            result: 单个文件的处理结果（dict）
+        """
+        if not callback_url:
+            return
+
+        try:
+            logger.info(f"📤 [异步] 单文件回调通知: {callback_url}")
+            # 包装成列表，与批量回调保持一致的接口格式
+            json_str = json.dumps([result], ensure_ascii=False)
+
+            try:
+                import aiohttp
+
+                async with aiohttp.ClientSession() as session:
+                    data = aiohttp.FormData()
+                    data.add_field('dataJson', json_str)
+
+                    async with session.post(
+                            callback_url,
+                            data=data,
+                            timeout=aiohttp.ClientTimeout(total=30)
+                    ) as resp:
+                        status = resp.status
+                        text = await resp.text()
+                        try:
+                            resp_json = json.loads(text)
+                        except Exception:
+                            resp_json = None
+
+                        ok = (status == 200) and (
+                                not isinstance(resp_json, dict) or bool(resp_json.get("success", True))
+                        )
+                        if ok:
+                            logger.info(
+                                f"✅ [异步] 单文件回调成功: id={result.get('id')}, status={result.get('status')}")
+                        else:
+                            text = await resp.text()
+                            logger.warning(f"[异步] 单文件回调失败: status={status}, body={text[:200]}")
+            except ImportError:
+                # 如果 aiohttp 不可用，回退到同步 requests
+                import requests
+                files = {"dataJson": (None, json_str)}
+                response = requests.post(callback_url, files=files, timeout=30)
+                logger.info(f"单文件回调响应(同步回退): {response.status_code}")
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            logger.error(f"[异步] 单文件回调失败: {e}", exc_info=True)
 
 # ============================================================
 # 全局单例（线程安全）

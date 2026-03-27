@@ -1,4 +1,4 @@
-"""
+﻿"""
 数据提取器V2
 
 功能说明：
@@ -652,8 +652,8 @@ class DataExtractorV2:
             # 环境上下文：段落ID
             import os
             paragraph_id = getattr(self._context, 'paragraph_id', 'unknown')
-            os.environ['CURRENT_PARAGRAPH_ID'] = paragraph_id
-
+            from utils.context_manager import set_paragraph_id
+            set_paragraph_id(paragraph_id)
             aggregated_content_parts: List[str] = []
             aggregated_ids: List[str] = []
             per_file_extraction_results: List[Dict[str, Any]] = []

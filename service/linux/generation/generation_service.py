@@ -424,8 +424,9 @@ class GenerationService:
         task_manager = get_task_manager()
         run_dir = None
         task_logger = None
-        
+        flow_steps = ""  # 用于记录流程执行步骤
         try:
+
             # ===== 步骤1：执行生成流程 =====
             logger.info(f"[Compose异步] 开始步骤1: 文本生成, task_id={task_id}")
             
@@ -469,6 +470,7 @@ class GenerationService:
             # controller.word_post_processor = None
             
             try:
+                flow_steps = "执行生成流程"
                 # 执行生成
                 task_logger.info("开始执行生成流程")
                 flow_res = controller.generate_all_paragraphs()
@@ -483,10 +485,11 @@ class GenerationService:
                         "status": "失败",
                         "task_id": task_id,
                         "project_id": project_id,
+                        "err_msg": "生成流程失败",
                         "error": error_msg
                     })
                     return
-                
+                flow_steps = "处理生成结果"
                 # 处理生成结果
                 result = self._build_result(flow_res, run_dir)
                 logger.info(f"[Compose异步] 步骤1完成: 文本生成成功")
@@ -494,30 +497,33 @@ class GenerationService:
                 
                 # ===== 步骤2：调用模板插入（如果提供了模板）=====
                 if template_file:
+                    flow_steps = "执行模板插入"
                     logger.info(f"[Compose异步] 开始步骤2: 模板插入 - {template_file}")
                     task_logger.info("开始步骤2: 模板插入", template_file=template_file)
-                    
+
                     insertion_config = result.get("insertion_config", {})
                     data_json_str = json.dumps(insertion_config, ensure_ascii=False)
-                    
+
                     from service.linux.bridge.windows_bridge_client import WindowsBridgeClient
-                    
+
                     client = WindowsBridgeClient(self.settings.windows_bridge_url)
                     insertion_result = client.insert_content(
                         template_file=template_file,
                         data_json=data_json_str
                     )
-                    
+
                     if insertion_result and insertion_result.get("success"):
                         logger.info(f"[Compose异步] 步骤2完成: 模板插入成功")
                         task_logger.info("步骤2完成: 模板插入成功")
                         result["output_file"] = insertion_result.get("output_file")
                     else:
+                        flow_steps = "模板插入失败"
                         error_msg = insertion_result.get("error", "未知错误") if insertion_result else "Windows Bridge无响应"
                         logger.warning(f"[Compose异步] 步骤2失败: {error_msg}")
                         task_logger.warning("步骤2失败: 模板插入失败", error_msg=error_msg)
                         result["insertion_error"] = error_msg
                 else:
+                    flow_steps = "未提供模板文件"
                     logger.info(f"[Compose异步] 跳过步骤2: 未提供模板文件")
                     task_logger.info("跳过步骤2: 未提供模板文件")
                 
@@ -547,6 +553,7 @@ class GenerationService:
                 "status": "失败",
                 "task_id": task_id,
                 "project_id": project_id,
+                "err_msg": "任务执行失败"+flow_steps,
                 "error": str(e)
             })
         finally:
@@ -840,6 +847,8 @@ class GenerationService:
             
             logger.info(f"[Compose回调] 发送回调到: {callback_url}")
             logger.info(f"[Compose回调] project_id: {project_id}")
+            logger.info(f"[Compose回调] 数据: {data_json_str[:200]}")
+            logger.info(f"[Compose回调] 插入信息: {data.get('insertion_config','')}")  # 方便插入流程出错后测试
             logger.info(f"[Compose回调] 数据: status={data.get('status')}, success={data.get('success')}")
             
             with httpx.Client(timeout=30.0) as client:

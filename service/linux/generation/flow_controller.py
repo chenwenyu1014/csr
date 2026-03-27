@@ -250,9 +250,9 @@ class CSRFlowController:
                     from utils.json_logging import JSONLogFormatter  # type: ignore
                     formatter = JSONLogFormatter(service="flow")
                 except Exception:
-                    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                    formatter = logging.Formatter('%(asctime)s - %(name)s(%(lineno)s) - %(levelname)s - %(message)s')
             else:
-                formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                formatter = logging.Formatter('%(asctime)s - %(name)s(%(lineno)s) - %(levelname)s - %(message)s')
 
             # 自定义 FileHandler：每条日志后立即 flush，确保实时写入
             class FlushingFileHandler(logging.FileHandler):
@@ -337,7 +337,7 @@ class CSRFlowController:
         else:
             logging.basicConfig(
                 level=getattr(logging, self.config.log_level.upper()),
-                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+                format='%(asctime)s - %(name)s(%(lineno)s)- %(levelname)s - %(message)s'
             )
         logger.info("流程控制器初始化完成")
     
@@ -1533,6 +1533,8 @@ class CSRFlowController:
                 }
             )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             logger.error(f"批量生成失败: {e}")
             return FlowResult(
                 success=False,
