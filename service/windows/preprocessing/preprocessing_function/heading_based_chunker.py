@@ -12,7 +12,9 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from service.prompts.system_prompt_manager import SystemPromptManager
+from config import get_settings
 
+settings = get_settings()
 logger = logging.getLogger(__name__)
 
 # 正则表达式
@@ -79,8 +81,8 @@ class HeadingBasedChunker:
                 }
             }
         
-        # 使用线程池并发处理，每次5个
-        max_workers = 5
+        # 使用线程池并发处理
+        max_workers = settings.max_summary_workers
         section_results = [None] * len(sections)  # 预分配列表，保持顺序
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:

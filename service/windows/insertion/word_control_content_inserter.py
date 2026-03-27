@@ -243,7 +243,7 @@ class WordControlContentInserter:
         import re
 
         # 1. 统一换行符
-        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        text = text.replace('\r\n', '\r').replace('\n', '\r')
 
         # 2. 替换各种特殊空白为普通空格
         special_spaces = [
@@ -517,13 +517,6 @@ class WordControlContentInserter:
         # 清理可能导致 COM 错误的字符
         portrait_content = self._clean_text_for_word(portrait_content)
 
-        # 🆕 解锁控件（防止因控件锁定导致插入失败）
-        try:
-            control.LockContents = False
-            control.LockContentControl = False
-        except Exception:
-            pass  # 某些控件类型可能不支持这些属性
-
         # 清空控件并插入纵向内容（按照原始设计）
         # control.Range.Text = ""
         control.Range.Delete()
@@ -533,13 +526,6 @@ class WordControlContentInserter:
         # 应用格式
         control.Range.Font.Name = font_name
         control.Range.Font.Size = font_size
-
-        # 重新锁定控件（可选）
-        try:
-            control.LockContents = True
-            control.LockContentControl = True
-        except Exception:
-            pass
 
         logger.info(f"  ✅ 插入纵向内容 ({len(portrait_content)} 字符)")
 
@@ -807,6 +793,14 @@ class WordControlContentInserter:
             # 连接Word
             self._connect_word()
 
+            # import pythoncom
+            # pythoncom.CoInitialize()
+            # import win32com as win32com
+            # word = win32com.client.Dispatch("Word.Application")
+            # word.Visible = False  # 显示Word窗口
+            # word.DisplayAlerts = 0
+
+
             # 验证模板文件存在
             template_path = Path(template_file).absolute()
             if not template_path.exists():
@@ -828,6 +822,13 @@ class WordControlContentInserter:
                     delay=0.5
                 )
 
+                # doc = word.Documents.Open(
+                #         str(template_path),
+                #         ConfirmConversions=False,
+                #         ReadOnly=False,
+                #         AddToRecentFiles=False
+                #     )
+
                 # 验证文档对象
                 if doc is None:
                     raise RuntimeError(f"Word打开文档失败，返回None")
@@ -835,6 +836,8 @@ class WordControlContentInserter:
                 # 使用 com_retry 访问 doc.Name，防止 COM 繁忙错误
                 doc_name = com_retry(lambda: doc.Name, max_retries=5, delay=0.3)
                 logger.info(f"✅ 打开模板: {doc_name}")
+
+                doc_name = doc.Name
 
             except AttributeError as e:
                 # 如果仍然出错，说明 EnsureDispatch 也没有生效
@@ -886,28 +889,18 @@ class WordControlContentInserter:
 
                 if not valid_placeholders:
                     # 没有占位符，直接插入文本
-                    for control in controls:
+                    for i in range(cc_collection.Count):
+                        control = cc_collection.Item(i + 1)
                         try:
                             # 清理内容中可能导致 COM 错误的字符
                             cleaned_content = self._clean_text_for_word(generated_content)
-                            
-                            # 🆕 解锁控件（防止因控件锁定导致插入失败）
-                            try:
-                                control.LockContents = False
-                                control.LockContentControl = False
-                            except Exception:
-                                pass  # 某些控件类型可能不支持这些属性
-                            
-                            # 设置文本
-                            # 🆕 使用 Selection 对象插入文本（最稳定的方法）
-                            # 1. 选中控件并清空内容
-                            control.Range.Select()
-                            self.word.Selection.TypeText('')  # 清空选中内容
-                            # 2. 使用 Selection.TypeText 插入文本
-                            self.word.Selection.TypeText(cleaned_content)
+                            # control.Range.Text = cleaned_content
+                            control.Range.Text = cleaned_content
                             logger.info(f"  ✅ 文本插入成功 ({len(cleaned_content)} 字符)")
                             inserted_controls.append(control_title)
                         except Exception as e:
+                            # import traceback
+                            # traceback.print_exc()
                             logger.error(f"  ❌ 文本插入失败: {e}")
                             logger.error(f"  内容长度: {len(generated_content)} 字符")
                             logger.error(f"  内容前200字符: {generated_content[:200]}")
@@ -1138,3 +1131,100 @@ class WordControlContentInserter:
                     )
 
         return mappings
+
+    def test_word_control_insert(self):
+        """测试Word控件内容插入 - IDE调试版本"""
+
+        # ========== 在这里修改你的测试参数 ==========
+        word_file_path = r"C:\Users\yeedo\Desktop\4028829e9d0abef0019d23aa03bd0430.doc"  # 修改为你的Word文件路径
+        control_title = "main_research_objectives"  # 修改为你的控件标题
+        new_content = """队列1主要目的：评价高脂餐对健康参与者口服GFH375片的药代动力学影响。
+队列2主要目的：评价艾司奥美拉唑镁肠溶片对健康参与者口服GFH375片的药代动力学影响。"""
+        # 修改为你要插入的内容"
+
+        # ==========================================
+
+        word = None
+        doc = None
+
+        try:
+            print(f"📄 打开文件: {word_file_path}")
+            print(f"🎯 控件标题: {control_title}")
+            print(f"📝 新内容: {new_content}")
+            print("-" * 50)
+
+            # 启动Word
+            import win32com as win32com
+            word = win32com.client.Dispatch("Word.Application")
+            word.Visible = False  # 显示Word窗口
+            word.DisplayAlerts = 0
+            # 打开文档
+            doc = word.Documents.Open(
+                str(word_file_path),
+                ConfirmConversions=False,
+                ReadOnly=False,
+                AddToRecentFiles=False
+            )
+            print("✅ 文档打开成功")
+
+            # 查找控件
+            cc_collection = doc.SelectContentControlsByTitle(control_title)
+            print(f"🔍 找到控件数量: {cc_collection.Count}")
+            if cc_collection.Count == 0:
+                print(f"❌ 未找到控件: {control_title}")
+                return False
+            for i in range(cc_collection.Count):
+                control = cc_collection.Item(i + 1)
+                print(f"\n--- 控件 {i + 1} ---")
+                control.Range.Text = new_content
+
+            # 查找控件
+            cc_collection = doc.SelectContentControlsByTitle('project_name')
+            print(f"🔍 找到控件数量: {cc_collection.Count}")
+            if cc_collection.Count == 0:
+                print(f"❌ 未找到控件: {control_title}")
+                return False
+            for i in range(cc_collection.Count):
+                control = cc_collection.Item(i + 1)
+                print(f"\n--- 控件 {i + 1} ---")
+                control.Range.Text = 'p[pppp'
+
+
+            # 保存
+            doc.Save()
+            print(f"\n✅ 文档已保存")
+            return True
+
+        except Exception as e:
+            print(f"❌ 错误: {e}")
+            return False
+
+        finally:
+            # 关闭文档
+            if doc:
+                try:
+                    doc.Close()
+                except:
+                    pass
+
+            # 退出Word
+            if word:
+                try:
+                    word.Quit()
+                except:
+                    pass
+
+if __name__ == "__main__":
+    import re
+
+    # 1. 统一换行符
+    new_content = """队列1主要目的：评价高脂餐对健康参与者口服GFH375片的药代动力学影响。
+    队列2主要目的：评价艾司奥美拉唑镁肠溶片对健康参与者口服GFH375片的药代动力学影响。"""
+    text = new_content.replace('\r\n', '\r')
+    print(text)
+    # import pythoncom
+    # pythoncom.CoInitialize()
+    # inserter = WordControlContentInserter()  # 创建实例
+    # inserter.test_word_control_insert()
+
+

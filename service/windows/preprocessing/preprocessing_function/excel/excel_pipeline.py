@@ -121,7 +121,7 @@ def split_sheets(excel_path: Path | str, out_dir: Path | str) -> List[Dict[str, 
     regions: List[Dict[str, Any]] = []
     logger.info(f"split_sheets start | excel={excel_path} | out_dir={out_dir} | com_enabled={_com_enabled()}")
 
-    if _com_enabled():
+    if excel_path.suffix == ".xls":
         try:
             import pythoncom  # type: ignore
             import win32com.client as win32  # type: ignore
@@ -137,6 +137,18 @@ def split_sheets(excel_path: Path | str, out_dir: Path | str) -> List[Dict[str, 
                     name = ws.Name
                     safe_name = _safe_sheet_name(name)
                     sheet_file = out_dir / f"{excel_path.stem}_{safe_name}.xlsx"
+                    # 检测 sheet 是否有实质内容，跳过空 sheet
+                    try:
+                        used = ws.UsedRange
+                        row_count = used.Rows.Count
+                        col_count = used.Columns.Count
+                        if row_count == 1 and col_count == 1:
+                            cell_val = ws.Cells(used.Row, used.Column).Value
+                            if cell_val is None or str(cell_val).strip() == '':
+                                logger.info(f"跳过空 Sheet (COM) | name={name}")
+                                continue
+                    except Exception as e:
+                        logger.debug(f"Sheet内容检测失败，正常处理 | name={name} | err={e}")
                     # Save each sheet as its own workbook
                     ws.Copy()
                     new_wb = excel.ActiveWorkbook
@@ -179,6 +191,15 @@ def split_sheets(excel_path: Path | str, out_dir: Path | str) -> List[Dict[str, 
                         nws.merge_cells(str(merged))
                 except Exception:
                     pass
+                # 检查 sheet 是否有实质内容
+                has_content = False
+                for row in ws.iter_rows(values_only=True):
+                    if any(cell is not None and str(cell).strip() != '' for cell in row):
+                        has_content = True
+                        break
+                if not has_content:
+                    logger.info(f"跳过空 Sheet: {name}")
+                    continue
                 nwb.save(str(sheet_file))
                 logger.debug(f"openpyxl saved sheet | name={name} | path={sheet_file}")
                 regions.append({'sheet_name': name, 'file_path': str(sheet_file)})
