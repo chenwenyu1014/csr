@@ -9,6 +9,7 @@ POST /api/v1/datasource/allocate
 import json
 import logging
 import os
+import time
 
 # ========== 第三方库导入 ==========
 from fastapi import APIRouter, Form, HTTPException, Request
@@ -87,13 +88,15 @@ async def allocate_datasource(
         # 解析 items_json
         data = _parse_items_json(items_json)
         
-        logger.info(f"数据匹配请求(新版Schema): {len(data)} 个分组")
+        logger.info(f"数据匹配请求: {len(data)} 个段落标签")
+        start_time = time.time()
         
         # 使用服务层处理
         from service.linux.allocation.allocation_service import get_allocation_service
         
         allocation_service = get_allocation_service()
         result_groups = allocation_service.allocate_batch(data)
+        logger.info(f"数据匹配完成: {len(result_groups)} 个段落标签，耗时 {time.time() - start_time:.2f} 秒")
 
         return JSONResponse({
             "code": 200,

@@ -36,30 +36,25 @@ import json  # 标准库：JSON 读写
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request, HTTPException, Form
 from fastapi.responses import JSONResponse
+from pathlib import Path
+from dotenv import load_dotenv, find_dotenv
 
-# 配置详细日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s(%(lineno)s) - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+# 预加载环境变量，确保 setup_logging 能读取到 ENVIRONMENT 配置
+try:
+    _env_path = find_dotenv(usecwd=True)
+    if not _env_path:
+        _env_path = str(Path(__file__).resolve().parents[2] / ".env")
+    load_dotenv(_env_path, override=False, encoding="utf-8")
+except Exception:
+    pass
 
-# 设置本模块的logger级别
+# 使用统一日志配置（控制台 + 文件双输出）
+from utils.logging_config import setup_logging
+setup_logging(service_name="Bridge")
+
+# 设置本模块的logger
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 app = FastAPI(title="Windows Bridge Service", version="1.0.0")
-# ============================================================
-# Windows 串行任务锁（防止 win32/Office COM 并发导致崩溃）
-#
-# FastAPI 的同步 def 会在线程池中并发执行；但 Word/Excel COM
-# 在同一进程内并发非常脆弱，因此这里对“会触发 Office/COM 的路由”
-# 统一做全局串行化。
-#
-# 环境变量：
-# - WINDOWS_BRIDGE_SERIAL_MODE: "wait"(默认) | "reject"
-# - WINDOWS_BRIDGE_SERIAL_TIMEOUT: 秒；0/空=无限等待（仅 wait 模式有效）
-# - WINDOWS_BRIDGE_SERIAL_IPC_LOCK: "1"(默认) 开启跨进程文件锁；"0" 关闭
-# - WINDOWS_BRIDGE_SERIAL_LOCK_FILE: 锁文件路径（默认 AAA/.windows_bridge.lock）
 # ============================================================
 
 _WIN_BRIDGE_TASK_LOCK = threading.Lock()
@@ -189,26 +184,12 @@ wdOrientPortrait = 0
 # ========== 导入核心插入模块 ==========
 
 from pathlib import Path
-from service.windows.insertion.word_control_content_inserter import WordControlContentInserter, ResourceMapping
+from service.windows.insertion.word_control_content_inserter import WordControlContentInserter
 
 # 异步任务管理
 task_storage: Dict[str, Dict[str, Any]] = {}
 task_results: Dict[str, Any] = {}
 
-# # ❌ 删除顶部导入，改为函数内延迟导入
-# # PreprocessingService会在需要时才导入
-#
-#
-# def _make_content_disposition(filename: str) -> str:
-#     """
-#     生成支持中文文件名的 Content-Disposition 头部值
-#     使用 RFC 5987 格式：filename*=UTF-8''encoded_name
-#     """
-#     # ASCII 安全的备用文件名
-#     safe_filename = "file.bin"
-#     # URL编码的完整文件名（支持中文）
-#     encoded_filename = quote(filename.encode('utf-8'))
-#     return f'attachment; filename="{safe_filename}"; filename*=UTF-8\'\'{encoded_filename}'
 
 
 # 统一 JSON 日志
@@ -324,7 +305,121 @@ def _probe_win32_available() -> bool:
         return False
 
 
-# ---------- 清理Content Control并保留内容（COM） ----------
+# ---------- 清理文档（python-docx，优先方案） ----------
+
+def _clean_document_with_docx(file_path: str, output_path: str, remove_first_line: bool = True) -> Dict[str, Any]:
+    """
+    用 python-docx 清理文档（不依赖 COM，速度快）
+
+    功能：
+    1. 删除首行（水印）
+    2. 清理 Content Control 控件（保留内容）
+    3. 删除占位符标记段落
+
+    Args:
+        file_path: 输入文件路径
+        output_path: 输出文件路径
+        remove_first_line: 是否删除首行
+
+    Returns:
+        Dict: 包含成功状态、清理信息等
+    """
+    result = {
+        "success": False,
+        "controls_removed": 0,
+        "first_line_removed": False,
+        "markers_removed": False,
+        "error": None
+    }
+
+    try:
+        from docx import Document
+        import re
+
+        doc = Document(file_path)
+
+        # 1. 删除首行
+        if remove_first_line and len(doc.paragraphs) > 0:
+            first_para = doc.paragraphs[0]._element
+            parent = first_para.getparent()
+            if parent is not None:
+                parent.remove(first_para)
+                result["first_line_removed"] = True
+                logger.info("✅ 已删除首行")
+
+        # 2. 清理 Content Control（只删除有 tag 的自定义控件，保留内容）
+        body = doc._element.body
+        WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+        # 找到所有 sdt 元素
+        sdt_elements = body.findall(f'.//{{{WNS}}}sdt')
+        controls_count = 0
+
+        for sdt in sdt_elements:
+            try:
+                # 检查是否有 tag（自定义控件有 tag，目录控件等没有）
+                sdt_pr = sdt.find(f'{{{WNS}}}sdtPr')
+                if sdt_pr is not None:
+                    tag_elem = sdt_pr.find(f'{{{WNS}}}tag')
+                    if tag_elem is None:
+                        # 没有 tag，不是自定义控件（如目录），跳过
+                        continue
+
+                # 获取 sdtContent 里的内容
+                sdt_content = sdt.find(f'{{{WNS}}}sdtContent')
+                if sdt_content is not None:
+                    # 取出 sdtContent 的所有子元素
+                    children = list(sdt_content)
+                    parent = sdt.getparent()
+                    if parent is not None:
+                        # 用 addnext 从后往前插入，保证最终顺序正确
+                        for child in reversed(children):
+                            sdt.addnext(child)
+                        parent.remove(sdt)
+                        controls_count += 1
+            except Exception:
+                pass
+
+        result["controls_removed"] = controls_count
+        logger.info(f"✅ 已清理 {controls_count} 个 Content Control 控件")
+
+        # 3. 删除占位符标记段落
+        marker_regex = re.compile(r'^\{\{(TemplateTable_\d+_Start|TemplateTable_\d+_End|标题：[^}]+)\}\}$')
+
+        to_delete = []
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if marker_regex.match(text):
+                to_delete.append(para._element)
+
+        deleted_markers = 0
+        for elem in to_delete:
+            parent = elem.getparent()
+            if parent is not None:
+                parent.remove(elem)
+                deleted_markers += 1
+
+        result["markers_removed"] = deleted_markers > 0
+        if deleted_markers > 0:
+            logger.info(f"✅ 已清理 {deleted_markers} 个占位符标记段落")
+        else:
+            logger.info("ℹ️ 文档中没有占位符标记")
+
+        # 保存
+        doc.save(output_path)
+        result["success"] = True
+        result["output_file"] = output_path
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        result["error"] = str(e)
+        logger.error(f"python-docx 清理失败: {e}", exc_info=True)
+
+    return result
+
+
+# ---------- 清理Content Control并保留内容（COM，回退方案） ----------
 
 def _clean_content_controls_preserve_content(file_path: str, output_path: str, remove_first_line: bool = True) -> Dict[str, Any]:
     """
@@ -348,6 +443,7 @@ def _clean_content_controls_preserve_content(file_path: str, output_path: str, r
         "success": False,
         "controls_removed": 0,
         "first_line_removed": False,
+        "markers_removed": False,
         "error": None
     }
     
@@ -432,7 +528,57 @@ def _clean_content_controls_preserve_content(file_path: str, output_path: str, r
                 import traceback
                 traceback.print_exc()
                 logger.warning(f"删除首行失败: {e}")
-        
+
+        # 3. 清理模板占位符标记 {{Table_*_Start}}、{{Table_*_End}}、{{标题：...}}
+        # 用 python-docx 处理（更快更可靠）
+        result["markers_removed"] = False
+        try:
+            from docx import Document
+            import re
+
+            # 标记匹配正则
+            marker_regex = re.compile(r'^\{\{(Table_\d+_Start|Table_\d+_End|标题：[^}]+)\}\}$')
+
+            # 先保存当前 COM 文档状态
+            doc.Save()
+            doc.Close(SaveChanges=False)
+
+            # 用 python-docx 打开并处理
+            docx_doc = Document(str(Path(output_path).resolve()))
+
+            # 收集要删除的段落元素
+            to_delete = []
+            for para in docx_doc.paragraphs:
+                text = para.text.strip()
+                if marker_regex.match(text):
+                    to_delete.append(para._element)
+
+            # 删除段落元素（直接操作 XML）
+            deleted_count = 0
+            for elem in to_delete:
+                parent = elem.getparent()
+                if parent is not None:
+                    parent.remove(elem)
+                    deleted_count += 1
+
+            # 保存
+            docx_doc.save(str(Path(output_path).resolve()))
+
+            result["markers_removed"] = deleted_count > 0
+
+            if deleted_count > 0:
+                logger.info(f"✅ 已清理 {deleted_count} 个占位符标记段落")
+            else:
+                logger.info("ℹ️ 文档中没有占位符标记")
+
+            # 重新打开文档（后续流程需要）
+            doc = word.Documents.Open(str(Path(output_path).resolve()), ReadOnly=False)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            logger.warning(f"清理占位符标记失败: {e}")
+
         # 保存到输出路径
         output_path_resolved = str(Path(output_path).resolve())
         # 确保输出目录存在
@@ -549,155 +695,6 @@ def _clear_first_line_with_com_bytes(src_bytes: bytes, suffix: str) -> Optional[
         logger.warning(f"COM 清理首行失败: {e}")
         return None
 
-# def _insert_head_break_with_com(src_bytes: bytes) -> Optional[bytes]:
-#     try:
-#         import win32com.client as win32  # type: ignore
-#     except Exception:
-#         return None
-#     from utils.windows_com import safe_dispatch
-#     try:
-#         with tempfile.TemporaryDirectory() as td:
-#             td = str(td)
-#             inp = os.path.join(td, f"in_{uuid.uuid4().hex[:8]}.rtf")
-#             outp = os.path.join(td, f"out_{uuid.uuid4().hex[:8]}.rtf")
-#             with open(inp, "wb") as f:
-#                 f.write(src_bytes)
-#
-#             com_inited = False
-#             try:
-#                 import pythoncom  # type: ignore
-#                 try:
-#                     pythoncom.CoInitialize()
-#                     com_inited = True
-#                 except Exception:
-#                     pass
-#             except Exception:
-#                 com_inited = False
-#
-#             word = safe_dispatch("Word.Application", use_ex=False, logger=logger)
-#             try:
-#                 word.Visible = False
-#             except Exception:
-#                 pass
-#             doc = None
-#             try:
-#                 doc = word.Documents.Open(inp, ReadOnly=False)
-#                 rng = doc.Range(Start=0, End=0)
-#                 # 2 = wdSectionBreakNextPage
-#                 rng.InsertBreak(2)
-#                 doc.SaveAs(outp)
-#                 data = open(outp, "rb").read()
-#             finally:
-#                 try:
-#                     if doc is not None:
-#                         doc.Close(SaveChanges=True)
-#                 except Exception:
-#                     pass
-#                 try:
-#                     word.Quit()
-#                 except Exception:
-#                     pass
-#                 try:
-#                     if com_inited:
-#                         import pythoncom  # type: ignore
-#                         pythoncom.CoUninitialize()
-#                 except Exception:
-#                     pass
-#             return data
-#     except Exception as e:
-#         logger.warning(f"COM 插入分节符失败: {e}")
-#         return None
-#
-#
-# # ---------- RTF -> TXT ----------
-#
-# def _rtf_to_txt_with_com_bytes(src_bytes: bytes) -> Optional[bytes]:
-#     try:
-#         import win32com.client as win32  # type: ignore
-#     except Exception:
-#         return None
-#     from utils.windows_com import safe_dispatch
-#     try:
-#         with tempfile.TemporaryDirectory() as td:
-#             td = str(td)
-#             inp = os.path.join(td, f"in_{uuid.uuid4().hex[:8]}.rtf")
-#             outp = os.path.join(td, f"out_{uuid.uuid4().hex[:8]}.txt")
-#             with open(inp, "wb") as f:
-#                 f.write(src_bytes)
-#
-#             com_inited = False
-#             try:
-#                 import pythoncom  # type: ignore
-#                 try:
-#                     pythoncom.CoInitialize()
-#                     com_inited = True
-#                 except Exception:
-#                     pass
-#             except Exception:
-#                 com_inited = False
-#
-#             word = safe_dispatch("Word.Application", use_ex=False, logger=logger)
-#             try:
-#                 word.Visible = False
-#                 word.DisplayAlerts = 0
-#             except Exception:
-#                 pass
-#             doc = None
-#             wdFormatUnicodeText = 7
-#             wdCRLF = 0
-#             wdDoNotSaveChanges = 0
-#             try:
-#                 doc = word.Documents.Open(inp, ReadOnly=True, ConfirmConversions=False, AddToRecentFiles=False)
-#                 doc.SaveAs2(FileName=outp, FileFormat=wdFormatUnicodeText, LineEnding=wdCRLF, LockComments=False, AddToRecentFiles=False)
-#                 # 读取为二进制（UTF-16LE）
-#                 data = open(outp, "rb").read()
-#             finally:
-#                 try:
-#                     if doc is not None:
-#                         doc.Close(SaveChanges=wdDoNotSaveChanges)
-#                 except Exception:
-#                     pass
-#                 try:
-#                     word.Quit()
-#                 except Exception:
-#                     pass
-#                 try:
-#                     if com_inited:
-#                         import pythoncom  # type: ignore
-#                         pythoncom.CoUninitialize()
-#                 except Exception:
-#                     pass
-#             return data
-#     except Exception as e:
-#         logger.warning(f"COM RTF->TXT 失败: {e}")
-#         return None
-#
-#
-#
-# # ---------- Word 标记/扫描/导出（COM优先） ----------
-#
-# def _com_open_docx(path: str):
-#     import win32com.client as win32  # type: ignore
-#     from utils.windows_com import safe_dispatch
-#     try:
-#         import pythoncom  # type: ignore
-#         try:
-#             pythoncom.CoInitialize()
-#         except Exception:
-#             pass
-#     except Exception:
-#         pass
-#     word = safe_dispatch("Word.Application", use_ex=False, logger=logger)
-#     try:
-#         word.Visible = False
-#         word.DisplayAlerts = 0
-#         word.ScreenUpdating = False
-#     except Exception:
-#         pass
-#     doc = word.Documents.Open(path)
-#     return word, doc
-# # ---------- Content Control插入 API ----------
-# # 注意：bundle.zip接口已弃用，只使用直接模式接口
 
 @app.post("/ky/sys/ai/insert_direct")
 def content_control_insert_direct(
@@ -731,7 +728,7 @@ def _content_control_insert_direct_impl(*, template_file: str, data_json: str, r
         # ✅ 显示原始参数（用于调试）
         logger.info(f"📄 接收到的template_file: {template_file}")
         logger.info(f"📄 接收到的data_json长度: {len(data_json)} 字符")
-        logger.info(f"📄 data_json前500字符: {data_json[:500]}")
+        # logger.info(f"📄 data_json前500字符: {data_json[:500]}")
         
         # 解析JSON数据
         data = json.loads(data_json)
@@ -750,10 +747,48 @@ def _content_control_insert_direct_impl(*, template_file: str, data_json: str, r
             # 确保有status字段
             if 'status' not in item:
                 item['status'] = 'success'
-        
-        resource_mappings_dict = data.get('resource_mappings', {})
-        control_placeholder_mapping = data.get('control_placeholder_mapping', {})  # 控件-占位符映射
-        
+
+            # 兼容 generated_content 为 dict 对象的情况（表格 JSON）
+            # 如果是 dict 类型，转为 JSON 字符串，以便下游 _is_table_json() 检测
+            gc = item.get('generated_content')
+            if isinstance(gc, dict):
+                item['generated_content'] = json.dumps(gc, ensure_ascii=False)
+                logger.info(f"  🔄 generated_content 从 dict 转为 JSON 字符串（段落: {item.get('control_title')}）")
+
+            # 清理段落级 resource_mappings 的路径
+            paragraph_mappings = item.get('resource_mappings', {})
+            if paragraph_mappings:
+                cleaned_mappings = {}
+                for placeholder, mapping in paragraph_mappings.items():
+                    rel_path = mapping.get('path', '') if isinstance(mapping, dict) else str(mapping)
+
+                    # 统一路径分隔符
+                    clean_path = rel_path.replace("\\", "/")
+
+                    # 处理混合路径格式（如 /home/xxx/AAA/project_data/...）
+                    aaa_idx = clean_path.lower().find("/aaa/")
+                    if aaa_idx != -1:
+                        clean_path = clean_path[aaa_idx + 5:]  # 跳过 /AAA/
+                    elif clean_path.lower().startswith("aaa/"):
+                        clean_path = clean_path[4:]  # 跳过 AAA/
+                    elif clean_path.startswith("/"):
+                        clean_path = clean_path[1:]  # 去掉开头的 /
+
+                    # 转换为本地相对路径
+                    resource_path = f"../AAA/{clean_path}"
+                    if not Path(resource_path).exists():
+                        resource_path = f"AAA/{clean_path}"
+
+                    # 保留原有映射结构
+                    if isinstance(mapping, dict):
+                        cleaned_mappings[placeholder] = {**mapping, 'path': resource_path}
+                    else:
+                        cleaned_mappings[placeholder] = {'path': resource_path}
+
+                    logger.info(f"  段落资源路径清理: {placeholder} -> {Path(resource_path).name}")
+
+                item['resource_mappings'] = cleaned_mappings
+
         # ✅ 清理模板路径：确保是相对路径
         # 先去除首尾的空白和引号
         clean_template = template_file.strip().strip('"').strip("'")
@@ -796,57 +831,6 @@ def _content_control_insert_direct_impl(*, template_file: str, data_json: str, r
         
         logger.info(f"模板文件: {template_path}")
         logger.info(f"段落数: {len(generation_results)}")
-        logger.info(f"占位符数: {len(resource_mappings_dict)}")
-        
-        # ⚠️ 如果段落数为0但有占位符，发出警告
-        if len(generation_results) == 0 and len(resource_mappings_dict) > 0:
-            logger.warning("⚠️ 检测到异常：有资源映射但没有段落内容！")
-            logger.warning(f"   可能原因：data_json格式错误或generation_results字段缺失")
-            logger.warning(f"   正确格式请参考: tests/test_windows_insert_direct.py")
-        
-        # 如果提供了控件-占位符映射，打印出来
-        if control_placeholder_mapping:
-            logger.info("控件-占位符映射关系：")
-            for control_title, placeholders in control_placeholder_mapping.items():
-                logger.info(f"  {control_title}: {placeholders}")
-        
-        # 转换资源映射（路径相对于AAA）
-        resource_mappings = {}
-        for placeholder, mapping in resource_mappings_dict.items():
-            rel_path = mapping.get('path', '')
-            
-            # ✅ 清理资源路径：确保是相对路径
-            # 统一路径分隔符
-            clean_path = rel_path.replace("\\", "/")
-            
-            # 🆕 处理混合路径格式（如 /home/xxx/AAA/project_data/...）
-            # 找到 AAA/ 或 /AAA/ 的位置，从那里开始截取
-            aaa_idx = clean_path.lower().find("/aaa/")
-            if aaa_idx != -1:
-                clean_path = clean_path[aaa_idx + 5:]  # 跳过 /AAA/
-            elif clean_path.lower().startswith("aaa/"):
-                clean_path = clean_path[4:]  # 跳过 AAA/
-            elif clean_path.startswith("/"):
-                clean_path = clean_path[1:]  # 去掉开头的 /
-            
-            logger.info(f"  资源路径清理: {rel_path[:50]}... -> {clean_path}")
-            
-            # 直接使用相对路径（相对于AAA）
-            resource_path = f"../AAA/{clean_path}"
-            if not Path(resource_path).exists():
-                resource_path = f"AAA/{clean_path}"
-            
-            # 检查文件是否存在
-            if not Path(resource_path).exists():
-                logger.warning(f"  ⚠️ 文件不存在: {resource_path}")
-            
-            resource_mappings[placeholder] = ResourceMapping(
-                placeholder=placeholder,
-                path=resource_path,
-                type=mapping.get('type', 'table'),
-                source_file=mapping.get('source_file', '')
-            )
-            logger.info(f"  资源: {placeholder} -> {Path(resource_path).name}")
         
         # 输出文件路径（相对路径）
         output_dir = "../AAA/output"
@@ -861,11 +845,10 @@ def _content_control_insert_direct_impl(*, template_file: str, data_json: str, r
         logger.info(f"输出文件: {output_file}")
         
         # 执行插入
-        inserter = WordControlContentInserter()  # 不需要传递shared_root参数
+        inserter = WordControlContentInserter()
         result = inserter.insert_to_template(
             template_file=template_path,
             generation_results=generation_results,
-            resource_mappings=resource_mappings,
             output_file=output_file
         )
         
@@ -1052,13 +1035,24 @@ def _clean_document_impl(
         logger.info(f"🔧 删除首行: {remove_first_line}")
         logger.info(f"🔧 清理控件: {remove_content_controls}")
         
-        # 执行清理（对复制的文件进行清理）
+        # 执行清理（优先 python-docx，失败回退 COM）
         if remove_content_controls:
-            result = _clean_content_controls_preserve_content(
-                file_path=str(output_full_path),  # 使用复制的文件作为输入
-                output_path=str(output_full_path),  # 输出到同一路径（覆盖复制的文件）
+            # 先尝试 python-docx（快速）
+            logger.info("🚀 尝试使用 python-docx 清理...")
+            result = _clean_document_with_docx(
+                file_path=str(output_full_path),
+                output_path=str(output_full_path),
                 remove_first_line=remove_first_line
             )
+
+            # 如果失败，回退到 COM
+            if not result.get("success"):
+                logger.warning("⚠️ python-docx 清理失败，回退到 COM 方案")
+                result = _clean_content_controls_preserve_content(
+                    file_path=str(output_full_path),
+                    output_path=str(output_full_path),
+                    remove_first_line=remove_first_line
+                )
         else:
             # 只删除首行，不清理控件
             result = {"success": False, "error": "仅删除首行功能暂未单独实现"}
@@ -1099,7 +1093,8 @@ def _clean_document_impl(
                 "success": True,
                 "output_file": output_rel_path or str(output_full_path),
                 "controls_removed": result.get("controls_removed", 0),
-                "first_line_removed": result.get("first_line_removed", False)
+                "first_line_removed": result.get("first_line_removed", False),
+                "markers_removed": result.get("markers_removed", False)
             })
         else:
             raise HTTPException(status_code=500, detail=f"清理失败: {result.get('error', '未知错误')}")

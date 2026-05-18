@@ -1,7 +1,7 @@
 """
 CSR API Service - 主应用入口
 
-这是CSR文档生成系统的FastAPI主应用，包含以下6个核心接口：
+这是CSR文档生成系统的FastAPI主应用，包含以下8个核心接口：
 1. validation - 数据源验证接口
 2. generation - 内容生成接口
 3. compose - 文档合成接口
@@ -9,6 +9,7 @@ CSR API Service - 主应用入口
 5. insertion - 内容插入接口
 6. allocation - 数据分配接口
 7. postprocessing - 后处理接口
+8. template - 模板处理接口
 
 主要功能：
 - 提供RESTful API接口
@@ -29,7 +30,7 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv, find_dotenv
 
 from config import get_settings
-from utils import setup_json_logging, request_id_ctx
+from utils import request_id_ctx,setup_logging
 
 # ========== 环境变量预加载 ==========
 # 预加载环境变量，优先查找当前工作目录下的.env文件
@@ -47,8 +48,8 @@ except Exception:
 # 初始化应用配置
 settings = get_settings()
 
-# 设置JSON格式的结构化日志
-setup_json_logging(service="api", level=settings.log_level)
+# 设置统一日志配置（控制台 + 文件双输出）
+setup_logging(service_name="API")
 
 # 获取当前模块的日志记录器
 logger = logging.getLogger(__name__)
@@ -187,7 +188,8 @@ async def startup_event():
         preprocessing,   # 预处理接口
         insertion,       # 内容插入接口
         allocation,      # 数据分配接口
-        postprocessing   # 后处理接口
+        postprocessing,  # 后处理接口
+        template         # 模板处理接口
     )
     
     # 注册所有路由到主应用，统一使用/api/v1前缀
@@ -198,6 +200,7 @@ async def startup_event():
     app.include_router(insertion.router, prefix="/api/v1", tags=["insertion"])
     app.include_router(allocation.router, prefix="/api/v1", tags=["allocation"])
     app.include_router(postprocessing.router, prefix="/api/v1", tags=["postprocessing"])
+    app.include_router(template.router, prefix="/api/v1", tags=["template"])
     
     logger.info("所有路由注册完成")
 

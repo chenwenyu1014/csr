@@ -1,4 +1,4 @@
-﻿"""
+"""
 数据提取器V2
 
 功能说明：
@@ -246,11 +246,46 @@ class DataExtractorV2:
                 return {
                     "item": item,
                     "status": "error",
+                    "error_type": "EXTRACTION_EXCEPTION",
                     "error": str(e),
                     "content": None
                 }
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        # ========== 段落级数据源校验 ==========
+        data_items = paragraph_data.get("data", [])
+        if not data_items:
+            logger.warning(f"⚠️ [extract_paragraph_data] 段落 {paragraph_id} 无数据项")
+            logger.warning(f"   请检查JSON配置中该段落的datas字段")
+            # 添加一个 error 项到 extracted_items，以便 pipeline.py 能检测到错误
+            extracted_data["extracted_items"].append({
+                "item": {"item_id": "N/A"},
+                "status": "error",
+                "error_type": "NO_DATA_SOURCE",
+                "error": "段落未分配数据源：datas字段为空。请检查JSON配置。",
+                "content": "",
+                "data_type": "unknown"
+            })
+            return extracted_data
+
+        # 检查是否有有效的数据项（至少有一个file_type不为空）
+        valid_items = [item for item in data_items if item.get("file_type")]
+        if not valid_items:
+            logger.warning(f"⚠️ [extract_paragraph_data] 段落 {paragraph_id} 所有数据项均缺少file_type")
+            logger.warning(f"   请检查数据源分配逻辑")
+            # 添加一个 error 项到 extracted_items，以便 pipeline.py 能检测到错误
+            first_item = data_items[0] if data_items else {}
+            extracted_data["extracted_items"].append({
+                "item": first_item,
+                "status": "error",
+                "error_type": "NO_DATA_SOURCE",
+                "error": "数据项缺少数据源配置：所有数据项的file_type均为空。请检查数据源分配逻辑。",
+                "content": "",
+                "data_type": "unknown",
+                "item_id": first_item.get("item_id"),
+                "directory": first_item.get("directory")
+            })
+            return extracted_data
         items = list(enumerate(paragraph_data["data"]))
 
         # 限制并发数：取配置值与数据项数量的较小值
@@ -294,6 +329,7 @@ class DataExtractorV2:
                         results_buffer[idx] = {
                             "item": items[idx][1],
                             "status": "error",
+                            "error_type": "EXECUTION_EXCEPTION",
                             "error": str(e),
                             "content": None,
                             "stack_trace": stack_trace
@@ -383,7 +419,26 @@ class DataExtractorV2:
         extract_prompt = data_item.get("extract", "")
         source_file = data_item.get("source_file", "")
         quote = data_item.get("quote")  # 获取quote字段（用于在生成内容前添加引用标签）
-        logger.info(f"🔍 [extract_single_data_item] quote字段值: {quote}, 文件类型: {file_type}")
+        # ✅ 新增：读取溯源信息字段
+        item_id = data_item.get("item_id")           # 资料编号
+        directory = data_item.get("directory")       # 来源目录
+        file_names = data_item.get("file_name", [])  # 溯源文件名列表
+
+        # ========== 数据项级数据源校验 ==========
+        # 检查是否缺少数据源配置（datas为空时传入的占位项）
+        if not file_type:
+            logger.warning(f"⚠️ [extract_single_data_item] 数据项缺少数据源配置")
+            logger.warning(f"   请检查JSON配置中该段落的datas字段是否已分配数据源")
+            return {
+                "item": data_item,
+                "status": "error",
+                "error_type": "NO_DATA_SOURCE",  # 新增错误类型字段
+                "error": "数据项缺少数据源配置：file_type为空。请检查JSON配置中该段落的datas字段。",
+                "content": "",
+                "data_type": "unknown",
+                "item_id": item_id,
+                "directory": directory
+            }
 
         # 映射文件类型到处理器
         type_mapping = {
@@ -401,6 +456,7 @@ class DataExtractorV2:
             return {
                 "item": data_item,
                 "status": "error",
+                "error_type": "UNSUPPORTED_FILE_TYPE",
                 "error": f"不支持的文件类型: {file_type}",
                 "content": "",
                 "data_type": data_type
@@ -429,6 +485,13 @@ class DataExtractorV2:
             if "markdown_files" in data_item:
                 result.setdefault("markdown_files", data_item.get("markdown_files"))
             result["insert_original"] = insert_original
+            # ✅ 新增：添加溯源信息字段
+            if item_id is not None:
+                result["item_id"] = item_id
+            if directory:
+                result["directory"] = directory
+            if file_names:
+                result["file_name"] = file_names
             if result.get("status") == "success":
                 result.setdefault("traceability", {
                     "data_type": data_type,
@@ -452,6 +515,13 @@ class DataExtractorV2:
             # ✅ 添加quote字段
             if quote:
                 output["quote"] = quote
+            # ✅ 新增：添加溯源信息字段
+            if item_id is not None:
+                output["item_id"] = item_id
+            if directory:
+                output["directory"] = directory
+            if file_names:
+                output["file_name"] = file_names
             # 合并除content以外的附加信息
             for k, v in result.items():
                 if k == "content":
@@ -479,6 +549,13 @@ class DataExtractorV2:
             # ✅ 添加quote字段
             if quote:
                 output["quote"] = quote
+            # ✅ 新增：添加溯源信息字段
+            if item_id is not None:
+                output["item_id"] = item_id
+            if directory:
+                output["directory"] = directory
+            if file_names:
+                output["file_name"] = file_names
             return output
 
     def _handle_word_type(self, data_item: Dict[str, Any]) -> Dict[str, Any]:
@@ -493,22 +570,29 @@ class DataExtractorV2:
         【quote字段处理】
         将quote字段传递给_extract_from_chunks，最终包含在返回结果中
         """
-        # ✅ 读取处理所需的关键字段
+        # 读取处理所需的关键字段
         extract_prompt = data_item.get("extract", "")
         original_mode = data_item.get("original_mode", False)
         insert_original = data_item.get("insert_original", False)
         chunks_file = data_item.get("chunks_file", "")
-        quote = data_item.get("quote")  # 获取quote字段，将传递给_extract_from_chunks
-        logger.info(f"🔍 [_handle_word_type] quote字段值: {quote}")
+        quote = data_item.get("quote")
+        per_file_ragflow_list = data_item.get("per_file_ragflow_list", [])  # per-file RAGFlow 内容
+
+        # logger.info(f"🔍 [_handle_word_type] quote字段值: {quote}")
+        # if per_file_ragflow_list:
+        #     logger.info(f"📌 [_handle_word_type] per-file RAGFlow: {len(per_file_ragflow_list)} 个文件")
 
         # 如果无提取逻辑，并且是原文模式，则提取全部内容
         if (not extract_prompt or not extract_prompt.strip()) and original_mode:
             logger.info("无提取逻辑且为原文模式，直接加载全部分块内容")
-            return self._load_all_chunks_content(chunks_file, quote=quote, doc_type="word",insert_original=insert_original)
+            return self._load_all_chunks_content(chunks_file, quote=quote, doc_type="word", insert_original=insert_original)
 
-        # 有提取逻辑，调用统一的提取入口，内部会根据 original_mode 决定是否让模型改写内容
-        # 原文模式处理insert_original
-        return self._extract_from_chunks(chunks_file, extract_prompt, "word", original_mode=original_mode, quote=quote,insert_original=insert_original)
+        # 有提取逻辑，调用统一的提取入口
+        return self._extract_from_chunks(
+            chunks_file, extract_prompt, "word",
+            original_mode=original_mode, quote=quote, insert_original=insert_original,
+            per_file_ragflow_list=per_file_ragflow_list, data_item=data_item
+        )
 
     def _load_all_chunks_content(self, chunks_file, doc_type: str, quote=None,insert_original= False):
         """
@@ -523,7 +607,7 @@ class DataExtractorV2:
             elif isinstance(chunks_file, list):
                 chunks_files = chunks_file
             else:
-                return {"status": "error", "error": "chunks_file格式错误", "content": ""}
+                return {"status": "error", "error_type": "INVALID_CHUNKS_FILE", "error": "chunks_file格式错误", "content": ""}
 
             aggregated_parts = []
             total_sections = 0
@@ -573,12 +657,15 @@ class DataExtractorV2:
             traceback.print_exc()
             logger.error(f"全文加载失败: {e}", exc_info=True)
             return {"status": "error",
+                    "error_type": "FULL_LOAD_FAILED",
                     "error": str(e),
                     "content": "",
                     "quote": quote}
 
     def _extract_from_chunks(self, chunks_file, extract_prompt: str, doc_type: str, original_mode: bool = False,
-                             quote: Optional[str] = None,insert_original=False) -> Dict[str, Any]:
+                             quote: Optional[str] = None, insert_original=False,
+                             per_file_ragflow_list: Optional[List[Dict[str, str]]] = None,
+                             data_item: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         从分块数据中进行两阶段提取
 
@@ -596,6 +683,10 @@ class DataExtractorV2:
             - 输出：提取的内容文本
             - 目标：根据需求从相关分块中提取关键信息
 
+        【RAGFlow 集成】
+            - 使用 per_file_ragflow_list（每个文件独立检索的 RAGFlow 内容）
+            - 在阶段2构建内容时将 RAGFlow 分块拼在本地分块后（标记来源）
+
         【quote字段处理】
         - 成功时：将quote字段添加到return_data中
         - 失败时：将quote字段添加到error_data中
@@ -607,6 +698,7 @@ class DataExtractorV2:
             doc_type: 文档类型 ("word" 或 "pdf")
             original_mode: 是否为原文模式（保留占位符）
             quote: 引用标签（可选）
+            per_file_ragflow_list: per-file RAGFlow 内容列表（每个文件独立检索）
 
         Returns:
             提取结果字典，包含 status, content, quote 等字段
@@ -616,18 +708,25 @@ class DataExtractorV2:
             import json
 
             if not chunks_file:
-                return {"status": "error", "error": "缺少chunks_file字段", "content": ""}
+                return {"status": "error", "error_type": "MISSING_CHUNKS_FILE", "error": "缺少chunks_file字段", "content": ""}
 
-            # 统一为列表
+            # 统一为列表（支持字符串、字典两种格式）
             if isinstance(chunks_file, str):
+                chunks_files = [{"chunks_path": chunks_file}]
+            elif isinstance(chunks_file, dict):
                 chunks_files = [chunks_file]
             elif isinstance(chunks_file, list):
-                chunks_files = [cf for cf in chunks_file if cf]
+                chunks_files = []
+                for cf in chunks_file:
+                    if isinstance(cf, str):
+                        chunks_files.append({"chunks_path": cf})
+                    elif isinstance(cf, dict):
+                        chunks_files.append(cf)
             else:
-                return {"status": "error", "error": f"chunks_file类型不支持: {type(chunks_file)}", "content": ""}
+                return {"status": "error", "error_type": "INVALID_CHUNKS_TYPE", "error": f"chunks_file类型不支持: {type(chunks_file)}", "content": ""}
 
             if not chunks_files:
-                return {"status": "error", "error": "chunks_file列表为空", "content": ""}
+                return {"status": "error", "error_type": "EMPTY_CHUNKS_FILE", "error": "chunks_file列表为空", "content": ""}
 
             # 带校验的两阶段提取（逐文件分别提取后拼接）
             from service.linux.generation.extraction.two_stage_extraction_service import two_stage_extraction_service
@@ -645,8 +744,9 @@ class DataExtractorV2:
             if insert_original:
                 extraction_query_with_instruction = (
                     f"{extraction_query_with_instruction}\n\n"
-                    "【重要】当前为引用图表模式，请保留原文中的所有占位符标签，如 {{Table_1_Start}}、{{Table_1_End}}、"
-                    "{{Image_1_Start}}、{{Image_1_End}} 等。不要删除或修改这些标签，保持原样。\n"
+                    "【重要】当前为引用图表模式，请保留原文中的所有占位符标签，如 {{{{Table_1_Start}}}}、{{{{Table_1_End}}}}、"
+                    "{{{{Image_1_Start}}}}、{{{{Image_1_End}}}} 等。不要删除或修改这些标签，保持原样。"
+                    "提取过程中如果遇到提取的文本前后有这些标志也要保留。\n"
                 )
 
             # 环境上下文：段落ID
@@ -678,12 +778,26 @@ class DataExtractorV2:
             _file_request_lock = threading.Lock()
             _file_last_request_time = [0.0]
 
-            def _extract_single_file(cf: str) -> Dict[str, Any]:
+            def _extract_single_file(chunks_info) -> Dict[str, Any]:
                 """单个文件的提取任务"""
-                cf_path = Path(cf)
-                if not cf_path.exists():
+                # ✅ 在工作线程中重新设置 paragraph_id（确保并发时获取正确的值）
+                from utils.context_manager import set_paragraph_id
+                set_paragraph_id(paragraph_id)
+
+                # 支持字符串和字典两种格式
+                if isinstance(chunks_info, dict):
+                    cf = chunks_info.get("chunks_path", "")
+                    file_id = chunks_info.get("file_id", "")
+                    original_file_name = chunks_info.get("original_file_name", "")
+                else:
+                    cf = chunks_info
+                    file_id = ""
+                    original_file_name = ""
+
+                cf_path = Path(cf) if cf else None
+                if not cf_path or not cf_path.exists():
                     logger.warning(f"分块文件不存在: {cf}")
-                    return {"success": False, "error": f"文件不存在: {cf}", "cf": cf}
+                    return {"success": False, "error": f"文件不存在: {cf}", "cf": cf, "file_id": file_id, "original_file_name": original_file_name}
 
                 # 统计该文件sections数量（用于汇总）
                 sections_cnt = 0
@@ -699,6 +813,22 @@ class DataExtractorV2:
                     traceback.print_exc()
                     sections_cnt = 0
 
+                # ✅ 优先使用 per-file RAGFlow 内容（每个文件独立检索）
+                file_ragflow_content = None
+                file_ragflow_chunks = []  # ✅ 新增：用于溯源的原始分块列表
+                if per_file_ragflow_list:
+                    parent_dir = cf_path.parent.name
+                    for entry in per_file_ragflow_list:
+                        # ✅ 优先使用 preprocessed_file_id 字段匹配（去掉 .docx 后缀精确匹配）
+                        pp_file_id = entry.get("preprocessed_file_id", "")
+                        # 去掉扩展名进行匹配
+                        pp_file_id_stem = Path(pp_file_id).stem if pp_file_id else ""
+                        if pp_file_id_stem and pp_file_id_stem == parent_dir:
+                            file_ragflow_content = entry.get("ragflow_content", "")  # 用于 LLM
+                            file_ragflow_chunks = entry.get("ragflow_chunks", [])  # 用于溯源
+                            logger.info(f"📌 匹配到 per-file RAGFlow: {entry.get('file_name', '')} (ID: {pp_file_id}), {len(file_ragflow_chunks)} 个分块")
+                            break
+
                 # 请求间隔控制：避免瞬时高并发
                 with _file_request_lock:
                     elapsed = time.time() - _file_last_request_time[0]
@@ -713,16 +843,39 @@ class DataExtractorV2:
                             "chunks_dir": str(cf_path.parent),
                             "extraction_query": extraction_query_with_instruction,
                             "task_name": None,
-                            "doc_type": doc_type
+                            "doc_type": doc_type,
+                            "ragflow_content": file_ragflow_content  #  添加RAGFlow检索的信息
                         },
                         source_content="",
                         doc_type=doc_type,
                         enable_validation=not skip_validation
                     )
 
+                # ✅ 新增：获取 localchunks 和 ragflowchunks
+                extraction_result = result.get("extraction_result", {})
+                localchunks = extraction_result.get("localchunks", [])
+
+                # ✅ 新增：构建 ragflowchunks（使用 file_ragflow_chunks 原始分块列表）
+                ragflowchunks = []
+                if file_ragflow_chunks:
+                    for chunk in file_ragflow_chunks:
+                        # chunk 应该是字典格式
+                        if isinstance(chunk, dict):
+                            content = chunk.get("content", "")
+                            ragflowchunks.append({
+                                "id": chunk.get("chunk_id", ""),
+                                "used": "true",
+                                "title": content[:20] if content else "",
+                                "score": str(chunk.get("similarity", ""))
+                            })
+
                 result["cf"] = cf
                 result["cf_name"] = cf_path.name
                 result["sections_cnt"] = sections_cnt
+                result["file_id"] = file_id
+                result["original_file_name"] = original_file_name
+                result["localchunks"] = localchunks  # ✅ 新增
+                result["ragflowchunks"] = ragflowchunks  # ✅ 新增
                 return result
 
             # 使用受限并发处理多个文件
@@ -759,7 +912,8 @@ class DataExtractorV2:
                     success_count += 1
                     content_i = result.get("extracted_content") or result.get("combined_content") or result.get("content", "")
                     if content_i:
-                        aggregated_content_parts.append(f"## Source: {cf_name}\n\n{content_i}")
+                        # aggregated_content_parts.append(f"## Source: {cf_name}\n\n{content_i}")   #添加了溯源信息，这部分暂不需要
+                        aggregated_content_parts.append(content_i)
                         # 新增：从内容中提取占位符
                         placeholders = self._extract_placeholders_from_content(content_i)
                         # 如果内容中没有占位符，尝试从原始分块中提取
@@ -819,6 +973,7 @@ class DataExtractorV2:
 
                 error_data = {
                     "status": "error",
+                    "error_type": "ALL_FILES_FAILED",
                     "error": f"{doc_type.upper()}提取失败：所有文件均失败",
                     "content": "",
                     "detailed_errors": all_errors,  # 添加详细错误信息
@@ -828,11 +983,42 @@ class DataExtractorV2:
                     error_data["quote"] = quote
                 return error_data
 
-            aggregated_content = "\n\n---\n\n".join([p for p in aggregated_content_parts if p])
+            aggregated_content = "\n\n".join([p for p in aggregated_content_parts if p])
 
             # 清理占位符（移除 Start-End 之间的内容，只保留 Start 标签）
             if aggregated_content:
                 aggregated_content = self._clean_placeholder_content(aggregated_content)
+
+            # 建立原始文件名 -> content 的映射
+            per_file_contents = {}
+            for result in results_list:
+                content_i = result.get("extracted_content") or result.get("combined_content") or result.get("content", "")
+                original_name = result.get("original_file_name", "")
+                if result.get("success") and content_i and original_name:
+                    per_file_contents[original_name] = content_i
+
+            # ✅ 新增：构建 per_file_chunks（按文件分开的分块信息，含独立 content）
+            # ✅ 修改：无论成功还是失败，都要加入 per_file_chunks
+            per_file_chunks = []
+            for result in results_list:
+                original_name = result.get("original_file_name", "") or result.get("cf_name", "未知文件")
+                if result.get("success"):
+                    # 获取每个文件的独立提取内容
+                    file_content = result.get("extracted_content") or result.get("combined_content") or result.get("content", "")
+                    per_file_chunks.append({
+                        "filename": original_name,
+                        "content": file_content,
+                        "localchunks": result.get("localchunks", []),
+                        "ragflowchunks": result.get("ragflowchunks", [])
+                    })
+                else:
+                    # ✅ 新增：失败的文件也要记录
+                    per_file_chunks.append({
+                        "filename": original_name,
+                        "content": "",  # 失败时为空字符串
+                        "localchunks": [],
+                        "ragflowchunks": []
+                    })
 
             return_data = {
                 "status": "success",
@@ -848,13 +1034,19 @@ class DataExtractorV2:
                 "is_validated": True,
                 "extraction_result": {
                     "per_file_results": per_file_extraction_results
-                }
+                },
+                "per_file_contents": per_file_contents,
+                "per_file_chunks": per_file_chunks  # ✅ 新增：按文件分开的分块信息
             }
+            # 添加 file_name 字段（从 data_item 获取）
+            if data_item and "file_name" in data_item:
+                return_data["file_name"] = data_item["file_name"]
             if quote:
                 return_data["quote"] = quote
             # 添加占位符
             if insert_original and all_placeholders:
                     return_data["placeholders"] = list(all_placeholders)
+
             return return_data
 
         except Exception as e:
@@ -862,28 +1054,37 @@ class DataExtractorV2:
             traceback.print_exc()
             logger.error(f"{doc_type.upper()}文档提取失败: {e}", exc_info=True)
             _task_log_error(f"{doc_type.upper()}文档提取失败", exc=e, doc_type=doc_type)
-            error_data = {"status": "error", "error": str(e), "content": ""}
+            error_data = {"status": "error", "error_type": "DOC_EXTRACTION_FAILED", "error": str(e), "content": ""}
             if quote:
                 error_data["quote"] = quote
             return error_data
 
     def _handle_pdf_type(self, data_item: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        处理PDF文档类型的数据提取
+
+        【RAGFlow 支持】
+        - 使用 per_file_ragflow_list（每个文件独立检索的 RAGFlow 内容）
+        """
         # 处理PDF文件,处理逻辑同word处理逻辑
         extract_prompt = data_item.get("extract", "")
         original_mode = data_item.get("original_mode", False)
         insert_original = data_item.get("insert_original", False)
         chunks_file = data_item.get("chunks_file", "")
-        quote = data_item.get("quote")  # 获取quote字段，将传递给_extract_from_chunks
-        logger.info(f"🔍 [_handle_word_type] quote字段值: {quote}")
+        quote = data_item.get("quote")
+        per_file_ragflow_list = data_item.get("per_file_ragflow_list", [])
 
         # 如果无提取逻辑，并且是原文模式，则提取全部内容
         if (not extract_prompt or not extract_prompt.strip()) and original_mode:
             logger.info("无提取逻辑且为原文模式，直接加载全部分块内容")
-            return self._load_all_chunks_content(chunks_file, quote=quote, doc_type="pdf",insert_original=insert_original)
+            return self._load_all_chunks_content(chunks_file, quote=quote, doc_type="pdf", insert_original=insert_original)
 
-        # 有提取逻辑，调用统一的提取入口，内部会根据 original_mode 决定是否让模型改写内容
-        # 原文模式处理
-        return self._extract_from_chunks(chunks_file, extract_prompt, "pdf", original_mode=original_mode, quote=quote,insert_original=insert_original)
+        # 有提取逻辑，调用统一的提取入口
+        return self._extract_from_chunks(
+            chunks_file, extract_prompt, "pdf",
+            original_mode=original_mode, quote=quote, insert_original=insert_original,
+            per_file_ragflow_list=per_file_ragflow_list, data_item=data_item
+        )
 
     def _handle_excel_type(self, data_item: Dict[str, Any]) -> Dict[str, Any]:
         """处理Excel表格（带智能校验）"""
@@ -899,24 +1100,23 @@ class DataExtractorV2:
         if insert_original:
 
             # 情况1：无提取提示词 → 只构建TFL占位符，不提取内容
-            # if not extract_prompt or not extract_prompt.strip():
-            #     if source_file_list and isinstance(source_file_list, list):
-            #         # 列表格式：从source_file列表构建TFL占位符
-            #         return self._build_tfl_insert_mappings(data_item, file_type)
-            #     else:
-            #         # 单个文件格式：也构建TFL占位符
-            #         return self._build_tfl_insert_mappings(data_item, file_type)
+            if not extract_prompt or not extract_prompt.strip():
+                if source_file_list and isinstance(source_file_list, list):
+                    # 列表格式：从source_file列表构建TFL占位符
+                    return self._build_tfl_insert_mappings(data_item, file_type)
+                else:
+                    # 单个文件格式：也构建TFL占位符
+                    return self._build_tfl_insert_mappings(data_item, file_type)
 
             # 情况2：有提取提示词 → 提取内容 + 构建占位符
             # 🔑 关键：先提取内容（给LLM作参考），再构建占位符
             logger.info(f"🔍  有extract提示词，开始提取内容...")
-            logger.info(f"   - extract_prompt: {extract_prompt[:100]}...")
             logger.info(f"   - markdown_files数量: {len(markdown_files)}")
             logger.info(
                 f"   - source_file_list数量: {len(source_file_list) if isinstance(source_file_list, list) else 0}")
 
             extracted_content = self._extract_from_markdown_files(markdown_files, extract_prompt, source_file,
-                                                                  file_type)
+                                                                  file_type, data_item=data_item)
 
             if extracted_content.get("status") != "success":
                 logger.warning(f"⚠️ 提取失败: {extracted_content.get('error', 'Unknown error')}")
@@ -953,40 +1153,69 @@ class DataExtractorV2:
         # if not extract_prompt:
         #     return {"status": "error", "error": "缺少提取提示词", "content": ""}
 
-        return self._extract_from_markdown_files(markdown_files, extract_prompt, source_file, file_type)
+        return self._extract_from_markdown_files(markdown_files, extract_prompt, source_file, file_type, data_item=data_item)
 
     def _extract_from_markdown_files(self, markdown_files: list, extract_prompt: str, source_file: str,
-                                     doc_type: str) -> Dict[str, Any]:
-        """从Markdown文件列表中提取内容"""
+                                     doc_type: str, data_item: Dict[str, Any] = None) -> Dict[str, Any]:
+        """从Markdown文件列表中提取内容
+
+        Args:
+            markdown_files: Markdown文件路径列表，支持两种格式：
+                - 字典列表（新格式）：[{"markdown_files": [...], "file_id": "...", "original_file_name": "..."}, ...]
+                - 字符串列表（旧格式）：["AAA/.../sheet1.md", ...]
+            extract_prompt: 提取提示词
+            source_file: 源文件名
+            doc_type: 文档类型
+            data_item: 数据项字典（可选）
+        """
         try:
             from service.linux.generation.extraction.excel_extraction_service import excel_extraction_service
             from service.linux.generation.extraction.validated_extraction_service import validated_extraction_service
             from pathlib import Path
 
+            # ✅ 在方法开始时设置 paragraph_id（确保并发线程获取正确的值）
+            paragraph_id = getattr(self._context, 'paragraph_id', 'unknown')
+            from utils.context_manager import set_paragraph_id
+            set_paragraph_id(paragraph_id)
+            logger.info(f"📌 设置段落ID: {paragraph_id}")
+
             if not markdown_files:
-                return {"status": "error", "error": "缺少markdown_files字段", "content": ""}
+                return {"status": "error", "error_type": "MISSING_MARKDOWN_FILES", "error": "缺少markdown_files字段", "content": ""}
 
-            # 将所有 md 文件按父目录分组（每个目录代表一个Excel/RTF）
-            md_paths = [Path(p) for p in markdown_files]
-            dirs_in_order: List[Path] = []
-            seen = set()
-            for p in md_paths:
-                parent = p.parent
-                key = str(parent)
-                if key not in seen:
-                    seen.add(key)
-                    dirs_in_order.append(parent)
+            # 判断输入格式，支持字典结构和字符串列表两种格式
+            file_groups = []
+            if isinstance(markdown_files[0], dict):
+                # 新格式：字典结构列表
+                for group in markdown_files:
+                    file_groups.append({
+                        "markdown_dir": group.get("markdown_dir", ""),
+                        "markdown_files": group.get("markdown_files", []),
+                        "file_id": group.get("file_id", ""),
+                        "original_file_name": group.get("original_file_name", "")
+                    })
+            else:
+                # 旧格式：字符串列表，按目录分组
+                md_paths = [Path(p) for p in markdown_files]
+                seen = set()
+                for p in md_paths:
+                    parent = p.parent
+                    key = str(parent)
+                    if key not in seen:
+                        seen.add(key)
+                        file_groups.append({
+                            "markdown_dir": str(parent),
+                            "markdown_files": [str(p) for p in md_paths if p.parent == parent],
+                            "file_id": "",
+                            "original_file_name": ""
+                        })
 
-            # ✅ 改进日志：显示将要处理的所有目录
-            logger.info(f"📊 准备处理 {len(dirs_in_order)} 个目录（对应 {len(markdown_files)} 个 markdown 文件）")
-            for i, d in enumerate(dirs_in_order, 1):
-                dir_label = d.parent.name if d.name == "markdown" else d.name
-                logger.info(f"  {i}. {dir_label} ({d})")
+            logger.info(f"📊 准备处理 {len(file_groups)} 个文件组")
 
             aggregated_parts: List[str] = []
-            aggregated_sheets_results: List[Dict[str, Any]] = []
+            per_file_sheets_info: Dict[str, List[Dict[str, Any]]] = {}  # 按文件分开存储 sheets_info
             excel_results: List[Dict[str, Any]] = []
             full_prompts: List[str] = []
+            file_names_list: List[str] = []  # 记录每个文件组的原始文件名
             validated_any = False
             success_any = False
 
@@ -997,46 +1226,99 @@ class DataExtractorV2:
             if skip_validation:
                 logger.info("📌 已配置跳过提取校验 (SKIP_EXTRACTION_VALIDATION=1 或默认)")
 
-            for idx, d in enumerate(dirs_in_order, 1):
-                md_in_dir = [str(p) for p in md_paths if p.parent == d]
-                # ✅ 改进日志：显示正在处理的目录序号和完整路径
-                logger.info(f"📂 处理第 {idx}/{len(dirs_in_order)} 个目录: {d}")
+            for idx, group in enumerate(file_groups, 1):
+                markdown_dir = group.get("markdown_dir", "")
+                md_files = group.get("markdown_files", [])
+                original_file_name = group.get("original_file_name", "")
+
+                logger.info(f"📂 处理第 {idx}/{len(file_groups)} 个文件组: {original_file_name}")
+
+                # ✅ 获取当前 paragraph_id，传递给 Excel 提取（确保并发时文件保存到正确目录）
+                from utils.context_manager import get_paragraph_id
+                current_paragraph_id = get_paragraph_id("unknown")
+
                 result = validated_extraction_service.extract_with_validation(
                     extraction_func=excel_extraction_service.extract_from_excel,
                     extraction_kwargs={
-                        "excel_dir": str(d),
+                        "excel_dir": markdown_dir,
                         "extraction_query": extract_prompt,
-                        "source_file": None
+                        "source_file": None,
+                        "paragraph_id": current_paragraph_id  # ✅ 传入 paragraph_id
                     },
-                    source_content=self._load_source_content_from_files(md_in_dir),
+                    source_content=self._load_source_content_from_files(md_files),
                     doc_type=doc_type,
-                    enable_validation=not skip_validation  # 如果skip_validation=True，则enable_validation=False
+                    enable_validation=not skip_validation
                 )
                 if result.get("success"):
                     success_any = True
                     if result.get("is_validated"):
                         validated_any = True
-                    content_i = result.get("extracted_content") or result.get("combined_content") or result.get(
-                        "content", "")
+                    content_i = result.get("extracted_content") or result.get("combined_content") or result.get("content", "")
+                    # ✅ 修改：无论是否有内容，都要添加到 aggregated_parts 和 file_names_list
+                    aggregated_parts.append(content_i if content_i else "")
+                    file_names_list.append(original_file_name)  # ✅ 修改：总是记录原始文件名
                     if content_i:
-                        # ✅ 改进标识：使用完整路径的父目录名（预处理目录名）而非只用 markdown
-                        dir_label = d.parent.name if d.name == "markdown" else d.name
-                        aggregated_parts.append(f"## 来源: {dir_label}\n\n{content_i}")
-                        logger.info(f"✅ 目录 {idx} 提取成功: {len(content_i)} 字符")
-                    _er = result.get("extraction_result", {}) if isinstance(result.get("extraction_result"),
-                                                                            dict) else {}
-                    aggregated_sheets_results.extend(_er.get("sheets_results", []))
+                        logger.info(f"✅ 文件组 {idx} 提取成功: {len(content_i)} 字符")
+                    else:
+                        logger.info(f"⚠️ 文件组 {idx} 提取成功但内容为空")
+                    _er = result.get("extraction_result", {}) if isinstance(result.get("extraction_result"), dict) else {}
+                    # 按文件分开存储 sheets_results
+                    sheets_results_i = _er.get("sheets_results", [])
+                    if original_file_name and sheets_results_i:
+                        per_file_sheets_info[original_file_name] = sheets_results_i
                     excel_results.append(_er)
                     full_prompts.append(result.get("full_prompt", "") or _er.get("full_prompt", "") or "")
                 else:
+                    # ✅ 修改：失败时也要添加空内容占位
+                    aggregated_parts.append("")
                     excel_results.append({"success": False, "error": result.get("error")})
+                    file_names_list.append(original_file_name)
 
             if not success_any:
-                return {"status": "error", "error": f"{doc_type.upper()}提取失败：所有目录均失败", "content": ""}
+                return {"status": "error", "error_type": "ALL_DIRS_FAILED", "error": f"{doc_type.upper()}提取失败：所有文件组均失败", "content": ""}
 
-            # ✅ 改进日志：显示最终汇总结果
-            logger.info(
-                f"📊 提取汇总: 共处理 {len(dirs_in_order)} 个目录，成功 {len(aggregated_parts)} 个，总内容长度 {sum(len(p) for p in aggregated_parts)} 字符")
+            logger.info(f"📊 提取汇总: 共处理 {len(file_groups)} 个文件组，成功 {len(aggregated_parts)} 个，总内容长度 {sum(len(p) for p in aggregated_parts)} 字符")
+
+            # 建立原始文件名 -> content 的映射
+            per_file_contents = {}
+            for idx, original_name in enumerate(file_names_list):
+                if idx < len(aggregated_parts) and aggregated_parts[idx] and original_name:
+                    per_file_contents[original_name] = aggregated_parts[idx]
+
+            # ✅ 新增：构建 per_file_chunks（表格类，按文件分开的分块信息，含独立 content）
+            per_file_chunks = []
+            for idx, original_name in enumerate(file_names_list):
+                # ✅ 修改：无论成功还是失败，都要加入 per_file_chunks
+                file_content = ""
+                localchunks = []
+
+                if idx < len(excel_results):
+                    _er = excel_results[idx]
+                    if isinstance(_er, dict):
+                        if _er.get("success"):
+                            # 构建 localchunks（表格类，每个 sheet 作为分块）
+                            sheets_results_i = _er.get("sheets_results", [])
+                            for sheet in sheets_results_i:
+                                localchunks.append({
+                                    "id": sheet.get("sheet_name", ""),
+                                    "used": "true" if sheet.get("available") else "false",
+                                    "title": sheet.get("sheet_title", ""),
+                                    "score": str(sheet.get("relevance_score", 0)),
+                                    "reason": sheet.get("reason", "")
+                            })
+                            # 获取每个文件的独立提取内容
+                            file_content = aggregated_parts[idx] if idx < len(aggregated_parts) else ""
+                        else:
+                            # ✅ 新增：失败的文件也要记录，只是内容为空
+                            localchunks = []
+                            file_content = ""
+
+                per_file_chunks.append({
+                    "filename": original_name,
+                    "content": file_content,  # 失败时为空字符串
+                    "localchunks": localchunks,
+                    "ragflowchunks": []  # 表格类无 RAGFlow 分块
+                })
 
             return {
                 "status": "success",
@@ -1047,9 +1329,12 @@ class DataExtractorV2:
                 "full_prompt": "\n\n".join([fp for fp in full_prompts if fp]),
                 "extraction_result": {
                     "excel_results": excel_results,
-                    "sheets_results": aggregated_sheets_results
+                    "per_file_sheets_info": per_file_sheets_info
                 },
-                "sheets_results": aggregated_sheets_results
+                "per_file_sheets_info": per_file_sheets_info,  # 按文件分开的 sheets_info
+                "per_file_contents": per_file_contents,
+                "file_name": file_names_list,
+                "per_file_chunks": per_file_chunks  # ✅ 新增：按文件分开的分块信息
             }
 
         except Exception as e:
@@ -1057,7 +1342,7 @@ class DataExtractorV2:
             traceback.print_exc()
             logger.error(f"{doc_type.upper()}提取失败: {e}", exc_info=True)
             _task_log_error(f"{doc_type.upper()}提取失败", exc=e, doc_type=doc_type)
-            return {"status": "error", "error": str(e), "content": ""}
+            return {"status": "error", "error_type": "EXTRACTION_FAILED", "error": str(e), "content": ""}
 
     def _load_source_content_from_files(self, markdown_files: list) -> str:
         """从Markdown文件列表加载源内容用于校验"""
@@ -1093,9 +1378,6 @@ class DataExtractorV2:
         source_file_list = data_item.get("source_file", [])
         tfl_insert_mappings = []
         extract_prompt = data_item.get("extract", "")
-
-        logger.info(f"🔍 [_build_tfl_insert_mappings] source_file_list类型: {type(source_file_list)}")
-        logger.info(f"🔍 [_build_tfl_insert_mappings] source_file_list内容: {source_file_list}")
 
         for source_item in source_file_list:
             try:
@@ -1169,82 +1451,6 @@ class DataExtractorV2:
         data_item["file_type"] = "rtf"
         return self._handle_excel_type(data_item)
 
-    # # ---------- 索引与文件定位 ----------
-    # def _read_file_generic(self, file_path: Path) -> str:
-    #     """读取文件内容，支持 RTF/TXT，其他类型做最简兜底。"""
-    #     try:
-    #         suffix = file_path.suffix.lower()
-    #         if suffix == ".rtf":
-    #             try:
-    #                 from striprtf.striprtf import rtf_to_text  # type: ignore
-    #                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-    #                     return rtf_to_text(f.read())
-    #             except Exception:
-    #                 return self._simple_text_read(file_path)
-    #         elif suffix in (".txt", ".log"):
-    #             return self._simple_text_read(file_path)
-    #         else:
-    #             # 其他类型先返回文件名占位
-    #             return f"[未实现的文件类型读取] {file_path.name}"
-    #     except Exception as e:
-    #         logger.warning("读取文件失败 %s: %s", str(file_path), e)
-    #         return ""
-    #
-    # def _simple_text_read(self, file_path: Path) -> str:
-    #     try:
-    #         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-    #             return f.read()
-    #     except Exception:
-    #         return ""
-    #
-    # # [死代码已清理] 原有的旧版原文处理函数已删除，现使用 _extract_from_chunks + _clean_placeholder_content
-    #
-    # def _clean_placeholder_content(self, content: str) -> str:
-    #     """
-    #     清理占位符内容（原文模式专用）
-    #
-    #     将 {{Table_1_Start}}...{{Table_1_End}} 替换为 {{Table_1_Start}}
-    #     将 {{Image_1_Start}}...{{Image_1_End}} 替换为 {{Image_1_Start}}
-    #
-    #     这样插入时可以根据 {{Table_1_Start}} 等占位符找到对应的资源文件进行替换
-    #
-    #     Args:
-    #         content: 原始内容（包含Start-End标签对）
-    #
-    #     Returns:
-    #         清理后的内容（只保留Start标签）
-    #     """
-    #     import re
-    #
-    #     try:
-    #         cleaned = content
-    #
-    #         # 清理表格标签：{{Table_X_Start}}...{{Table_X_End}} → {{Table_X_Start}}
-    #         table_pattern = re.compile(
-    #             r'\{\{Table_(\d+)_Start\}\}[\s\S]*?\{\{Table_\1_End\}\}',
-    #             flags=re.DOTALL
-    #         )
-    #         cleaned = table_pattern.sub(r'{{Table_\1_Start}}', cleaned)
-    #
-    #         # 清理图片标签：{{Image_X_Start}}...{{Image_X_End}} → {{Image_X_Start}}
-    #         image_pattern = re.compile(
-    #             r'\{\{Image_(\d+)_Start\}\}[\s\S]*?\{\{Image_\1_End\}\}',
-    #             flags=re.DOTALL
-    #         )
-    #         cleaned = image_pattern.sub(r'{{Image_\1_Start}}', cleaned)
-    #
-    #         # 统计清理数量
-    #         table_count = len(table_pattern.findall(content))
-    #         image_count = len(image_pattern.findall(content))
-    #
-    #         if table_count > 0 or image_count > 0:
-    #             logger.info(f"✅ 清理占位符内容: 表格{table_count}个, 图片{image_count}个")
-    #
-    #         return cleaned
-    #
-    #     except Exception as e:
-    #         logger.warning(f"清理占位符内容失败: {e}")
-    #         return content
 
     def _extract_placeholders_from_content(self, content: str) -> List[str]:
         """从内容中提取占位符 ({{Table_X_Start}} 和 {{Image_X_Start}} 等)"""
@@ -1318,8 +1524,7 @@ class DataExtractorV2:
             # 匹配所有可能的占位符变体：{Table_X_Start}、{{Table_X_Start}}、{{{Table_X_Start}}}
             # 以及对应的End标签
             # 匹配模式：捕获花括号内的核心内容 (Table|Image)_\d+_(Start|End)
-            unified_pattern = re.compile(r'\{*((Table|Image)_\d+_(Start|End))\}*')
-            # 统计修复数量
+            unified_pattern = re.compile(r'\{*((Table|Image)_(\d+)(?:_(\d+))?_(Start|End))\}*')            # 统计修复数量
             matches = unified_pattern.findall(cleaned)
             # 去重统计（避免重复计数）
             unique_matches = set()
@@ -1333,23 +1538,23 @@ class DataExtractorV2:
             # ===== 第二步：清理占位符内容 =====
             # 清理表格标签：{{Table_X_Start}}...{{Table_X_End}} → {{Table_X_Start}}
             table_pattern = re.compile(
-                r'\{\{Table_(\d+)_Start\}\}[\s\S]*?\{\{Table_\1_End\}\}',
+                r'\{\{Table_(\d+)(?:_(\d+))?_Start\}\}[\s\S]*?\{\{Table_\1(?:_\2)?_End\}\}',
                 flags=re.DOTALL
             )
             # 统计清理前的匹配数
             before_table_count = len(table_pattern.findall(cleaned))
             # 执行清理
-            cleaned = table_pattern.sub(r'{{Table_\1_Start}}', cleaned)
+            cleaned = table_pattern.sub(lambda m: f'{{{{Table_{m.group(1)}{"_"+m.group(2) if m.group(2) else ""}_Start}}}}', cleaned)
 
             # 清理图片标签：{{Image_X_Start}}...{{Image_X_End}} → {{Image_X_Start}}
             image_pattern = re.compile(
-                r'\{\{Image_(\d+)_Start\}\}[\s\S]*?\{\{Image_\1_End\}\}',
+                r'\{\{Image_(\d+)(?:_(\d+))?_Start\}\}[\s\S]*?\{\{Image_\1(?:_\2)?_End\}\}',
                 flags=re.DOTALL
             )
             # 统计清理前的匹配数
             before_image_count = len(image_pattern.findall(cleaned))
             # 执行清理
-            cleaned = image_pattern.sub(r'{{Image_\1_Start}}', cleaned)
+            cleaned = image_pattern.sub(lambda m: f'{{{{Image_{m.group(1)}{"_"+m.group(2) if m.group(2) else ""}_Start}}}}', cleaned)
 
             # ===== 第三步：统计和日志 =====
             table_count = before_table_count
@@ -1365,255 +1570,3 @@ class DataExtractorV2:
             traceback.print_exc()
             logger.warning(f"清理占位符内容失败: {e}")
             return content
-    #
-    # def build_complete_json(self, tfl_data: List[Dict[str, Any]], plan_data: Dict[str, Any], output_path: str) -> Dict[str, Any]:
-    #     """构建完整的JSON结构，包含TFL、Plan和Output部分
-    #
-    #     最终结构（按当前需求）：
-    #     - tfl: [{ id, Path }]
-    #     - plan: { table: [{ id, Path }], Image: [{ id, Path }] }
-    #     - output: 最终Word路径
-    #     """
-    #     try:
-    #         # 构建TFL部分（仅输出 id 与 Path）
-    #         tfl_list: List[Dict[str, str]] = []
-    #         for item in tfl_data:
-    #             if not isinstance(item, dict):
-    #                 continue
-    #             # 1) insert=true 的映射
-    #             mappings = item.get("tfl_insert_mappings")
-    #             if mappings and isinstance(mappings, list):
-    #                 for m in mappings:
-    #                     tfl_list.append({
-    #                         "id": m.get("id", ""),
-    #                         "Path": m.get("Path", "")
-    #                     })
-    #                 continue
-    #             # 2) 单文件读取成功的条目（read_ok）
-    #             if item.get("status") == "read_ok" and item.get("source_file"):
-    #                 sf = item.get("source_file", "")
-    #                 tfl_list.append({
-    #                     "id": (item.get("item") or {}).get("title", "") or item.get("title", ""),
-    #                     "Path": sf
-    #                 })
-    #                 continue
-    #             # 3) 聚合结果的来源文件列表
-    #             srcs = item.get("tfl_source_files") or []
-    #             for sf in srcs:
-    #                 tfl_list.append({
-    #                     "id": (item.get("item") or {}).get("title", "") or item.get("title", ""),
-    #                     "Path": sf
-    #                 })
-    #
-    #         # 仅保留 id 与 Path 字段
-    #         complete_json = {
-    #             "tfl": [
-    #                 {k: v for k, v in item.items() if k in ("id", "Path")}
-    #                 for item in tfl_list
-    #             ],
-    #             "plan": plan_data,
-    #             "output": output_path or "output\\result.docx"
-    #         }
-    #
-    #         return complete_json
-    #
-    #     except Exception as e:
-    #         logger.error(f"构建完整JSON失败: {e}", exc_info=True)
-    #         return {
-    #             "tfl": [],
-    #             "plan": {},
-    #             "output": output_path
-    #         }
-    #
-    # # ---------- 文件缓存相关方法 ----------
-    # def _get_pdf_cache_path(self, word_file_path: Path) -> Path:
-    #     """获取 Word 文件对应的 PDF 缓存路径"""
-    #     cache_name = f"{word_file_path.stem}.pdf"
-    #     return self.pdf_cache_dir / cache_name
-    #
-    # def _get_ocr_cache_path(self, file_path: Path) -> Path:
-    #     """获取文件对应的 OCR 缓存路径"""
-    #     cache_name = f"{file_path.stem}.md"
-    #     return self.ocr_cache_dir / cache_name
-    #
-    # def _get_ocr_clean_cache_path(self, file_path: Path) -> Path:
-    #     """获取文件对应的 清洗后OCR 缓存路径"""
-    #     cache_name = f"{file_path.stem}.clean.md"
-    #     return self.ocr_clean_cache_dir / cache_name
-    #
-    # def _is_pdf_cache_valid(self, word_file_path: Path, pdf_cache_path: Path) -> bool:
-    #     """检查 PDF 缓存是否有效（Word 文件未更新）"""
-    #     if not pdf_cache_path.exists():
-    #         return False
-    #     return pdf_cache_path.stat().st_mtime >= word_file_path.stat().st_mtime
-    #
-    # def _is_ocr_cache_valid(self, file_path: Path, ocr_cache_path: Path) -> bool:
-    #     """检查 OCR 缓存是否有效（文件未更新）"""
-    #     if not ocr_cache_path.exists():
-    #         return False
-    #
-    #     # 对于标记文件，如果缓存存在就直接使用（不需要检查时间）
-    #     if "_marked" in file_path.name:
-    #         return True
-    #
-    #     # 对于普通文件，检查时间
-    #     return ocr_cache_path.stat().st_mtime >= file_path.stat().st_mtime
-    #
-    # def _load_from_cache(self, cache_path: Path) -> Optional[str]:
-    #     """从缓存文件加载内容"""
-    #     try:
-    #         with open(cache_path, 'r', encoding='utf-8') as f:
-    #             return f.read()
-    #     except Exception as e:
-    #         logger.warning(f"加载缓存失败 {cache_path}: {e}")
-    #         return None
-    #
-    # def _save_to_cache(self, cache_path: Path, content: str) -> None:
-    #     """保存内容到缓存文件"""
-    #     try:
-    #         with open(cache_path, 'w', encoding='utf-8') as f:
-    #             f.write(content)
-    #         logger.info(f"已缓存到: {cache_path}")
-    #     except Exception as e:
-    #         logger.warning(f"保存缓存失败 {cache_path}: {e}")
-    #
-    # def _clean_ocr_markdown(self, content: str) -> str:
-    #     """清理OCR Markdown：仅移除图片相关内容，保留所有其他内容。"""
-    #     try:
-    #         lines = content.splitlines()
-    #         cleaned_lines: List[str] = []
-    #
-    #         for line in lines:
-    #             stripped = line.strip()
-    #
-    #             # 只跳过图片相关行：
-    #             # 1. Markdown图片格式：![alt](url)
-    #             if stripped.startswith('![') and '](' in stripped and stripped.endswith(')'):
-    #                 continue
-    #             # 2. HTML图片标签：<img ...>
-    #             if '<img' in stripped.lower():
-    #                 continue
-    #             # 3. base64数据URI图片
-    #             if 'data:image/' in stripped and 'base64,' in stripped:
-    #                 continue
-    #             # 4. 纯图片URL行（以常见图片扩展名结尾）
-    #             if re.match(r'^https?://.*\.(jpg|jpeg|png|gif|bmp|webp|svg)(\?.*)?$', stripped, re.IGNORECASE):
-    #                 continue
-    #
-    #             # 保留所有其他内容，包括表格、文本等
-    #             cleaned_lines.append(line)
-    #
-    #         # 压缩多余空行
-    #         out: List[str] = []
-    #         prev_blank = False
-    #         for l in cleaned_lines:
-    #             if l.strip() == "":
-    #                 if not prev_blank:
-    #                     out.append("")
-    #                 prev_blank = True
-    #             else:
-    #                 out.append(l)
-    #                 prev_blank = False
-    #         return "\n".join(out).strip()
-    #     except Exception as e:
-    #         logger.warning(f"清理OCR Markdown失败，返回原文: {e}")
-    #         return content
-    #
-    # def _convert_word_to_pdf(self, word_file_path: Path, pdf_output_path: Path) -> Optional[Path]:
-    #     """将 Word 文件转换为 PDF"""
-    #     try:
-    #         if self.vision_service:
-    #             # 使用视觉服务的转换方法
-    #             pdf_path = self.vision_service._docx_to_pdf(str(word_file_path), str(pdf_output_path))
-    #             return Path(pdf_path) if pdf_path else None
-    #         else:
-    #             # 模拟转换
-    #             logger.warning("视觉服务未配置，无法转换 Word 到 PDF")
-    #             return None
-    #     except Exception as e:
-    #         logger.error(f"Word 转 PDF 失败: {e}", exc_info=True)
-    #         return None
-    #
-    # def _call_ocr_service(self, file_path: Path) -> Dict[str, Any]:
-    #     """调用 OCR 服务解析文件"""
-    #     try:
-    #         if self.vision_service:
-    #             return self.vision_service._call_ocr_service(file_path)
-    #         else:
-    #             # 模拟 OCR 结果
-    #             return {
-    #                 "status": "success",
-    #                 "content": f"[模拟OCR] 文件: {file_path.name}\n模拟的 Markdown 内容...",
-    #                 "visual_elements": [],
-    #                 "structured_content": f"[模拟OCR] 文件: {file_path.name}\n模拟的 Markdown 内容..."
-    #             }
-    #     except Exception as e:
-    #         logger.error(f"OCR 服务调用失败: {e}", exc_info=True)
-    #         return {
-    #             "status": "error",
-    #             "error": str(e)
-    #         }
-    #
-#     def _backup_word_document(self, word_file: Path) -> Optional[Path]:
-#         """备份Word文档"""
-#         try:
-#             from datetime import datetime
-#             import shutil
-#
-#             # 创建备份文件名，包含时间戳
-#             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-#             backup_name = f"{word_file.stem}_backup_{timestamp}{word_file.suffix}"
-#             backup_path = word_file.parent / backup_name
-#
-#             # 复制文件
-#             shutil.copy2(word_file, backup_path)
-#             logger.info(f"Word文档已备份到: {backup_path}")
-#             return backup_path
-#
-#         except Exception as e:
-#             logger.error(f"备份Word文档失败: {e}", exc_info=True)
-#             return None
-#
-# def main():
-#     """测试数据提取功能"""
-#     import sys
-#     import os
-#     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-#
-#     from service.linux.generation.parsers.config_parser import ConfigParser
-#
-#     # 解析配置（示例已废弃，配置应从API传入）
-#     # parser = ConfigParser("configs/paragraphs-v1.1(1).json")
-#     # paragraphs = parser.parse()
-#
-#     # 创建数据提取器
-#     extractor = DataExtractorV2()
-#
-#     # 测试提取第一个段落
-#     if paragraphs:
-#         test_paragraph = paragraphs[0]
-#         logger.info(f"测试提取段落: {test_paragraph.id}")
-#
-#         # 转换为字典格式
-#         paragraph_dict = {
-#             "id": test_paragraph.id,
-#             "generate": test_paragraph.generate,
-#             "example": test_paragraph.example,
-#             "data": [
-#                 {
-#                     "extract": item.extract,
-#                     "datas": item.datas,
-#                     "insert_original": item.insert_original
-#                 }
-#                 for item in test_paragraph.data
-#             ]
-#         }
-#
-#         result = extractor.extract_data_for_paragraph(paragraph_dict)
-#
-#         logger.info("提取结果:")
-#         logger.info(json.dumps(result, ensure_ascii=False, indent=2))
-#
-#
-# if __name__ == "__main__":
-#     main()

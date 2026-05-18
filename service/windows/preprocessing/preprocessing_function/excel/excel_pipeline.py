@@ -498,8 +498,8 @@ def to_markdown(
     # 始终输出 sheet 名到正文开头（避免只当作 sheet 名而正文缺失）
     # 若表内已存在标题行，则避免重复（忽略首尾空格比较）
     titles_to_output: List[str] = []
-    if sheet_title and sheet_title.strip():
-        titles_to_output.append(sheet_title.strip())
+    # if sheet_title and sheet_title.strip():
+    #     titles_to_output.append(sheet_title.strip())
     for t in title_lines:
         if t.strip() not in titles_to_output:
             titles_to_output.append(t.strip())

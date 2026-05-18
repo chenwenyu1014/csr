@@ -340,26 +340,3 @@ def _extract_table_name(header_lines, table_lines) -> str:
     return "sheet"
 
 # 原RTF处理逻辑
-# from service.windows.preprocessing.preprocessing_function.rtf.rtf_to_excel import rtf_to_xlsx_native
-# from service.windows.preprocessing.preprocessing_function.excel.excel_pipeline import run as excel_run
-#
-#
-# def run(rtf_path: Path | str, work_dir: Path | str) -> Dict[str, Any]:
-#     rtf_path = Path(rtf_path)
-#     work_dir = Path(work_dir)
-#
-#     # 1) RTF -> Excel (native)
-#     temp_excel = work_dir / f"{rtf_path.stem}_rtf2excel.xlsx"
-#     info = rtf_to_xlsx_native(str(rtf_path), str(temp_excel), sheet_prefix=rtf_path.stem[:20] or "RTFTable")
-#
-#     # 2) Excel pipeline
-#     excel_result = excel_run(temp_excel, work_dir)
-#
-#     # 3) Merge metadata
-#     meta = excel_result.get('metadata', {})
-#     steps = list(dict.fromkeys(['rtf_to_excel'] + meta.get('steps', [])))
-#     meta['steps'] = steps
-#     meta['rtf_intermediate_excel'] = str(temp_excel)
-#     excel_result['metadata'] = meta
-#
-#     return excel_result

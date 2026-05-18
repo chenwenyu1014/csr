@@ -13,6 +13,7 @@
 # ========== 标准库导入 ==========
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 # ========== 本地导入 ==========
@@ -38,36 +39,78 @@ class AllocationService:
     # 公开方法
     # ============================================================
     
-    def allocate_batch(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def allocate_batch(
+        self,
+        data: List[Dict[str, Any]],
+        max_workers: int = 30
+    ) -> List[Dict[str, Any]]:
         """
-        批量处理数据分配
-        
+        批量处理数据分配（跨分组并发版本）
+
         Args:
             data: 分组数据列表，格式为 [{"tagId": "...", "data": [...]}]
-        
+            max_workers: 最大并发线程数，默认为10
+
         Returns:
             处理后的分组数据列表，每个数据项增加 matched_files 字段
         """
         from service.linux.allocation.data_source_validator import DataSourceValidator
-        
-        validator = DataSourceValidator()
-        result_groups = []
 
-        for group in data:
+        validator = DataSourceValidator()
+
+        # 收集所有待处理的任务（跨所有 group）
+        all_tasks = []  # [(group_idx, item_idx, item, tag_id)]
+        for group_idx, group in enumerate(data):
             if not isinstance(group, dict):
                 continue
-            
+
+            tag_id = group.get("tagId") or group.get("tag_id") or "unknown"
+            items = group.get("data", [])
+            if not isinstance(items, list):
+                items = []
+            for item_idx, item in enumerate(items):
+                all_tasks.append((group_idx, item_idx, item, tag_id))
+
+        total_items = len(all_tasks)
+        logger.info(f"总任务数: {total_items}, 并发数: {max_workers}")
+
+        # 并发处理所有任务
+        results_map = {}  # {(group_idx, item_idx): processed_item}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._process_item, task[2], task[3], validator): (task[0], task[1])
+                for task in all_tasks
+            }
+
+            for future in as_completed(futures):
+                group_idx, item_idx = futures[future]
+                try:
+                    results_map[(group_idx, item_idx)] = future.result()
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    logger.error(f"并发处理失败 (group={group_idx}, item={item_idx}): {e}")
+                    # 失败时返回原数据
+                    original_item = data[group_idx]["data"][item_idx]
+                    results_map[(group_idx, item_idx)] = original_item
+
+        # 按原结构重组结果
+        result_groups = []
+        for group_idx, group in enumerate(data):
+            if not isinstance(group, dict):
+                continue
+
             tag_id = group.get("tagId") or group.get("tag_id") or "unknown"
             items = group.get("data", [])
             if not isinstance(items, list):
                 items = []
 
-            logger.info(f"开始处理分组 tagId={tag_id}, items={len(items)}")
-            new_items = []
-
-            for item in items:
-                new_item = self._process_item(item, tag_id, validator)
-                new_items.append(new_item)
+            # 按顺序收集该 group 的结果
+            new_items = [
+                results_map.get((group_idx, item_idx), items[item_idx])
+                for item_idx in range(len(items))
+            ]
 
             result_groups.append({
                 "tagId": tag_id,

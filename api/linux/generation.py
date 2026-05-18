@@ -137,9 +137,11 @@ async def run_flow_text_only(
         # 解析配置JSON
         cfg_obj = await _parse_config(request, config_json, config_file)
         
-        # 提取 project_id
+        # 提取 project_id 和 project_name
         final_project_id = _extract_project_id(project_id, cfg_obj)
-        logger.info(f"最终使用的 project_id: {final_project_id}")
+        project_name = _extract_project_name(cfg_obj)
+        final_project_name = (project_name or "unknown") + "_" + (final_project_id or "no_id")
+        logger.info(f"project_id: {final_project_id}, project_name: {final_project_name}")
         
         # 创建任务
         from service.linux.generation.task_manager import get_task_manager
@@ -152,6 +154,7 @@ async def run_flow_text_only(
                 "base_data_dir": base_data_dir,
                 "output_dir": output_dir,
                 "project_id": final_project_id,
+                "project_name": final_project_name,
                 "combinationId": combinationId,
                 "project_desc": project_desc,
                 "callback_url": callback_url,
@@ -159,7 +162,7 @@ async def run_flow_text_only(
             }
         )
         
-        logger.info(f"创建异步任务: {task_id}, project_id={final_project_id}")
+        logger.info(f"创建异步任务: {task_id}, project_id={final_project_id}, project_name={final_project_name}")
         
         # 获取认证Token
         auth_token = request.headers.get("X-Access-Token") or request.headers.get("Authorization")
@@ -180,6 +183,7 @@ async def run_flow_text_only(
             callback_url=callback_url,
             result_callback_url=result_callback_url,
             project_id=final_project_id,
+            project_name=final_project_name,
             auth_token=auth_token,
             skip_validation=skip_validation
         )
@@ -278,11 +282,11 @@ async def _parse_config(
 def _extract_project_id(project_id: Optional[str], cfg_obj: dict) -> Optional[str]:
     """
     提取 project_id
-    
+
     优先级：Form参数 > paragraphs[0].project_id > 顶层project_id
     """
     final_project_id = project_id
-    
+
     if not final_project_id:
         # 尝试从 paragraphs[0].project_id 提取
         paragraphs = cfg_obj.get("paragraphs", [])
@@ -290,11 +294,24 @@ def _extract_project_id(project_id: Optional[str], cfg_obj: dict) -> Optional[st
             final_project_id = paragraphs[0].get("project_id")
             if final_project_id:
                 logger.info(f"从 paragraphs[0].project_id 提取到 project_id: {final_project_id}")
-    
+
     if not final_project_id:
         # 尝试从顶层提取
         final_project_id = cfg_obj.get("project_id")
         if final_project_id:
             logger.info(f"从顶层 project_id 提取到 project_id: {final_project_id}")
-    
+
     return final_project_id
+
+
+def _extract_project_name(cfg_obj: dict) -> Optional[str]:
+    """
+    提取 project_name（用于 RAGFlow 知识库查找）
+
+    优先级：顶层 project_name
+    """
+    final_project_name = cfg_obj.get("project_name")
+    if final_project_name:
+        logger.info(f"从顶层 project_name 提取到 project_name: {final_project_name}")
+
+    return final_project_name

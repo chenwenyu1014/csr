@@ -94,7 +94,7 @@ class ParagraphGenerationService:
             # 使用线程安全的方式获取当前会话目录
             session_dir = get_current_output_dir(default="output")
             safe_pid = (paragraph_id or "unknown").replace("/", "_").replace("\\", "_")
-            prompts_dir = Path(session_dir) / "prompts" / safe_pid
+            prompts_dir = Path(session_dir) / "generation" / safe_pid
             prompts_dir.mkdir(parents=True, exist_ok=True)
             from datetime import datetime
             import uuid
@@ -119,7 +119,7 @@ class ParagraphGenerationService:
             # 使用线程安全的方式获取当前会话目录
             session_dir = get_current_output_dir(default="output")
             safe_pid = (paragraph_id or "unknown").replace("/", "_").replace("\\", "_")
-            outputs_dir = Path(session_dir) / "prompts" / safe_pid
+            outputs_dir = Path(session_dir) / "generation" / safe_pid
             outputs_dir.mkdir(parents=True, exist_ok=True)
             from datetime import datetime
             import uuid
@@ -143,7 +143,9 @@ class ParagraphGenerationService:
                            extracted_data: Dict[str, Any],
                            example: str = "",
                            insert_original: bool = False,
-                           paragraph_id: Optional[str] = None) -> Dict[str, Any]:
+                           paragraph_id: Optional[str] = None,
+                           is_table: bool = False,
+                           html: str = "") -> Dict[str, Any]:
         """
         生成CSR段落
         
@@ -208,71 +210,21 @@ class ParagraphGenerationService:
 
         try:
             # 从extracted_items中提取内容
-            # 1.1 从extracted_items中提取内容（新格式）
-            scheme_data = ""
             extracted_items = extracted_data.get("extracted_items", [])
             logger.info(f"📋 extracted_items数量: {len(extracted_items)}")
             logger.info(f"📋 extracted_data的所有键: {list(extracted_data.keys())}")
+            # 构建结构化 scheme_data
+            scheme_data = self._build_structured_scheme_data(extracted_items)
 
-            # 调试：输出extracted_data的完整结构（前1000字符）
-            import json
-            try:
-                debug_data = json.dumps(extracted_data, ensure_ascii=False, indent=2)
-                logger.info(f"📋 extracted_data结构预览:\n{debug_data[:1000]}...")
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                logger.warning(f"无法序列化extracted_data: {e}")
-
-            # ✅ 遍历extracted_items，处理每个提取结果
-            for idx, item in enumerate(extracted_items):
-                logger.info(
-                    f"📋 Item {idx}: status={item.get('status')}, data_type={item.get('data_type')}, content_length={len(item.get('content', ''))}")
-
-                # 只处理提取成功的项
-                if item.get("status") == "success":
-                    content = item.get("content", "")
-                    if not content:
-                        logger.warning(f"⚠️ Item {idx} 状态为success但content为空")
-                        continue
-
-                    data_type = item.get("data_type", "word")
-                    quote = item.get("quote")  # 从提取结果中获取quote字段
-
-                    # ✅ 关键逻辑：如果有quote字段，在内容前添加引用标签
-                    # 这样LLM在生成时就能看到内容的来源标识，例如：
-                    # 【方案1.0】
-                    # 研究目的是评估...
-                    if quote:
-                        content = f"【{quote}】\n{content}"
-                        logger.info(f"✅ 添加quote标签: 【{quote}】")
-                        logger.info(f"   处理后内容预览: {content[:100]}...")
-
-                    # 根据数据类型分类到不同的数据容器
-                    if data_type in ["word", "doc", "docx", "pdf", "excel", "xlsx", "xls", "rtf"]:
-                        # 文档类型归类为方案数据（scheme_data）
-                        if scheme_data:
-                            scheme_data += f"\n\n{content}"  # 多个数据项之间用双换行分隔
-                        else:
-                            scheme_data = content
-                        logger.info(f"✅ 添加到scheme_data: {len(content)}字符")
-                else:
-                    # 提取失败的项，记录错误日志
-                    logger.error(f"❌ Item {idx} 提取失败: {item.get('error', 'Unknown error')}")
-                    logger.error(f"   失败项的完整信息: {item}")
-
-            # 1.2 兼容旧格式：如果没有extracted_items，尝试直接获取scheme_data
+            # 兼容旧格式：如果没有extracted_items，尝试直接获取scheme_data
             if not extracted_items:
                 scheme_data = extracted_data.get("scheme_data", "")
-
-                # 如果有其他数据源，也整合进来（纯数据，不添加标签）
+                # 如果有其他数据源，也整合进来
                 other_data = []
                 for key, value in extracted_data.items():
                     if key not in ["scheme_data", "extracted_items", "available_resources",
                                    "traceability"] and value:
                         other_data.append(str(value))
-
-                # 如果有其他数据，附加到方案数据
                 if other_data:
                     other_data_text = "\n\n".join(other_data)
                     if scheme_data:
@@ -297,29 +249,33 @@ class ParagraphGenerationService:
             # 3. 构建生成提示词
             logger.info(f"📊 最终数据统计:")
             logger.info(f"  - scheme_data长度: {len(scheme_data)}字符")
-            logger.info(f"  - scheme_data预览: {scheme_data[:300] if scheme_data else '(空)'}...")
             logger.info(f"  - available_resources数量: {len(available_resources)}个")
-            logger.info(f"  - generate_prompt: {generate_prompt[:100]}...")
 
             if not scheme_data:
                 logger.warning("⚠️ 警告: scheme_data为空！LLM将没有参考资料")
 
+            # 根据is_table选择模板
+            template_name = "csr_generation_table" if is_table else "csr_generation"
+
+            # 构建variables，仅表格模式添加html
             variables = {
                 "generate_prompt": generate_prompt,
                 "scheme_data": scheme_data,  # ✅ 直接传递，空值由模板处理
                 "example": example,
                 "project_desc": os.getenv("CURRENT_PROJECT_DESC", "")
             }
+            if is_table:
+                variables["html"] = html
 
             # 构建提示词计时
             with Timer("构建生成提示词", parent="段落生成") as prompt_timer:
                 generation_prompt = system_prompt_manager.build_prompt(
-                    "csr_generation",
+                    template_name,
                     variables
                 )
 
             logger.info(f"📝 生成提示词长度: {len(generation_prompt)}字符 [构建耗时: {prompt_timer.duration_str}]")
-            logger.info(f"📝 生成提示词预览（最后500字符）:\n{generation_prompt[-500:]}")
+            # logger.info(f"📝 生成提示词预览（最后500字符）:\n{generation_prompt[-500:]}")
 
             # ✅ 保存生成阶段的完整溯源数据
             provenance_data = {
@@ -446,169 +402,6 @@ class ParagraphGenerationService:
                 }
             }
 
-    # def generate_paragraph_from_extractions(self,
-    #                                         generate_prompt: str,
-    #                                         extraction_results: List[Dict[str, Any]],
-    #                                         example: str = "",
-    #                                         paragraph_id: Optional[str] = None) -> Dict[str, Any]:
-    #     """
-    #     从多个提取结果生成段落
-    #
-    #     Args:
-    #         generate_prompt: 用户的生成逻辑
-    #         extraction_results: 多个提取结果的列表（来自extracted_items）
-    #         example: 示例文本（可选）
-    #         paragraph_id: 段落ID（可选）
-    #
-    #     Returns:
-    #         Dict: 生成结果
-    #     """
-    #     try:
-    #         # 1. 整合提取结果和收集TFL占位符
-    #         extracted_data = {}
-    #         tfl_placeholders = []  # 收集TFL占位符（RTF/Excel原文模式）
-    #         tfl_insert_mappings = []  # 收集TFL插入映射
-    #
-    #         for result in extraction_results:
-    #             # 提取状态检查
-    #             if result.get("status") != "success":
-    #                 continue
-    #
-    #             data_type = result.get("data_type", "")
-    #             content = result.get("content", "")
-    #             is_original = result.get("is_original", False)
-    #
-    #             # 🆕 收集TFL插入映射中的占位符（RTF/Excel原文模式）
-    #             mappings = result.get("tfl_insert_mappings", [])
-    #             if mappings and isinstance(mappings, list):
-    #                 for m in mappings:
-    #                     ph = m.get("Placeholder", "")
-    #                     if ph:
-    #                         tfl_placeholders.append(ph)
-    #                         tfl_insert_mappings.append(m)
-    #                         logger.info(f"📌 收集TFL占位符: {ph} -> {m.get('Source', 'unknown')}")
-    #
-    #             # 如果是原文且没有内容，跳过
-    #             if is_original and not content:
-    #                 continue
-    #
-    #             if not content:
-    #                 continue
-    #
-    #             # 根据数据类型分类（Word/PDF的content已包含{{Table_1_Start}}等占位符）
-    #             if data_type in ["word","docx", "doc", "pdf"]:
-    #                 # Word/PDF归类为方案数据
-    #                 if "scheme_data" not in extracted_data:
-    #                     extracted_data["scheme_data"] = ""
-    #                 extracted_data["scheme_data"] += f"\n\n{content}"
-    #
-    #             elif data_type in ["tfl"]:
-    #                 # TFL归类为TFL数据
-    #                 if "tfl_data" not in extracted_data:
-    #                     extracted_data["tfl_data"] = ""
-    #                 extracted_data["tfl_data"] += f"\n\n{content}"
-    #
-    #             else:
-    #                 # 其他类型（Excel、RTF等）归类为方案数据
-    #                 if "scheme_data" not in extracted_data:
-    #                     extracted_data["scheme_data"] = ""
-    #                 extracted_data["scheme_data"] += f"\n\n{content}"
-    #
-    #         # 2. 调用段落生成
-    #         generation_result = self.generate_paragraph(
-    #             generate_prompt=generate_prompt,
-    #             extracted_data=extracted_data,
-    #             example=example,
-    #             paragraph_id=paragraph_id
-    #         )
-    #
-    #         # 3. 如果有TFL占位符，附加到生成内容的末尾
-    #         if generation_result.get("success") and tfl_placeholders:
-    #             generated_content = generation_result.get("generated_content", "")
-    #             placeholders_text = "\n\n" + "\n".join(tfl_placeholders)
-    #             generation_result["generated_content"] = generated_content + placeholders_text
-    #             generation_result["tfl_placeholders"] = tfl_placeholders
-    #             logger.info(f"✅ 已附加{len(tfl_placeholders)}个TFL占位符到段落末尾: {tfl_placeholders}")
-    #
-    #         # 4. 附加TFL插入映射信息到结果
-    #         if tfl_insert_mappings:
-    #             generation_result["tfl_insert_mappings"] = tfl_insert_mappings
-    #             logger.info(f"📊 TFL插入映射: {len(tfl_insert_mappings)} 个")
-    #
-    #         return generation_result
-    #
-    #     except Exception as e:
-    #         logger.error(f"从提取结果生成段落失败: {e}")
-    #         _task_log_error(f"从提取结果生成段落失败: {paragraph_id}", exc=e, paragraph_id=paragraph_id)
-    #         return {
-    #             "success": False,
-    #             "paragraph_id": paragraph_id,
-    #             "error": str(e)
-    #         }
-    #
-    # def generate_with_validated_extractions(self,
-    #                                        generate_prompt: str,
-    #                                        validated_results: List[Dict[str, Any]],
-    #                                        example: str = "",
-    #                                        paragraph_id: Optional[str] = None,
-    #                                        use_only_valid: bool = True) -> Dict[str, Any]:
-    #     """
-    #     使用校验后的提取结果生成段落
-    #
-    #     Args:
-    #         generate_prompt: 用户的生成逻辑
-    #         validated_results: 校验后的提取结果列表
-    #         example: 示例文本（可选）
-    #         paragraph_id: 段落ID（可选）
-    #         use_only_valid: 是否只使用通过校验的结果（默认True）
-    #
-    #     Returns:
-    #         Dict: 生成结果
-    #     """
-    #     try:
-    #         # 筛选提取结果
-    #         extraction_results = []
-    #
-    #         for result in validated_results:
-    #             # 检查是否成功
-    #             if not result.get("success"):
-    #                 logger.warning(f"跳过失败的提取结果")
-    #                 continue
-    #
-    #             # 检查是否通过校验
-    #             is_valid = result.get("is_valid", True)
-    #             if use_only_valid and not is_valid:
-    #                 logger.warning(f"跳过未通过校验的提取结果（评分:{result.get('validation_result', {}).get('overall_score', 0)}）")
-    #                 continue
-    #
-    #             # 提取内容
-    #             extracted_content = result.get("extracted_content", "")
-    #             if not extracted_content:
-    #                 continue
-    #
-    #             extraction_results.append({
-    #                 "data_type": result.get("data_type", "unknown"),
-    #                 "name": result.get("name", "未命名"),
-    #                 "extracted_content": extracted_content
-    #             })
-    #
-    #         logger.info(f"使用{len(extraction_results)}个有效的提取结果生成段落")
-    #
-    #         # 调用生成
-    #         return self.generate_paragraph_from_extractions(
-    #             generate_prompt=generate_prompt,
-    #             extraction_results=extraction_results,
-    #             example=example,
-    #             paragraph_id=paragraph_id
-    #         )
-    #     except Exception as e:
-    #         logger.error(f"使用校验结果生成段落失败: {e}")
-    #         _task_log_error(f"使用校验结果生成段落失败: {paragraph_id}", exc=e, paragraph_id=paragraph_id)
-    #         return {
-    #             "success": False,
-    #             "paragraph_id": paragraph_id,
-    #             "error": str(e)
-    #         }
 
     def _save_provenance_data(self, paragraph_id: Optional[str], provenance_data: Dict[str, Any],
                               extracted_data: Dict[str, Any]) -> Optional[Path]:
@@ -628,7 +421,7 @@ class ParagraphGenerationService:
             # 使用线程安全的方式获取当前会话目录
             session_dir = get_current_output_dir(default="output")
             safe_para_id = (paragraph_id or "unknown").replace("/", "_").replace("\\", "_")
-            prompts_dir = Path(session_dir) / "prompts" / safe_para_id
+            prompts_dir = Path(session_dir) / "generation" / safe_para_id
             prompts_dir.mkdir(parents=True, exist_ok=True)
 
             # 生成文件名
@@ -676,6 +469,141 @@ class ParagraphGenerationService:
         pattern = r'\{\{([^\}]+)\}\}'
         matches = re.findall(pattern, content)
         return matches if matches else []
+
+    def _build_structured_scheme_data(self, extracted_items: List[Dict[str, Any]]) -> str:
+        """
+        按结构化格式构建 scheme_data（有生成逻辑时使用）
+
+        格式示例：
+        ## 参考资料
+        ### 参考资料编号: 1
+        来源目录: 临床研究方案
+        来源文件: xxxxI期临床方案.docx
+        内容:
+        提取的内容...
+
+        Args:
+            extracted_items: 提取结果列表
+
+        Returns:
+            结构化的参考资料文本
+        """
+        # 按 item_id 分组
+        grouped_items: Dict[int, Dict[str, Any]] = {}
+
+        for item in extracted_items:
+            if item.get("status") != "success":
+                continue
+
+            item_id = item.get("item_id", 0) or 0
+            if item_id not in grouped_items:
+                grouped_items[item_id] = {
+                    "directory": item.get("directory", "未知目录"),
+                    "files": []
+                }
+
+            content = item.get("content", "")
+            data_type = item.get("data_type", "word")
+
+            # 获取文件名列表
+            file_names = item.get("file_name", [])
+            if not isinstance(file_names, list):
+                file_names = [file_names] if file_names else []
+
+            # 获取映射关系（file_name -> content）
+            per_file_contents = item.get("per_file_contents", {})
+
+            # Excel 特殊处理：使用 per_file_sheets_info 按文件分开展示
+            per_file_sheets_info = item.get("per_file_sheets_info", {})
+            if per_file_sheets_info and file_names:
+                # 按文件分开展示每个文件的 sheet 信息
+                for source_file in file_names:
+                    sheets_info = per_file_sheets_info.get(source_file, [])
+                    file_content = per_file_contents.get(source_file, "")
+                    if sheets_info or file_content:
+                        file_entry = {
+                            "source_file": source_file,
+                            "content": file_content,
+                            "data_type": data_type,
+                            "sheet_info": sheets_info  # 该文件的 sheet 信息
+                        }
+                        grouped_items[item_id]["files"].append(file_entry)
+            elif per_file_contents and file_names:
+                # 有映射：精确匹配每个文件的提取内容
+                for source_file in file_names:
+                    file_content = per_file_contents.get(source_file, "")
+                    if file_content:
+                        file_entry = {
+                            "source_file": source_file,
+                            "content": file_content,
+                            "data_type": data_type
+                        }
+                        grouped_items[item_id]["files"].append(file_entry)
+            else:
+                # 兼容旧逻辑：无映射时取第一个文件名，共享合并内容
+                source_file = file_names[0] if file_names else (item.get("source_file") or "未知文件")
+                file_entry = {
+                    "source_file": source_file,
+                    "content": content,
+                    "data_type": data_type
+                }
+                grouped_items[item_id]["files"].append(file_entry)
+
+        # 构建文本
+        if not grouped_items:
+            return ""
+
+        result = "参考资料\n"
+
+        for item_id in sorted(grouped_items.keys()):
+            group = grouped_items[item_id]
+
+            # 临时存储当前item的输出，用于判断是否有有效内容
+            item_output_parts = []
+            item_output_parts.append(f"参考资料编号: {item_id}\n")
+            item_output_parts.append(f"来源目录: {group['directory']}\n")
+
+            has_valid_files = False
+
+            for file_entry in group["files"]:
+                file_output = f"来源文件: {file_entry['source_file']}\n"
+
+                # Excel 格式：按 sheet 展示（只展示 available=True 且有内容的 sheet）
+                if file_entry.get("sheet_info"):
+                    sheet_contents = []
+                    for idx, sheet in enumerate(file_entry["sheet_info"], 1):
+                        sheet_name = sheet.get("sheet_name", f"Sheet{idx}")
+                        sheet_content = sheet.get("content", "")
+                        # 检查 available 字段，只展示有效内容
+                        available = sheet.get("available", False)
+                        # 如果 available 是字符串，转换为布尔值
+                        if isinstance(available, str):
+                            available = available.lower() == "true"
+
+                        # 只展示 available=True 且有内容的 sheet
+                        if available and sheet_content:
+                            sheet_contents.append(f"sheet{idx}: {sheet_name}\n{sheet_content}\n")
+
+                    # 只有当存在有效的sheet内容时才添加文件信息
+                    if sheet_contents:
+                        file_output += "内容:\n"
+                        file_output += "".join(sheet_contents)
+                        file_output += "\n"
+                        item_output_parts.append(file_output)
+                        has_valid_files = True
+                else:
+                    # Word/PDF 格式：只有内容非空才添加
+                    if file_entry['content']:
+                        file_output += f"内容:\n{file_entry['content']}\n\n"
+                        item_output_parts.append(file_output)
+                        has_valid_files = True
+
+            # 只有当该item下有有效文件内容时，才添加到最终结果
+            if has_valid_files:
+                result += "".join(item_output_parts)
+                result += "\n"
+
+        return result.rstrip()
 
 
 # 创建全局服务实例

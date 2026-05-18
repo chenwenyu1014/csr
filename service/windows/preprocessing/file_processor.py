@@ -676,31 +676,9 @@ class FileProcessor:
             return FileType.EXCEL
         elif suffix == '.pdf':
             return FileType.PDF
-            # if force_ocr:
-            #     return FileType.PDF_SCANNED
-            # # 检测PDF是否为扫描件
-            # if self._is_scanned_pdf(file_path):
-            #     return FileType.PDF_SCANNED
-            # else:
-            #     return FileType.PDF_NORMAL
         else:
             return FileType.UNKNOWN
     
-    # def _is_scanned_pdf(self, pdf_path: Path) -> bool:
-    #     """检测PDF是否为扫描件（纯图片）"""
-    #     try:
-    #         import pdfplumber  # type: ignore
-    #         with pdfplumber.open(pdf_path) as pdf:
-    #             # 检查前3页的文字量
-    #             text_chars = 0
-    #             for page in pdf.pages[:3]:
-    #                 text = page.extract_text() or ""
-    #                 text_chars += len(text.strip())
-    #             # 少于100字符 → 扫描件
-    #             return text_chars < 100
-    #     except Exception as e:
-    #         logger.warning(f"PDF类型检测失败: {e}，默认为正常PDF")
-    #         return False
     
     def _normalize_content_type(self, content_type: Optional[str]) -> Optional[str]:
         """
@@ -781,15 +759,6 @@ class FileProcessor:
             except Exception as e:
                 logger.warning(f"PDF管道失败，回退到内置流程: {e}")
                 return self._pdf_to_markdown_direct(file_path, work_dir)
-        #
-        # elif file_type == FileType.PDF_SCANNED:
-        #     # 扫描PDF → 直接转 Markdown
-        #     try:
-        #         from service.windows.preprocessing.preprocessing_function.pdf.pdf_pipeline import run as pdf_run
-        #         return pdf_run(file_path, work_dir, scanned=True)
-        #     except Exception as e:
-        #         logger.warning(f"PDF(scanned) 管道失败，回退到内置流程: {e}")
-        #         return self._pdf_to_markdown_direct(file_path, work_dir)
         
         elif file_type == FileType.EXCEL:
             # 委派到 Excel Pipeline：拆分Sheet并生成Markdown
@@ -1498,15 +1467,6 @@ class FileProcessor:
             except Exception as e:
                 logger.warning(f"Word COM转换RTF失败: {e}")
             
-            # # 方法2: 通过Windows Bridge服务（如果可用）
-            # try:
-            #     from service.windows.preprocessing.preprocessing_function.rtf.tool_invoker import ToolInvoker
-            #     inv = ToolInvoker()
-            #     # 如果工具层支持RTF转Word，可以在这里调用
-            #     # 目前先跳过，等待工具层支持
-            #     logger.info("Windows Bridge暂不支持RTF转Word，跳过")
-            # except Exception as e:
-            #     logger.warning(f"工具层RTF转Word失败: {e}")
             
             # 转换失败
             logger.error(f"RTF转Word失败，无法处理RTF文件: {rtf_path}")
@@ -1516,6 +1476,172 @@ class FileProcessor:
             logger.error(f"RTF转Word过程出错: {e}", exc_info=True)
             return None
     
+    def _create_marker_paragraph_element(self, marker_text: str) -> 'etree._Element':
+        """
+        创建包含标记文本的段落 XML 元素（不添加到文档）
+
+        Args:
+            marker_text: 标记文本，如 "{{Table_1_Start}}"
+
+        Returns:
+            段落 XML 元素 (w:p)
+        """
+        from lxml import etree
+
+        # Word XML 命名空间
+        WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+        # 直接创建段落 XML 元素，不通过 doc.add_paragraph
+        # 结构: <w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>标记文本</w:t></w:r></w:p>
+        p = etree.Element(f'{{{WNS}}}p')
+
+        # 添加段落属性（居中对齐）
+        pPr = etree.SubElement(p, f'{{{WNS}}}pPr')
+        jc = etree.SubElement(pPr, f'{{{WNS}}}jc')
+        jc.set(f'{{{WNS}}}val', 'center')
+
+        # 添加文本内容
+        r = etree.SubElement(p, f'{{{WNS}}}r')
+        t = etree.SubElement(r, f'{{{WNS}}}t')
+        t.text = marker_text
+
+        return p
+
+    # 需要标记为图片的OLE对象ProgID列表（排除Excel等表格类对象）
+    _IMAGE_OLE_PROGIDS = frozenset([
+        'Visio.Drawing',      # Visio绘图（包含各种版本如 Visio.Drawing.11, Visio.Drawing.15 等）
+        'MSVisio',            # Visio的另一种ProgID格式
+        'PowerPoint.Show',    # PowerPoint幻灯片
+        'PowerPoint.Slide',   # PowerPoint幻灯片
+        'Equation',           # 公式编辑器
+        'WordArt',            # 艺术字
+    ])
+
+    def _check_paragraph_has_image(self, p_element: 'etree._Element') -> bool:
+        """
+        检查段落是否包含需要标记的图片元素
+
+        检测规则：
+        1. 标准图片：blip, drawing, pict
+        2. OLE嵌入对象：仅标记Visio等图像类对象，排除Excel表格
+
+        Args:
+            p_element: 段落 XML 元素 (w:p)
+
+        Returns:
+            是否包含需要标记的图片
+        """
+        for elem in p_element.iter():
+            tag_local = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+
+            # 检查标准图片元素
+            if tag_local in ('blip', 'drawing', 'pict'):
+                return True
+
+            # 检查OLE嵌入对象（w:object）
+            if tag_local == 'object':
+                # 获取OLEObject的ProgID来判断类型
+                for ole_elem in elem.iter():
+                    ole_tag = ole_elem.tag.split('}')[-1] if '}' in ole_elem.tag else ole_elem.tag
+                    if ole_tag == 'OLEObject':
+                        prog_id = ole_elem.get('ProgID', '')
+                        # 检查ProgID是否在图像类列表中（匹配前缀）
+                        for image_prog_prefix in self._IMAGE_OLE_PROGIDS:
+                            if prog_id.startswith(image_prog_prefix):
+                                return True
+                        # Excel等表格类对象不标记为图片，继续检查其他元素
+                        break
+
+        return False
+
+    def _process_nested_table_contents(self, doc: 'Document', tbl_element: 'etree._Element',
+                                        parent_table_idx: int,
+                                        counters: dict) -> None:
+        """
+        递归处理表格单元格内的嵌套内容
+
+        在单元格内检测嵌套表格和图片，在其前后插入标记段落
+
+        Args:
+            doc: Document 对象
+            tbl_element: 表格 XML 元素 (w:tbl)
+            parent_table_idx: 父表格编号
+            counters: 计数器字典，格式: {'nested_table': {parent_idx: count}, 'cell_image': {parent_idx: count}}
+        """
+        # 初始化父表格的计数器
+        if parent_table_idx not in counters['nested_table']:
+            counters['nested_table'][parent_table_idx] = 0
+        if parent_table_idx not in counters['cell_image']:
+            counters['cell_image'][parent_table_idx] = 0
+
+        # Word XML 命名空间
+        WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+        # 遍历表格结构: tbl -> tr -> tc
+        for tr in tbl_element:
+            if not tr.tag.endswith('tr'):
+                continue
+            for tc in tr:
+                if not tc.tag.endswith('tc'):
+                    continue
+
+                # 收集单元格内需要处理的元素和插入位置
+                # 格式: (index, 'before'/'after', marker_element)
+                insertions = []
+
+                for idx, child in enumerate(list(tc)):
+                    # 检查嵌套表格
+                    if child.tag.endswith('tbl'):
+                        counters['nested_table'][parent_table_idx] += 1
+                        nested_idx = counters['nested_table'][parent_table_idx]
+                        # 命名格式：Table_父表格_嵌套编号
+                        marker_name = f"Table_{parent_table_idx}_{nested_idx}"
+
+                        # 创建前后标记
+                        start_marker = self._create_marker_paragraph_element(
+                            f"{{{{{marker_name}_Start}}}}"
+                        )
+                        end_marker = self._create_marker_paragraph_element(
+                            f"{{{{{marker_name}_End}}}}"
+                        )
+
+                        insertions.append((idx, 'before', start_marker))
+                        insertions.append((idx + 1, 'after', end_marker, child))
+
+                        # 递归处理更深层嵌套表格
+                        self._process_nested_table_contents(doc, child, nested_idx, counters)
+
+                    # 检查段落中的图片
+                    elif child.tag.endswith('p'):
+                        if self._check_paragraph_has_image(child):
+                            counters['cell_image'][parent_table_idx] += 1
+                            image_idx = counters['cell_image'][parent_table_idx]
+                            # 命名格式：Image_父表格_图片编号
+                            marker_name = f"Image_{parent_table_idx}_{image_idx}"
+
+                            # 创建前后标记
+                            start_marker = self._create_marker_paragraph_element(
+                                f"{{{{{marker_name}_Start}}}}"
+                            )
+                            end_marker = self._create_marker_paragraph_element(
+                                f"{{{{{marker_name}_End}}}}"
+                            )
+
+                            insertions.append((idx, 'before', start_marker))
+                            insertions.append((idx + 1, 'after', end_marker, child))
+
+                # 按倒序处理插入，避免索引变化
+                for insertion in reversed(insertions):
+                    if len(insertion) == 3:
+                        idx, pos, marker = insertion
+                        if pos == 'before':
+                            tc.insert(idx, marker)
+                    elif len(insertion) == 4:
+                        idx, pos, marker, _ = insertion
+                        if pos == 'after':
+                            # 在指定元素后插入
+                            tc.insert(idx, marker)
+
     def _mark_word_tables_and_images(self, word_path: Path, work_dir: Path) -> Optional[Path]:
         """
         标记Word文档中的表格和图片
@@ -1537,37 +1663,32 @@ class FileProcessor:
             
             # 方法1: 使用word_document_service（Word COM）
             # 暂时禁用COM方法，因为长文件名会导致COM错误
-            # try:
-            #     from ..services.word_document_service import word_document_service
-            #     result = word_document_service.mark_tables_and_images_with_com(
-            #         source_file=str(word_path),
-            #         marked_file=str(marked_file_path)
-            #     )
-            #     if result:
-            #         logger.info(f"Word标记成功（COM）: {result}")
-            #         return Path(result)
-            # except Exception as e:
-            #     logger.warning(f"Word COM标记失败: {e}，尝试python-docx")
-            
+
             # 方法2: 使用python-docx（推荐）
             try:
                 from docx import Document  # type: ignore
                 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT  # type: ignore
                 import shutil
-                
+
                 # 复制原文件
                 shutil.copy2(word_path, marked_file_path)
-                
+
                 # 加载文档
                 doc = Document(marked_file_path)
                 table_count = 0
                 image_count = 0
-                
+
+                # 嵌套内容计数器
+                nested_counters = {
+                    'nested_table': {},  # {parent_table_idx: count}
+                    'cell_image': {}     # {parent_table_idx: count}
+                }
+
                 # 获取文档元素
                 body = doc._element.body
                 elements = list(body)
                 new_elements = []
-                
+
                 # 遍历元素，插入标记
                 for element in elements:
                     # 表格
@@ -1585,13 +1706,13 @@ class FileProcessor:
                         end_p.text = f"{{{{Table_{table_count}_End}}}}"
                         end_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
                         new_elements.append(end_p._element)
-                    
+
+                        # 处理表格内的嵌套内容（递归标记嵌套表格和单元格内图片）
+                        self._process_nested_table_contents(doc, element, table_count, nested_counters)
+
                     # 包含图片的段落
                     elif element.tag.endswith('p'):
-                        has_image = any(
-                            child.tag.endswith(('blip', 'drawing', 'pict'))
-                            for child in element.iter()
-                        )
+                        has_image = self._check_paragraph_has_image(element)
                         if has_image:
                             image_count += 1
                             # 开始标记
@@ -1610,21 +1731,26 @@ class FileProcessor:
                             new_elements.append(element)
                     else:
                         new_elements.append(element)
-                
+
                 # 重建文档
                 body.clear()
                 for elem in new_elements:
                     body.append(elem)
-                
+
                 # 保存
                 doc.save(marked_file_path)
-                logger.info(f"Word标记成功（python-docx）: {table_count}表格, {image_count}图片")
+
+                # 统计嵌套内容数量
+                total_nested_tables = sum(nested_counters['nested_table'].values())
+                total_cell_images = sum(nested_counters['cell_image'].values())
+                logger.info(f"Word标记成功（python-docx）: {table_count}表格, {image_count}顶层图片, "
+                           f"{total_nested_tables}嵌套表格, {total_cell_images}单元格内图片")
                 return marked_file_path
-                
+
             except Exception as e:
                 logger.error(f"python-docx标记失败: {e}", exc_info=True)
                 return None
-                
+
         except Exception as e:
             logger.error(f"Word标记失败: {e}", exc_info=True)
             return None
@@ -1813,33 +1939,6 @@ class FileProcessor:
                 'metadata': {'conversion_method': 'pdf_ocr_error', 'error': str(e)}
             }
     
-    # def _scanned_pdf_to_markdown(self, pdf_path: Path, work_dir: Path) -> Dict[str, Any]:
-    #     """扫描PDF通过OCR转Markdown - 复用Word→PDF→OCR的流程"""
-    #     try:
-    #         markdown_content = self._pdf_to_markdown_ocr(pdf_path, work_dir)
-    #         if markdown_content:
-    #             return {
-    #                 'content': markdown_content,
-    #                 'content_type': ContentType.MARKDOWN,
-    #                 'text': markdown_content,
-    #                 'metadata': {'conversion_method': 'pdf_ocr', 'source': 'scanned_pdf'}
-    #             }
-    #         else:
-    #             logger.warning("扫描PDF OCR失败，返回空内容")
-    #             return {
-    #                 'content': '',
-    #                 'content_type': ContentType.MARKDOWN,
-    #                 'text': '',
-    #                 'metadata': {'conversion_method': 'ocr_failed'}
-    #             }
-    #     except Exception as e:
-    #         logger.error(f"扫描PDF OCR失败: {e}")
-    #         return {
-    #             'content': '',
-    #             'content_type': ContentType.MARKDOWN,
-    #             'text': '',
-    #             'metadata': {'conversion_method': 'ocr_error', 'error': str(e)}
-    #         }
     
     def _excel_split_sheets(self, excel_path: Path, work_dir: Path) -> Dict[str, Any]:
         """
@@ -2113,24 +2212,6 @@ class FileProcessor:
                 'metadata': {'conversion_method': 'excel_split_sheets_failed', 'error': str(e), 'excel_sheets': [], 'excel_markdown_regions': []}
             }
     
-    # def _mark_document(self, content: str) -> str:
-    #     """标记文档（插入标签）"""
-    #     try:
-    #         from service.windows.preprocessing.preprocessing_function.markdown.markdown_splitter import mark_tables_and_images_in_markdown
-    #         return mark_tables_and_images_in_markdown(content)
-    #     except Exception as e:
-    #         logger.warning(f"文档标记失败: {e}，返回原内容")
-    #         return content
-    #
-    # def _split_regions(self, marked_content: str, work_dir: Path) -> List[Dict[str, Any]]:
-    #     """拆分标记区域"""
-    #     try:
-    #         from service.windows.preprocessing.preprocessing_function.markdown.markdown_splitter import split_markdown_by_regions
-    #         return split_markdown_by_regions(marked_content, work_dir / 'regions')
-    #     except Exception as e:
-    #         logger.warning(f"区域拆分失败: {e}")
-    #         return []
-    #
     def _extract_assets(self, content: str, regions: List[Dict], work_dir: Path) -> List[Dict[str, Any]]:
         """提取资源（图片等）"""
         assets = []

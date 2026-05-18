@@ -12,11 +12,14 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DataItem:
     """数据项配置（通用版）"""
+    item_id : str = None # 数据项编号
     extract: Optional[str] = None  # 提取提示词
-    datas: Optional[List] = None  # 文件列表（可以是字符串列表或字典列表）
+    datas: List[str] = None  # 文件列表（可以是字符串列表或字典列表）
     original_mode: bool = False  # 原文模式是否使用原始数据
     insert_original: bool = False  # 是否插入表格/图片等（针对单个数据项）
     quote: Optional[str] = None  # 引用编号标签（用于在生成时标注来源）
+    file_name: List[str] = None # 保存原始文件名
+    directory: str = None # 保存输入源目录
 
 
 @dataclass
@@ -27,6 +30,9 @@ class Paragraph:
     generate: str  # 生成提示词
     insert_original: bool = False  # 表示整个段落是否有需要插入的图表,由内部数据项自动推导得出 (任何一项为True则此处为True)
     example: Optional[str] = None  # 生成模板/示例
+    is_table : bool = False  # 是否是表格
+    html : Optional[str] = None
+    replace_tag: Optional[str] = None  # 要替换的模板表格标记（如 Table_1）
 
 
 class ConfigParser:
@@ -73,136 +79,57 @@ class ConfigParser:
                 # 兼容旧格式：options="原文" 转换为 original_mode=True
                 options_val = data_item.get("options", "")
                 original_mode = (str(options_val).strip() == "原文")
+            # 兼容新旧格式：
+            # 旧格式: datas: ["file1.docx", "file2.docx"] (字符串列表)
+            # 新格式: datas: [{"fileId": "xxx", "fileName": "yyy"}] (对象列表)
+            raw_datas = data_item.get("datas", [])
+            datas = []
+            file_name = []
+            for item in raw_datas:
+                if isinstance(item, dict):
+                    # 新格式：对象列表
+                    datas.append(item.get("fileId"))
+                    file_name.append(item.get("fileName"))
+                else:
+                    # 旧格式：字符串列表
+                    datas.append(item)
+                    file_name.append(item)
 
             item = DataItem(
+                item_id=data_item.get("number"),
                 extract=data_item.get("extract"),
-                datas=data_item.get("datas"),
+                datas=datas,
                 original_mode=original_mode,
                 insert_original=self._parse_bool(data_item.get("insert_original"), False),
-                quote=data_item.get("quote")  # 读取quote字段
+                quote=data_item.get("quote"),  # 读取quote字段
+                file_name=file_name,
+                directory=data_item.get("directory")
             )
             data_items.append(item)
 
         # 根据各个数据项级别insert_original的计算段落级 insert_original
         # 逻辑：只要 data_items 中有任何一个 item.insert_original 为 True，则外层为 True
         has_any_insert = any(item.insert_original for item in data_items)
+        is_table = self._parse_bool(para_data.get("is_table", False))
+        # 表格模式下强制不插入占位符
+        final_insert_original = has_any_insert and not is_table
 
         # 创建段落对象
         paragraph = Paragraph(
             id=para_data.get("id", ""),
             data=data_items,
             generate=para_data.get("generate", ""),
-            insert_original=has_any_insert,
-            example=para_data.get("example")
+            insert_original=final_insert_original,
+            example=para_data.get("example"),
+            is_table=is_table,
+            html=para_data.get("html",''),
+            replace_tag=para_data.get("replace_tag",'')
         )
         
         return paragraph
     
 
-#
-#     def get_raw_data_items(self) -> List[Dict[str, Any]]:
-#         """返回所有原始数据项，不做任何处理"""
-#         paragraphs = self.parse()
-#         all_items = []
-#
-#         for para in paragraphs:
-#             for item in para.data:
-#                 raw_item = {
-#                     "paragraph_id": para.id,
-#                     "extract": item.extract,
-#                     "datas": item.datas,
-#                     "insert_original": item.insert_original
-#                 }
-#                 all_items.append(raw_item)
-#
-#         return all_items
-#
-#     def get_data_by_type_structured(self) -> Dict[str, List[Dict[str, Any]]]:
-#         """按数据类型分组返回原始数据（已废弃：无type字段）"""
-#         # 由于DataItem已移除type字段，此方法仅返回空字典
-#         return {}
-#
-#     def get_simple_config(self) -> Dict[str, Any]:
-#         """返回简化的配置结构，方便直接使用"""
-#         paragraphs = self.parse()
-#
-#         # 构建简化的配置结构
-#         config = {
-#             "paragraphs": [],
-#             "data_items": [],
-#             "data_by_type": {},
-#             "paragraph_count": len(paragraphs),
-#             "total_data_items": 0
-#         }
-#
-#         for idx, para in enumerate(paragraphs):
-#             # 段落信息
-#             para_info = {
-#                 "id": para.id,
-#                 "generate": para.generate,
-#                 "example": para.example,
-#                 "data_count": len(para.data),
-#                 "data": []
-#             }
-#
-#             # 处理段落中的数据项
-#             for item in para.data:
-#                 # 构建数据项信息
-#                 data_item = {
-#                     "index": idx + 1
-#                 }
-#
-#                 # 只添加非空字段
-#                 if item.extract:
-#                     data_item["extract"] = item.extract
-#                 if item.datas:
-#                     data_item["datas"] = item.datas
-#                 if item.insert_original:
-#                     data_item["insert_original"] = item.insert_original
-#
-#                 para_info["data"].append(data_item)
-#                 config["data_items"].append(data_item)
-#
-#             config["paragraphs"].append(para_info)
-#
-#         config["total_data_items"] = len(config["data_items"])
-#
-#         return config
-#
-#
-#
-#
-# def main():
-#     """测试解析功能"""
-#     # config_path = "../configs/paragraphs-v1.1(1).json"  # 已废弃
-#     config_path = None  # 需要从API接口传入配置
-#
-#     try:
-#         parser = ConfigParser(config_path)
-#
-#         print("=== 原始数据项解析 ===")
-#         raw_items = parser.get_raw_data_items()
-#         print(f"总共解析出 {len(raw_items)} 个数据项:")
-#
-#         for i, item in enumerate(raw_items, 1):
-#             print(f"\n数据项 {i} (段落: {item['paragraph_id']}):")
-#             # 只显示非空字段
-#             for key, value in item.items():
-#                 if key not in ['paragraph_id'] and value is not None:
-#                     print(f"  {key}: {value}")
-#
-#         print("\n=== 按类型分组 ===")
-#         type_groups = parser.get_data_by_type_structured()
-#         for data_type, items in type_groups.items():
-#             print(f"\n{data_type} 类型: {len(items)} 个数据项")
-#
-#         print("\n=== JSON格式输出 ===")
-#         import json
-#         print(json.dumps(raw_items, ensure_ascii=False, indent=2))
-#
-#     except Exception as e:
-#         print(f"解析失败: {e}")
-#
-#
-# if __name__ == "__main__":
-#     main()
+if __name__ == '__main__':
+    CP = ConfigParser(r'..\tests\test.json')
+    g=CP.parse()
+    print(g)

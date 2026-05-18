@@ -30,6 +30,8 @@ import threading
 import asyncio
 import functools
 import random
+import uuid
+from pathlib import Path
 from collections import deque
 from typing import Any, Dict, Optional, List, Union
 
@@ -415,7 +417,10 @@ def generate(prompt: str,
 
     import logging
     _logger = logging.getLogger(__name__)
-    
+    # 原始响应存储路径
+    output_dir =  Path(os.getenv("OUTPUT_DIR"))
+    RAW_RESPONSE_SAVE_DIR: Optional[str] = output_dir / "Model_response"
+    task_id = uuid.uuid4().hex[:8]
     # 开始计时
     model_name = model or cfg["model"]
     prompt_len = len(prompt)
@@ -447,7 +452,7 @@ def generate(prompt: str,
         payload["max_tokens"] = max_tokens
     if extra:
         payload.update(extra)
-
+    raw_payload = payload.copy()
     def _post_with_retry(max_retries: int = 3, backoff: float = 1.5):
         last_err: Optional[Exception] = None
         # 环境变量可覆盖重试策略
@@ -466,7 +471,7 @@ def generate(prompt: str,
             if not _skip_rl:
                 rl.acquire()
             try:
-                r = requests.post(url, headers=headers, json=payload, timeout=cfg["timeout"])
+                r = requests.post(url, headers=headers, json=payload) # , timeout=cfg["timeout"]
                 if r.status_code == 429:
                     retry_after = r.headers.get("Retry-After")
                     try:
@@ -508,19 +513,78 @@ def generate(prompt: str,
         if last_err:
             raise last_err
 
+    # 保存原始响应到本地的辅助函数
+    def _save_raw_response(data: dict, turn: int) -> None:
+        if not RAW_RESPONSE_SAVE_DIR:
+            return
+        try:
+            os.makedirs(RAW_RESPONSE_SAVE_DIR, exist_ok=True)
+            filename = f"llm_raw_{task_id}_turn{turn}.json"
+            filepath = os.path.join(RAW_RESPONSE_SAVE_DIR, filename)
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            _logger.debug(f"💾 原始响应已保存: {filepath}")
+        except Exception as save_err:
+            _logger.warning(f"⚠️ 原始响应保存失败: {save_err}")
+
     try:
-        data = _post_with_retry()
+        accumulated_content: str = ""
+        turn = 0
+        data: dict = {}
+
+        while True:
+            turn += 1
+            data = _post_with_retry()
+
+            # 保存本次原始响应
+            _save_raw_response(data, turn)
+
+            choice = data["choices"][0]
+            chunk: str = choice["message"]["content"]
+            finish_reason: str = choice.get("finish_reason")
+
+            accumulated_content += chunk
+
+            if finish_reason in ("length", None):
+                if not chunk.strip():
+                    _logger.warning("⚠️ content 为空，跳过续写")
+                    break
+
+                _logger.info(f"第{turn}轮因长度中断，启动续写 (已累计 {len(accumulated_content)} 字符)")
+
+                payload["messages"] = raw_payload["messages"] + [
+                    {
+                        "role": "assistant",
+                        "content": accumulated_content,
+                        "partial": True
+                    }
+                ]
+
+                # 关闭思考模式
+                if turn >= 1:
+                    payload["enable_thinking"] = False
+
+                continue
+
+            # finish_reason == "stop"（或其他终止原因）→ 退出循环
+            break
+
         gen_timer.stop()
         
         # 记录到全局计时器
         if model_timer:
-            model_timer.record(f"文本生成({model_name})", gen_timer.duration, parent="模型调用",
-                              metadata={"prompt_len": prompt_len, "max_tokens": max_tokens})
-        
-        content = data["choices"][0]["message"]["content"]
-        content_len = len(content) if content else 0
-        _logger.info(f"✅ 文本生成完成 [模型: {model_name}, 耗时: {gen_timer.duration_str}, 输入: {prompt_len}字符, 输出: {content_len}字符]")
-        return content
+            model_timer.record(
+                f"文本生成({model_name})", gen_timer.duration, parent="模型调用",
+                metadata={"prompt_len": prompt_len, "max_tokens": max_tokens, "turns": turn}
+            )
+
+        content_len = len(accumulated_content)
+        _logger.info(
+            f"✅ 文本生成完成 [模型: {model_name}, 耗时: {gen_timer.duration_str}, "
+            f"轮次: {turn}, 输入: {prompt_len}字符, 输出: {content_len}字符]"
+        )
+        return accumulated_content
+
     except Exception as e:
         import traceback
         traceback.print_exc()

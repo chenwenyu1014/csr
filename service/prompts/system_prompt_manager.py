@@ -61,35 +61,7 @@ class SystemPromptManager:
         if template_data:
             return template_data
         return None
-    
-    # def get_system_prompt_info(self, prompt_id: str = "default") -> Dict[str, Any]:
-    #     """获取系统提示词详细信息"""
-    #     prompt_data = self.system_config.get("system_prompts", {}).get(prompt_id, {})
-    #     if isinstance(prompt_data, dict):
-    #         return {
-    #             "id": prompt_id,
-    #             "content": prompt_data.get("content", ""),
-    #             "usage": prompt_data.get("usage", ""),
-    #             "location": prompt_data.get("location", ""),
-    #             "used_by": prompt_data.get("used_by", [])
-    #         }
-    #     else:
-    #         # 兼容旧格式
-    #         return {
-    #             "id": prompt_id,
-    #             "content": prompt_data,
-    #             "usage": "旧格式提示词",
-    #             "location": "未知",
-    #             "used_by": []
-    #         }
-    #
-    # def get_user_prompt_template(self, template_id: str) -> Optional[Dict[str, Any]]:
-    #     """获取用户提示词模板"""
-    #     template_data = self.system_config.get("user_prompt_templates", {}).get(template_id, {})
-    #     if template_data:
-    #         return template_data
-    #     return None
-    
+
     def build_prompt(self, template_id: str, variables: Dict[str, Any]) -> str:
         """构建完整的提示词"""
         # 开始计时
@@ -163,10 +135,8 @@ class SystemPromptManager:
             remote_timer = Timer(f"远程获取提示词({template_id})", parent="提示词")
             remote_timer.start()
             try:
-                service_url = os.getenv(
-                    "PROMPT_SERVICE_URL",
-                    "http://192.168.3.32:8088/ky/sys/projectPromptDetailTable/findByCombinationAndUsedBy",
-                )
+                base_url = os.getenv("CALLBACK_BASE_URL")
+                service_url = base_url +"/ky/sys/projectPromptDetailTable/findByCombinationAndUsedBy"
                 # 先尝试 POST（表单），失败或空则回退 GET
                 try:
                     logger.info(
@@ -372,155 +342,6 @@ class SystemPromptManager:
             generation_timer.record(f"提示词构建(本地分段)-{template_id}", build_timer.duration, parent="提示词")
         logger.info(f"✅ 提示词构建完成(本地分段) [模板: {template_id}, 耗时: {build_timer.duration_str}, 长度: {len(result)}字符]")
         return result
-    
-    # def build_file_list(self, template_id: str, index_rows: List[Dict[str, Any]]) -> str:
-    #     """构建文件列表"""
-    #     template = self.get_prompt_template(template_id)
-    #     if not template:
-    #         return ""
-    #
-    #     template_parts = template.get("template", {})
-    #     file_list_item_template = template_parts.get("file_list_item", "{{index}}. {{filename}} - {{file_title}}")
-    #
-    #     def _render_double_brace_item(text: str, vars_dict: Dict[str, Any]) -> str:
-    #         try:
-    #             import re as _re
-    #             pattern = _re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
-    #             return pattern.sub(lambda m: str((vars_dict or {}).get(m.group(1), "")), text or "")
-    #         except Exception:
-    #             return text or ""
-    #
-    #     file_list_items = []
-    #     for i, row in enumerate(index_rows, 1):
-    #         filename = row.get("filename", row.get("file", row.get("name", "")))
-    #         file_title = row.get("title", "")
-    #         output_type = row.get("output_type", "")
-    #
-    #         # 如果模板未指定，默认显示为：序号. 文件名 (类型) - 标题
-    #         if not template_parts.get("file_list_item"):
-    #             display = f"{i}. {filename}"
-    #             if output_type:
-    #                 display += f" ({output_type})"
-    #             if file_title:
-    #                 display += f" - {file_title}"
-    #             file_list_items.append(display)
-    #             continue
-    #
-    #         file_list_item = _render_double_brace_item(file_list_item_template, {
-    #             "index": i,
-    #             "filename": filename,
-    #             "file_title": file_title,
-    #             "output_type": output_type
-    #         })
-    #         file_list_items.append(file_list_item)
-    #
-    #     return "\n".join(file_list_items)
-    #
-    # def get_available_system_prompts(self) -> List[Dict[str, str]]:
-    #     """获取所有可用的系统提示词"""
-    #     system_prompts = []
-    #     for prompt_id, prompt_data in self.system_config.get("system_prompts", {}).items():
-    #         if isinstance(prompt_data, dict):
-    #             system_prompts.append({
-    #                 "id": prompt_id,
-    #                 "content": prompt_data.get("content", ""),
-    #                 "usage": prompt_data.get("usage", ""),
-    #                 "location": prompt_data.get("location", ""),
-    #                 "used_by": prompt_data.get("used_by", []),
-    #                 "length": len(prompt_data.get("content", ""))
-    #             })
-    #         else:
-    #             # 兼容旧格式
-    #             system_prompts.append({
-    #                 "id": prompt_id,
-    #                 "content": prompt_data,
-    #                 "usage": "",
-    #                 "location": "",
-    #                 "used_by": [],
-    #                 "length": len(prompt_data)
-    #             })
-    #     return system_prompts
-    #
-    # def get_available_user_templates(self) -> List[Dict[str, str]]:
-    #     """获取所有可用的用户提示词模板"""
-    #     user_templates = []
-    #     for template_id, template_data in self.system_config.get("user_prompt_templates", {}).items():
-    #         if isinstance(template_data, dict):
-    #             user_templates.append({
-    #                 "id": template_id,
-    #                 "content": template_data.get("content", ""),
-    #                 "usage": template_data.get("usage", ""),
-    #                 "variables": template_data.get("variables", []),
-    #                 "length": len(template_data.get("content", ""))
-    #             })
-    #     return user_templates
-    #
-    # def get_template_variables(self, template_id: str) -> List[str]:
-    #     """获取模板的变量列表"""
-    #     template = self.get_user_prompt_template(template_id)
-    #     if template:
-    #         return template.get("variables", [])
-    #     return []
-    #
-    # def add_system_prompt(self, prompt_id: str, content: str, usage: str = "", location: str = "", used_by: List[str] = None) -> bool:
-    #     """添加系统提示词"""
-    #     try:
-    #         if "system_prompts" not in self.system_config:
-    #             self.system_config["system_prompts"] = {}
-    #
-    #         self.system_config["system_prompts"][prompt_id] = {
-    #             "content": content,
-    #             "usage": usage,
-    #             "location": location,
-    #             "used_by": used_by or []
-    #         }
-    #
-    #         # 保存到文件
-    #         with open(self.system_config_file, 'w', encoding='utf-8') as f:
-    #             json.dump(self.system_config, f, ensure_ascii=False, indent=2)
-    #
-    #         return True
-    #     except Exception as e:
-    #         print(f"添加系统提示词失败: {e}")
-    #         return False
-    #
-    # def add_user_template(self, template_id: str, content: str, usage: str = "", variables: List[str] = None) -> bool:
-    #     """添加用户提示词模板"""
-    #     try:
-    #         if "user_prompt_templates" not in self.system_config:
-    #             self.system_config["user_prompt_templates"] = {}
-    #
-    #         self.system_config["user_prompt_templates"][template_id] = {
-    #             "content": content,
-    #             "usage": usage,
-    #             "variables": variables or []
-    #         }
-    #
-    #         # 保存到文件
-    #         with open(self.system_config_file, 'w', encoding='utf-8') as f:
-    #             json.dump(self.system_config, f, ensure_ascii=False, indent=2)
-    #
-    #         return True
-    #     except Exception as e:
-    #         print(f"添加用户提示词模板失败: {e}")
-    #         return False
-    #
-    # def get_config_summary(self) -> Dict[str, Any]:
-    #     """获取配置摘要"""
-    #     return {
-    #         "system_prompts_count": len(self.system_config.get("system_prompts", {})),
-    #         "user_templates_count": len(self.system_config.get("user_prompt_templates", {})),
-    #         "config_file": str(self.system_config_file),
-    #         "last_modified": self.system_config_file.stat().st_mtime if self.system_config_file.exists() else 0
-    #     }
-    #
-    # def print_summary(self):
-    #     """打印配置摘要"""
-    #     summary = self.get_config_summary()
-    #     print("📋 系统提示词配置摘要:")
-    #     print(f"  系统提示词: {summary['system_prompts_count']} 个")
-    #     print(f"  用户提示词模板: {summary['user_templates_count']} 个")
-    #     print(f"  配置文件: {summary['config_file']}")
 
 # 创建全局实例
 system_prompt_manager = SystemPromptManager()

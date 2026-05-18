@@ -9,6 +9,7 @@ GET  /api/v1/documents/compose/task/{task_id} - 查询任务状态
 # ========== 标准库导入 ==========
 import json
 import logging
+import os
 from typing import Optional
 
 # ========== 第三方库导入 ==========
@@ -76,7 +77,7 @@ async def compose_document(
     project_desc: str | None = Form(None, description="项目背景"),
     project_id: str | None = Form(None, description="项目ID"),
     callback_url: str | None = Form(
-        "http://192.168.3.32:8088/ky/sys/projectCreateManage/getReportAIResult", 
+        os.getenv("CALLBACK_BASE_URL")+"/ky/sys/projectCreateManage/getReportAIResult",
         description="完成时回调URL"
     ),
     skip_validation: bool = Form(True, description="是否跳过提取校验（默认True跳过以加快处理速度，设为False可提高提取质量但更慢）"),
@@ -141,9 +142,11 @@ async def compose_document(
         # 解析配置JSON
         cfg_obj = await _parse_config(request, config_json, config_file)
         
-        # 提取 project_id
+        # 提取 project_id 和 project_name
         final_project_id = _extract_project_id(project_id, cfg_obj)
-        logger.info(f"project_id: {final_project_id}")
+        project_name = _extract_project_name(cfg_obj)
+        final_project_name = (project_name or "unknown") + "_" + (final_project_id or "no_id")
+        logger.info(f"project_id: {final_project_id}, project_name: {final_project_name}")
         logger.info(f"callback_url: {callback_url}")
         
         # 创建任务
@@ -157,6 +160,7 @@ async def compose_document(
                 "base_data_dir": base_data_dir,
                 "output_dir": output_dir,
                 "project_id": final_project_id,
+                "project_name": final_project_name,
                 "combinationId": combinationId,
                 "project_desc": project_desc,
                 "template_file": template_file,
@@ -185,6 +189,7 @@ async def compose_document(
             project_desc=project_desc,
             template_file=template_file,
             project_id=final_project_id,
+            project_name=final_project_name,
             auth_token=auth_token,
             callback_url=callback_url,
             skip_validation=skip_validation
@@ -273,11 +278,11 @@ async def _parse_config(
 def _extract_project_id(project_id: Optional[str], cfg_obj: dict) -> Optional[str]:
     """
     提取 project_id
-    
+
     优先级：Form参数 > paragraphs[0].project_id > 顶层project_id
     """
     final_project_id = project_id
-    
+
     if not final_project_id:
         # 尝试从 paragraphs[0].project_id 提取
         paragraphs = cfg_obj.get("paragraphs", [])
@@ -285,11 +290,24 @@ def _extract_project_id(project_id: Optional[str], cfg_obj: dict) -> Optional[st
             final_project_id = paragraphs[0].get("project_id")
             if final_project_id:
                 logger.info(f"从 paragraphs[0].project_id 提取到 project_id: {final_project_id}")
-    
+
     if not final_project_id:
         # 尝试从顶层提取
         final_project_id = cfg_obj.get("project_id")
         if final_project_id:
             logger.info(f"从顶层 project_id 提取到 project_id: {final_project_id}")
-    
+
     return final_project_id
+
+
+def _extract_project_name(cfg_obj: dict) -> Optional[str]:
+    """
+    提取 project_name（用于 RAGFlow 知识库查找）
+
+    优先级：顶层 project_name
+    """
+    final_project_name = cfg_obj.get("project_name")
+    if final_project_name:
+        logger.info(f"从顶层 project_name 提取到 project_name: {final_project_name}")
+
+    return final_project_name

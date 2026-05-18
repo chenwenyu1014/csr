@@ -47,57 +47,6 @@ class DataSourceValidator:
         # 使用统一的模型管理器获取LLM实例
         self.llm = get_llm_service("validation", model_name)
 
-    # def validate(self, spec: Dict[str, Any], task_name: Optional[str] = None) -> ValidationResult:
-    #     """
-    #     执行数据源校验。
-    #
-    #     Args:
-    #         spec: 用户JSON配置（包含各分类的Rules与文件名列表）
-    #         task_name: 任务名称（用于提示词标题）
-    #
-    #     Returns:
-    #         ValidationResult: 校验结果
-    #     """
-    #     # 1) 构建提示词（仅 rules 与 files）
-    #     prompt_text = self.build_prompt_from_spec_raw(spec, task_name=task_name, prompt_id="data_source_validation")
-    #
-    #     # 2) 保存提示词到 output/prompts 以便调试复盘
-    #     prompt_path = self._save_prompt(prompt_text, prefix="data_source_validation", task_name=task_name)
-    #
-    #     # 3) 模型校验
-    #     model_output_raw = None
-    #     model_output_path: Optional[Path] = None
-    #     parsed: Optional[Dict[str, Any]] = None
-    #     try:
-    #         model_output_raw = self.llm.generate_single(prompt_text)
-    #         # 保存模型原始输出，便于排查
-    #         model_output_path = self._save_model_output(model_output_raw, prefix="data_source_validation_output", task_name=task_name)
-    #         parsed = self._parse_json_response(model_output_raw)
-    #         return ValidationResult(
-    #             success=(parsed is not None),
-    #             prompt_path=str(prompt_path) if prompt_path else None,
-    #             model_output_raw=model_output_raw,
-    #             model_output_path=str(model_output_path) if model_output_path else None,
-    #             model_result=parsed,
-    #             pre_checks={"skipped": True},
-    #         )
-    #     except Exception as e:
-    #         # 失败兜底
-    #         fallback = {
-    #             "overall_pass": False,
-    #             "summary": f"模型校验失败: {e}",
-    #             "categories": [],
-    #             "files": [],
-    #             "suggestions": ["请检查API配置或稍后重试"]
-    #         }
-    #         return ValidationResult(
-    #             success=False,
-    #             prompt_path=str(prompt_path) if prompt_path else None,
-    #             model_output_raw=model_output_raw,
-    #             model_output_path=str(model_output_path) if model_output_path else None,
-    #             model_result=fallback,
-    #             pre_checks=pre_checks,
-    #         )
 
     def match(self, spec: Dict[str, Any], task_name: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -189,40 +138,6 @@ class DataSourceValidator:
                 "error": str(e)
             }
 
-    # # -------------------- 内部方法 --------------------
-    #
-    # def _parse_categories(self, spec: Dict[str, Any]) -> List[Dict[str, Any]]:
-    #     """已弃用：返回空列表。"""
-    #     return []
-    #
-    # def _run_pre_checks(self, categories: List[Dict[str, Any]]) -> Dict[str, Any]:
-    #     """已弃用：返回空检查结果。"""
-    #     return {"categories": [], "global_issues": []}
-    #
-    # def _build_category_list_text(self, categories: List[Dict[str, Any]]) -> str:
-    #     """已弃用：返回空字符串。"""
-    #     return ""
-    #
-    # def _canonicalize_to_categories(self, spec: Dict[str, Any]) -> Dict[str, Any]:
-    #     """已弃用：基于当前规则/文件返回单分类包装。"""
-    #     rules, files_list = self._extract_rules_files(spec)
-    #     return {"categories": [{"rules": rules, "files": files_list}]}
-    #
-    ## ============== 极简输出：仅返回模型文本 ==============
-    # def build_prompt_from_spec(self, spec: Dict[str, Any], task_name: Optional[str] = None,
-    #                            prompt_id: str = "data_source_validation") -> str:
-    #     rules, files_list = self._extract_rules_files(spec)
-    #     variables = {
-    #         "rules": rules,
-    #         "files": json.dumps(files_list, ensure_ascii=False, indent=2),
-    #     }
-    #     return system_prompt_manager.build_prompt(prompt_id, variables)
-    #
-    # def validate_to_text(self, spec: Dict[str, Any], task_name: Optional[str] = None,
-    #                      prompt_id: str = "data_source_validation") -> str:
-    #     """执行校验并仅返回模型输出文本，不进行本地解析或预检查。"""
-    #     prompt = self.build_prompt_from_spec(spec, task_name=task_name, prompt_id=prompt_id)
-    #     return self.llm.generate_single(prompt)
 
     def build_prompt_from_spec_raw(self, spec: Dict[str, Any], task_name: Optional[str] = None,
                                    prompt_id: str = "data_source_validation") -> str:
@@ -272,67 +187,6 @@ class DataSourceValidator:
             files_list = []
         return str(rules), files_list
 
-    # def validate_pure(self, spec: Dict[str, Any], task_name: Optional[str] = None,
-    #                   prompt_id: str = "data_source_validation") -> ValidationResult:
-    #     logger.info(f"开始纯LLM校验 - task_name={task_name}, prompt_id={prompt_id}")
-    #
-    #     prompt_text = self.build_prompt_from_spec_raw(spec, task_name=task_name, prompt_id=prompt_id)
-    #     logger.info(f"提示词构建完成，长度={len(prompt_text)}")
-    #
-    #     prompt_path = self._save_prompt(prompt_text, prefix="data_source_validation", task_name=task_name)
-    #     logger.info(f"提示词已保存: {prompt_path}")
-    #
-    #     model_output_raw = None
-    #     model_output_path: Optional[Path] = None
-    #     parsed: Optional[Dict[str, Any]] = None
-    #     try:
-    #         logger.info("调用模型生成...")
-    #         model_output_raw = self.llm.generate_single(prompt_text)
-    #         logger.info(f"模型返回完成，输出长度={len(model_output_raw) if model_output_raw else 0}")
-    #         # 保存模型原始输出
-    #         model_output_path = self._save_model_output(model_output_raw, prefix="data_source_validation_output", task_name=task_name)
-    #         if model_output_path:
-    #             logger.info(f"模型原始输出已保存: {model_output_path}")
-    #
-    #         parsed = self._parse_json_response(model_output_raw)
-    #
-    #         # 如果解析失败，记录详细错误信息
-    #         if parsed is None:
-    #             logger.error(
-    #                 f"❌ JSON解析失败 - 模型输出前500字符: {model_output_raw[:500] if model_output_raw else 'None'}"
-    #             )
-    #             logger.error(f"提示词路径: {prompt_path}")
-    #             if model_output_path:
-    #                 logger.error(f"模型输出路径: {model_output_path}")
-    #         else:
-    #             logger.info(f"✓ JSON解析成功，包含 {len(parsed)} 个顶层键")
-    #
-    #         return ValidationResult(
-    #             success=(parsed is not None),
-    #             prompt_path=str(prompt_path) if prompt_path else None,
-    #             model_output_raw=model_output_raw,
-    #             model_output_path=str(model_output_path) if model_output_path else None,
-    #             model_result=parsed,
-    #             pre_checks={"skipped": True},
-    #         )
-    #     except Exception as e:
-    #         logger.error(f"❌ 模型调用异常: {type(e).__name__}: {e}", exc_info=True)
-    #         logger.error(f"模型输出（如有）: {model_output_raw[:500] if model_output_raw else 'None'}")
-    #         fallback = {
-    #             "overall_pass": False,
-    #             "summary": f"模型校验失败: {e}",
-    #             "categories": [],
-    #             "files": [],
-    #             "suggestions": ["请检查API配置或稍后重试"]
-    #         }
-    #         return ValidationResult(
-    #             success=False,
-    #             prompt_path=str(prompt_path) if prompt_path else None,
-    #             model_output_raw=model_output_raw,
-    #             model_output_path=str(model_output_path) if model_output_path else None,
-    #             model_result=fallback,
-    #             pre_checks={"skipped": True},
-    #         )
 
     async def validate_pure_async(self, spec: Dict[str, Any], task_name: Optional[str] = None,
                                   prompt_id: str = "data_source_validation") -> ValidationResult:

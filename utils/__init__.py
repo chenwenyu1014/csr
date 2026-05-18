@@ -21,6 +21,7 @@ from .request_context import request_id_ctx, get_request_id
 
 # ========== 日志 ==========
 from .json_logging import setup_json_logging
+from .logging_config import setup_logging, get_service_logger
 
 # ========== 任务日志 ==========
 from .task_logger import (
@@ -94,6 +95,8 @@ __all__ = [
     
     # 日志
     "setup_json_logging",
+    "setup_logging",
+    "get_service_logger",
     
     # 任务日志
     "TaskLogger",

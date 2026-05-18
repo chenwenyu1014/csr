@@ -10,6 +10,7 @@ Word Content Control 内容插入服务（完整版）
 4. Excel使用COM粘贴保留格式
 """
 
+import json
 import logging
 import re
 import time
@@ -225,6 +226,207 @@ class WordControlContentInserter:
         except:
             pass
 
+
+    @staticmethod
+    def _is_table_json(text: str) -> bool:
+        """
+        检测是否为表格 JSON（统一格式）
+
+        预期格式：
+        {
+            "table": {
+                "total_rows": 行数,
+                "total_cols": 列数,
+                "cells": [{"r": 行号, "c": 列号, "cs": 跨列数, "rs": 跨行数, "text": "内容"}]
+            }
+        }
+
+        Args:
+            text: 待检测的字符串
+
+        Returns:
+            是否为表格 JSON 格式
+        """
+        if not isinstance(text, str) or not text.strip():
+            return False
+
+        try:
+            data = json.loads(text.strip())
+            if not isinstance(data, dict):
+                return False
+            if "table" not in data:
+                return False
+            t = data["table"]
+            if not isinstance(t, dict):
+                return False
+            if "total_rows" in t and "total_cols" in t and "cells" in t:
+                return True
+            return False
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _parse_table_json(text: str) -> dict:
+        """
+        解析表格 JSON，返回 {"table": {...}} 结构
+
+        Args:
+            text: 表格 JSON 字符串
+
+        Returns:
+            {"table": {"total_rows": N, "total_cols": N, "cells": [...]}}
+        """
+        data = json.loads(text.strip())
+        return {"table": data["table"]}
+
+    def _insert_table_to_control(
+        self,
+        doc,
+        control,
+        table_data: dict,
+        font_info: Tuple[str, str, int]
+    ) -> bool:
+        """
+        插入表格（统一格式：cells 坐标式，支持跨列/跨行合并）
+
+        Args:
+            doc: Word 文档对象
+            control: Content Control 对象
+            table_data: {"table": {"total_rows": N, "total_cols": N, "cells": [...]}}
+            font_info: (font_ascii, font_fareast, font_size) 元组
+
+        Returns:
+            是否插入成功
+        """
+        from collections import defaultdict
+
+        table_info = table_data["table"]
+        total_rows = table_info["total_rows"]
+        total_cols = table_info["total_cols"]
+        cells = table_info["cells"]
+        font_ascii, font_fareast, font_size = font_info
+
+        logger.info(f"  创建表格: {total_rows}行 x {total_cols}列, 共{len(cells)}个单元格")
+
+        try:
+            # 1. 清空控件内容
+            try:
+                control.Range.Delete()
+            except Exception:
+                pass
+
+            # 2. 创建表格
+            table = com_retry(
+                lambda: doc.Tables.Add(
+                    Range=control.Range,
+                    NumRows=total_rows,
+                    NumColumns=total_cols
+                ),
+                max_retries=3,
+                delay=0.3
+            )
+
+            if table is None:
+                logger.error("  ❌ Tables.Add 返回 None")
+                return False
+
+            # 3. 填充所有单元格内容（不合并）
+            for cell_def in cells:
+                r = cell_def["r"]
+                c = cell_def["c"]
+                text = cell_def.get("text", "")
+                try:
+                    com_cell = table.Cell(r + 1, c + 1)
+                    com_cell.Range.Text = text if text else ""
+                    # 设置字体
+                    com_cell.Range.Font.NameAscii = font_ascii
+                    com_cell.Range.Font.NameFarEast = font_fareast
+                    com_cell.Range.Font.Size = font_size
+                    com_cell.Range.Font.Bold = False
+                except Exception as e:
+                    logger.warning(f"  填充单元格 ({r},{c}) 失败: {e}")
+
+            # 4. 合并单元格
+            #    策略：先处理纯跨列和纯跨行，最后处理 both（拆成每行跨列+跨行两步）
+            #    这样避免 both 的合并影响纯跨列/跨行的坐标
+            only_cs = [d for d in cells if d.get("cs", 1) > 1 and d.get("rs", 1) <= 1]
+            only_rs = [d for d in cells if d.get("cs", 1) <= 1 and d.get("rs", 1) > 1]
+            both = [d for d in cells if d.get("cs", 1) > 1 and d.get("rs", 1) > 1]
+
+            # 4a. 纯跨列合并（从右往左）
+            for cell_def in sorted(only_cs, key=lambda x: (x["r"], -x["c"])):
+                r, c = cell_def["r"], cell_def["c"]
+                cs = cell_def["cs"]
+                try:
+                    table.Cell(r + 1, c + 1).Merge(table.Cell(r + 1, c + cs))
+                except Exception as e:
+                    logger.warning(f"  跨列合并失败 ({r},{c},cs={cs}): {e}")
+
+            # 4b. 纯跨行合并（从下往上）
+            for cell_def in sorted(only_rs, key=lambda x: (-x["r"], x["c"])):
+                r, c = cell_def["r"], cell_def["c"]
+                rs = cell_def["rs"]
+                try:
+                    table.Cell(r + 1, c + 1).Merge(table.Cell(r + rs, c + 1))
+                except Exception as e:
+                    logger.warning(f"  跨行合并失败 ({r},{c},rs={rs}): {e}")
+
+            # 4c. 最后处理同时跨行+跨列：拆成两步
+            for cell_def in sorted(both, key=lambda x: (-x["r"], -x["c"])):
+                r, c = cell_def["r"], cell_def["c"]
+                cs = cell_def["cs"]
+                rs = cell_def["rs"]
+
+                # Step 1: 每行做跨列合并（从下往上处理）
+                for row_idx in range(r + rs - 1, r - 1, -1):
+                    try:
+                        table.Cell(row_idx + 1, c + 1).Merge(table.Cell(row_idx + 1, c + cs))
+                    except Exception as e:
+                        logger.warning(f"  行{row_idx} 跨列合并失败: {e}")
+
+                # Step 2: 跨行合并
+                try:
+                    table.Cell(r + 1, c + 1).Merge(table.Cell(r + rs, c + 1))
+                except Exception as e:
+                    logger.warning(f"  跨行合并失败 ({r},{c},rs={rs}): {e}")
+
+            # 5. 自动调整列宽（根据内容）
+            try:
+                table.AutoFitBehavior(1)  # wdAutoFitContent = 1
+            except Exception as e:
+                logger.warning(f"  自动调整列宽失败: {e}")
+
+            for col_idx in range(1, total_cols + 1):
+                for row_idx in range(1, total_rows + 1):
+                    try:
+                        com_cell = table.Cell(row_idx, col_idx)
+                        com_cell.Range.ParagraphFormat.SpaceAfter = 0
+                        com_cell.Range.ParagraphFormat.SpaceBefore = 0
+                        com_cell.Range.ParagraphFormat.LineSpacingRule = 0
+                    except Exception:
+                        # 被合并掉的单元格访问会报错，直接跳过
+                        pass
+
+            # 6. 设置表格边框
+            try:
+                borders = table.Borders
+                borders.Enable = 1  # 开启所有边框
+                borders.InsideLineStyle = 1  # wdLineStyleSingle
+                borders.OutsideLineStyle = 1  # wdLineStyleSingle
+                borders.InsideLineWidth = 4   # 1 磅
+                borders.OutsideLineWidth = 4  # 1 磅
+            except Exception as e:
+                logger.debug(f"  设置表格边框失败: {e}")
+
+            logger.info(f"  表格插入成功")
+            return True
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            logger.error(f"  表格插入失败: {e}")
+            return False
+
     @staticmethod
     def _clean_text_for_word(text: str) -> str:
         """
@@ -281,8 +483,8 @@ class WordControlContentInserter:
 
         # 4. 清理 Markdown 行尾两个空格（LLM 常见输出，会产生不可见尾部空格）
         #    "内容  \n" -> "内容\n"
-        text = re.sub(r'  +\n', '\n', text)
-        text = re.sub(r' +\n', '\n', text)
+        text = re.sub(r'  +\r', '\r', text)
+        text = re.sub(r' +\r', '\r', text)
 
         # 5. 逐字符过滤残余控制字符
         #    保留：普通可打印字符、\n（换行）、\t（制表符）
@@ -290,7 +492,7 @@ class WordControlContentInserter:
         cleaned = []
         for ch in text:
             code = ord(ch)
-            if ch in ('\n', '\t'):
+            if ch in ('\r', '\t'):
                 cleaned.append(ch)
             elif code < 0x20:
                 # 其他控制字符用空格替代（不直接删除，避免词语粘连）
@@ -303,7 +505,7 @@ class WordControlContentInserter:
         text = ''.join(cleaned)
 
         # 6. 压缩连续空行（超过2个换行压缩为2个）
-        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r'\r{3,}', '\r\r', text)
 
         # 7. 去掉首尾空白
         text = text.strip()
@@ -399,16 +601,29 @@ class WordControlContentInserter:
 
                     logger.info(f"    Excel尺寸: {max_row}行 × {max_col}列")
 
-                    # 列数 > 行数 → 横向
-                    if max_col > max_row:
-                        logger.info(f"    ✅ Excel方向: landscape (列数{max_col} > 行数{max_row})")
-                        return "landscape"
+                    # 🆕 综合判断逻辑
+                    # 小表格（行数<10 且列数<10）默认纵向，除非明显宽表
+                    is_small_table = max_row < 10 and max_col < 10
+                    if is_small_table:
+                        # 小表格：只有列数明显多于行数（2 倍）才横向
+                        if max_col > max_row * 2:
+                            logger.info(f"    ✅ Excel 方向：landscape (小表格，列数>{max_row}×2)")
+                            return "landscape"
+                        else:
+                            logger.info(f"    ✅ Excel 方向：portrait (小表格，适合纵向)")
+                            return "portrait"
                     else:
-                        logger.info(f"    ✅ Excel方向: portrait (列数{max_col} ≤ 行数{max_row})")
-                        return "portrait"
+                        # 大表格：使用比例判断
+                        if max_col > max_row * 1.5 and max_col >= 8:
+                            logger.info(f"    ✅ Excel 方向：landscape (大表格，明显宽表)")
+                            return "landscape"
+                        else:
+                            logger.info(f"    ✅ Excel 方向：portrait (大表格，适合纵向)")
+                            return "portrait"
+
                 except Exception as e:
-                    logger.warning(f"    ⚠️ Excel方向检测失败: {e}，默认横向")
-                    return "landscape"  # 默认横向
+                    logger.warning(f"    ⚠️ Excel方向检测失败: {e}，默认纵向")
+                    return "portrait"  # 默认纵向
 
             # 其他文件：默认纵向
             else:
@@ -480,7 +695,8 @@ class WordControlContentInserter:
         control,
         generated_text: str,
         portrait_placeholders: List[str],
-        landscape_placeholders: List[str]
+        landscape_placeholders: List[str],
+        font_tuple: Optional[Tuple[str, str, int]] = None
     ):
         """
         在控件内插入内容
@@ -497,14 +713,31 @@ class WordControlContentInserter:
             portrait_placeholders: 纵向占位符列表
             landscape_placeholders: 横向占位符列表
         """
-        # 获取外部格式
-        try:
-            outside_range = control.Range.Previous()
-            font_name = outside_range.Font.Name
-            font_size = outside_range.Font.Size
-        except:
-            font_name = "宋体"
-            font_size = 12
+        # 使用传入的字体或从控件获取
+        if font_tuple:
+            font_ascii, font_fareast, font_size = font_tuple
+        else:
+            # 自动获取控件本身的格式（向后兼容）
+            control_font_ascii = None
+            control_font_fareast = None
+            control_font_size = None
+            try:
+                if control.Range.Font:
+                    control_font_ascii = control.Range.Font.NameAscii
+                    control_font_fareast = control.Range.Font.NameFarEast
+                    control_font_size = control.Range.Font.Size
+            except Exception:
+                pass
+
+            font_ascii = control_font_ascii if control_font_ascii else "Times New Roman"
+            # 因为 Times New Roman 等西文字体不能作为 NameFarEast 的值，使用默认中文字体（宋体）
+            if control_font_fareast and control_font_fareast != "Times New Roman":
+                font_fareast = control_font_fareast
+            else:
+                font_fareast = "宋体"
+                logger.warning(f"  ⚠️ 控件中文字体不能为Times New Roman，使用默认中文字体: {font_fareast}")
+            font_size = control_font_size if control_font_size else 12
+        logger.info(f"   控件字体：西文={font_ascii}, 中文={font_fareast}, 字号={font_size}")
 
         # 重新排列内容：从文本中移除横向占位符（它们会被集中到横向节）
         portrait_content = generated_text
@@ -516,23 +749,38 @@ class WordControlContentInserter:
 
         # 清理可能导致 COM 错误的字符
         portrait_content = self._clean_text_for_word(portrait_content)
-
-        # 清空控件并插入纵向内容（按照原始设计）
-        # control.Range.Text = ""
         control.Range.Delete()
         control.Range.Style = "正文"
-        control.Range.InsertAfter(portrait_content)
 
-        # 应用格式
-        control.Range.Font.Name = font_name
+        # 尝试插入文本，有备用方案处理 COM 错误
+        try:
+            control.Range.InsertAfter(portrait_content)
+            logger.info(f"  ✅ 插入纵向内容 ({len(portrait_content)} 字符)，手动应用控件样式")
+        except pywintypes.com_error as insert_err:
+            # InsertAfter 失败，尝试备用方案
+            logger.warning(f"  ⚠️ InsertAfter 失败，尝试分段插入: {insert_err}")
+            try:
+                # 分段处理：将内容按段落分开，逐段插入
+                paragraphs = portrait_content.split('\r')
+                for para_idx, para in enumerate(paragraphs):
+                    if para_idx > 0:
+                        try:
+                            control.Range.InsertAfter('\v')  # 垂直制表符
+                        except:
+                            control.Range.InsertAfter(' ')
+                            logger.warning("  ⚠️ 无法插入段落标记，用空格代替")
+                    if para.strip():
+                        control.Range.InsertAfter(para)
+                logger.info(f"  ✅ 通过分段 InsertAfter 插入成功 ({len(portrait_content)} 字符)")
+            except Exception as fallback_err:
+                logger.error(f"  ❌ 分段插入也失败: {fallback_err}")
+                raise
+
+        # 应用控件本身的字体格式(同时设置西文和中文)
+        control.Range.Font.NameAscii = font_ascii
+        control.Range.Font.NameFarEast = font_fareast
         control.Range.Font.Size = font_size
-
-        logger.info(f"  ✅ 插入纵向内容 ({len(portrait_content)} 字符)")
-
-        # 如果有横向占位符，用一对分节符包裹所有横向占位符
-        if landscape_placeholders:
-            logger.info(f"  处理 {len(landscape_placeholders)} 个横向占位符")
-
+        if landscape_content:
             # 在控件末尾插入第一个分节符（切换到横向）
             rng = control.Range
             rng.Collapse(wdCollapseEnd)
@@ -547,7 +795,8 @@ class WordControlContentInserter:
             # 插入所有横向占位符（集中在一起）
             newrng = doc.Range(rng.Start, rng.Start)
             newrng.InsertAfter(landscape_content)
-            newrng.Font.Name = font_name
+            newrng.Font.NameAscii = font_ascii
+            newrng.Font.NameFarEast = font_fareast
             newrng.Font.Size = font_size
             logger.info(f"  ✅ 插入 {len(landscape_placeholders)} 个横向占位符")
 
@@ -654,114 +903,10 @@ class WordControlContentInserter:
 
         return true_range
 
-    def replace_placeholder_with_file(
-            self,
-            doc,
-            placeholder: str,
-            mapping: ResourceMapping
-    ):
-        """
-        替换占位符为实际文件内容
-
-        注意：不在这里处理分节符！
-        横向占位符已经在 insert_to_control 中被移到横向节里了，
-        这里只需要简单地替换占位符为文件内容。
-
-        Args:
-            doc: Word文档对象
-            placeholder: 占位符
-            mapping: 资源映射
-
-        Raises:
-            Exception: 当发生严重 COM 错误时（如 RPC 服务器不可用）向上抛出
-        """
-        file_path = mapping.path
-        file_ext = Path(file_path).suffix.lower()
-
-        try:
-            # 查找占位符
-            find_range = doc.Range()
-            find_range.Find.ClearFormatting()
-            find_range.Find.Text = placeholder
-
-            if not find_range.Find.Execute():
-                logger.warning(f"  ⚠️ 未找到占位符: {placeholder}")
-                return
-
-            logger.info(f"  替换: {placeholder}")
-            logger.info(f"    <- {Path(file_path).name}")
-
-            # 清除占位符
-            # find_range.Text = ""
-            find_range.Delete()
-
-            # 根据文件类型插入
-            file_abs_path = str(Path(file_path).absolute())
-
-            if file_ext in ['.docx', '.doc', '.rtf']:
-                # Word/RTF文件：InsertFile（保留格式）
-                find_range.InsertFile(file_abs_path)
-                logger.info(f"    ✅ InsertFile插入")
-
-            elif file_ext in ['.xlsx', '.xls']:
-                # Excel文件：COM粘贴（保留格式）
-                self._connect_excel()
-
-                workbook = self.excel.Workbooks.Open(file_abs_path, ReadOnly=True)
-                sheet = workbook.Sheets(1)
-
-                # 复制Excel内容
-                # sheet.UsedRange.Copy()
-                import openpyxl
-                wb = openpyxl.load_workbook(file_path, read_only=True)
-                ws = wb.active
-                max_row = ws.max_row
-                max_col = ws.max_column
-                wb.close()
-                rng = self._get_range_by_scanning(sheet, max_row + 10, max_col + 10)
-                if rng is None:
-                    raise RuntimeError(
-                        f"Sheet 没找到有效内容范围。"
-                        f"可尝试 top_left='A1' 或切换 look_in_formulas。"
-                    )
-
-                rng.Copy()  # 放入剪贴板
-
-                
-                # 粘贴到Word
-                find_range.Paste()
-
-                # 关闭Excel文件
-                workbook.Close(False)
-                logger.info(f"    ✅ Excel COM粘贴插入")
-
-            else:
-                logger.warning(f"    ⚠️ 不支持的文件类型: {file_ext}")
-
-        except Exception as e:
-            error_str = str(e)
-            logger.error(f"  ❌ 替换失败 {placeholder}: {e}")
-
-            # 检查是否是严重的 COM 错误（RPC 服务器不可用等）
-            # 错误码 -2147023174 (0x800706BA) = RPC 服务器不可用
-            # 错误码 -2147417848 (0x80010108) = 对象已断开连接
-            is_fatal_com_error = (
-                '-2147023174' in error_str or  # RPC 服务器不可用
-                '-2147417848' in error_str or  # 对象已断开连接
-                'RPC' in error_str.upper() or
-                '服务器不可用' in error_str or
-                'disconnected' in error_str.lower()
-            )
-
-            if is_fatal_com_error:
-                logger.error(f"  ❌ 检测到严重 COM 错误，向上抛出")
-                raise  # 重新抛出异常，让调用方知道 Word 可能已经不可用
-
     def insert_to_template(
         self,
         template_file: str,
         generation_results: List[Dict[str, Any]],
-        resource_mappings: Dict[str, ResourceMapping],
         output_file: str
     ) -> ContentInsertResult:
         """
@@ -774,12 +919,12 @@ class WordControlContentInserter:
                     "paragraph_id": "study_population",
                     "control_title": "study_population",
                     "generated_content": "文本内容\n{{Table_1}}\n更多文本",
-                    "status": "success"
+                    "status": "success",
+                    "resource_mappings": {
+                        "{{Table_1}}": { "path": "...", "type": "table", ... }
+                    }
                 }
             ]
-            resource_mappings: 资源映射 {
-                "{{Table_1}}": ResourceMapping(...)
-            }
             output_file: 输出文件路径
 
         Returns:
@@ -793,12 +938,6 @@ class WordControlContentInserter:
             # 连接Word
             self._connect_word()
 
-            # import pythoncom
-            # pythoncom.CoInitialize()
-            # import win32com as win32com
-            # word = win32com.client.Dispatch("Word.Application")
-            # word.Visible = False  # 显示Word窗口
-            # word.DisplayAlerts = 0
 
 
             # 验证模板文件存在
@@ -822,12 +961,6 @@ class WordControlContentInserter:
                     delay=0.5
                 )
 
-                # doc = word.Documents.Open(
-                #         str(template_path),
-                #         ConfirmConversions=False,
-                #         ReadOnly=False,
-                #         AddToRecentFiles=False
-                #     )
 
                 # 验证文档对象
                 if doc is None:
@@ -853,9 +986,10 @@ class WordControlContentInserter:
             inserted_controls = []
             inserted_resources = []
             resource_orientations = {}  # 🆕 收集方向信息
+            control_fonts = {}  # 🆕 保存控件字体格式 {placeholder: (font_ascii, font_fareast, font_size)}
 
             # ===== 第一步：插入文本内容（包括占位符作为文本） =====
-            logger.info("\n" + "=" * 70)
+            logger.info("=" * 70)
             logger.info("第一步：插入文本内容和占位符")
             logger.info("=" * 70)
 
@@ -875,43 +1009,171 @@ class WordControlContentInserter:
                     logger.warning(f"  ⚠️ 未找到控件: {control_title}")
                     continue
                 else:
-                    logger.info(f"  ⚠️ 找到控件: {control_title},共{cc_collection.Count}个")
+                    logger.info(f"  找到控件: {control_title},共{cc_collection.Count}个")
 
                 controls = cc_collection
-                logger.info(f"  ✅ 找到控件")
 
-                # 提取占位符
+                #  检测是否为表格 JSON：如果是，直接创建表格，跳过占位符逻辑
+                if self._is_table_json(generated_content):
+                    logger.info(f"  📊 检测到表格 JSON，将创建 Word 表格")
+                    table_data = self._parse_table_json(generated_content)
+
+                    # 获取控件字体格式
+                    ctrl_font_ascii = 'Times New Roman'
+                    ctrl_font_fareast = '宋体'
+                    ctrl_font_size = 12
+                    try:
+                        if cc_collection.Count > 0:
+                            first_control = cc_collection.Item(1)
+                            if first_control.Range.Font:
+                                ctrl_font_ascii = first_control.Range.Font.NameAscii or 'Times New Roman'
+                                fareast = first_control.Range.Font.NameFarEast
+                                if fareast and fareast != 'Times New Roman':
+                                    ctrl_font_fareast = fareast
+                                ctrl_font_size = first_control.Range.Font.Size or 12
+                    except Exception as font_err:
+                        logger.warning(f'  获取控件字体失败：{font_err}，使用默认值')
+
+                    font_info = (ctrl_font_ascii, ctrl_font_fareast, ctrl_font_size)
+
+                    # 插入表格
+                    for i in range(cc_collection.Count):
+                        control = cc_collection.Item(i + 1)
+                        success = self._insert_table_to_control(
+                            doc, control, table_data, font_info
+                        )
+                        if success:
+                            inserted_controls.append(control_title)
+                        else:
+                            logger.warning(f"  ⚠️ 表格插入失败，将降级为文本插入")
+                            # 降级：将 JSON 作为普通文本插入
+                            cleaned_content = self._clean_text_for_word(generated_content)
+                            try:
+                                control.Range.Text = cleaned_content
+                            except Exception:
+                                pass
+                    continue  # 跳过后面的占位符提取和文本插入逻辑
+
+                # 原有逻辑：提取占位符
                 placeholders = re.findall(r'\{\{[^}]+\}\}', generated_content)
                 logger.info(f"  发现 {len(placeholders)} 个占位符")
 
-                # 过滤有效的占位符
-                valid_placeholders = [p for p in placeholders if p in resource_mappings]
+                # 从该段落获取 resource_mappings
+                paragraph_mappings = result.get("resource_mappings", {})
+
+                # 过滤有效的占位符（使用该段落的映射）
+                valid_placeholders = [p for p in placeholders if p in paragraph_mappings]
 
                 if not valid_placeholders:
                     # 没有占位符，直接插入文本
+                    # 🆕 先获取控件字体格式
+                    ctrl_font_ascii = 'Times New Roman'
+                    ctrl_font_fareast = '宋体'
+                    ctrl_font_size = 12
+                    try:
+                        if cc_collection.Count > 0:
+                            first_control = cc_collection.Item(1)
+                            if first_control.Range.Font:
+                                ctrl_font_ascii = first_control.Range.Font.NameAscii or 'Times New Roman'
+                                ctrl_font_fareast = first_control.Range.Font.NameFarEast or '宋体'
+                                ctrl_font_size = first_control.Range.Font.Size or 12
+                    except Exception as font_err:
+                        logger.warning(f'  获取控件字体失败：{font_err}，使用默认值')
+
                     for i in range(cc_collection.Count):
                         control = cc_collection.Item(i + 1)
                         try:
                             # 清理内容中可能导致 COM 错误的字符
                             cleaned_content = self._clean_text_for_word(generated_content)
-                            # control.Range.Text = cleaned_content
-                            control.Range.Text = cleaned_content
-                            logger.info(f"  ✅ 文本插入成功 ({len(cleaned_content)} 字符)")
+
+                            # 设置文本内容
+                            try:
+                                control.Range.Text = cleaned_content
+                                logger.info(f"  ✅ 文本插入成功 ({len(cleaned_content)} 字符)")
+                            except pywintypes.com_error as text_err:
+                                # 如果直接设置 Text 失败，使用分段插入备用方案
+                                logger.warning(f"  ⚠️ 设置 Text 属性失败，尝试分段插入: {text_err}")
+                                try:
+                                    # 先删除内容，再分段插入
+                                    control.Range.Delete()
+
+                                    # 分段处理：将内容按段落分开，逐段插入
+                                    paragraphs = cleaned_content.split('\r')
+                                    for para_idx, para in enumerate(paragraphs):
+                                        if para_idx > 0:
+                                            # 插入段落标记（换行）- 尝试多种方式
+                                            try:
+                                                # 使用 垂直制表符
+                                                control.Range.InsertAfter('\v')
+                                            except:
+                                                # 最后用空格代替
+                                                control.Range.InsertAfter(' ')
+                                                logger.warning("  ⚠️ 无法插入段落标记，用空格代替")
+                                        if para.strip():
+                                            control.Range.InsertAfter(para)
+
+                                    # 🆕 分段插入后应用控件字体格式
+                                    control.Range.Font.NameAscii = ctrl_font_ascii
+                                    control.Range.Font.NameFarEast = ctrl_font_fareast
+                                    control.Range.Font.Size = ctrl_font_size
+
+                                    logger.info(f"  ✅ 通过分段 InsertAfter 插入成功 ({len(cleaned_content)} 字符)")
+
+                                except Exception as insert_err:
+                                    logger.error(f"  ❌ 分段插入也失败: {insert_err}")
+                                    raise
+
                             inserted_controls.append(control_title)
                         except Exception as e:
-                            # import traceback
-                            # traceback.print_exc()
                             logger.error(f"  ❌ 文本插入失败: {e}")
                             logger.error(f"  内容长度: {len(generated_content)} 字符")
                             logger.error(f"  内容前200字符: {generated_content[:200]}")
                             raise
                     continue
 
-                # 检测方向并分类
+                # 保存占位符对应的字体格式
+                ctrl_font_ascii = 'Times New Roman'
+                ctrl_font_fareast = '宋体'
+                ctrl_font_size = 12
+                try:
+                    if controls.Count > 0:
+                        first_control = controls.Item(1)
+                        if first_control.Range.Font:
+                            ctrl_font_ascii = first_control.Range.Font.NameAscii or 'Times New Roman'
+                            # Times New Roman 不是有效的中文字体，需要检查并使用默认值
+                            fareast = first_control.Range.Font.NameFarEast
+                            if fareast and fareast != 'Times New Roman':
+                                ctrl_font_fareast = fareast
+                            # 否则保持默认值 '宋体'
+                            ctrl_font_size = first_control.Range.Font.Size or 12
+                except Exception as font_err:
+                    logger.warning(f'  获取控件字体失败：{font_err}，使用默认值')
+
+                # 保存占位符对应的字体格式（使用段落ID+占位符作为key避免冲突）
+                for p in valid_placeholders:
+                    control_fonts[(control_title, p)] = (ctrl_font_ascii, ctrl_font_fareast, ctrl_font_size)
+
+                # 🆕 将段落映射转换为 ResourceMapping 对象（用于方向检测）
+                paragraph_resource_mappings = {}
+                for placeholder, mapping_info in paragraph_mappings.items():
+                    if isinstance(mapping_info, ResourceMapping):
+                        paragraph_resource_mappings[placeholder] = mapping_info
+                    elif isinstance(mapping_info, dict):
+                        # 从字典转换为 ResourceMapping
+                        paragraph_resource_mappings[placeholder] = ResourceMapping(
+                            placeholder=placeholder,
+                            path=mapping_info.get("path", ""),
+                            type=mapping_info.get("type", ""),
+                            source_file=mapping_info.get("source_file", "")
+                        )
+                    else:
+                        logger.warning(f"  ⚠️ 未知的映射类型: {type(mapping_info)}")
+
+                # 检测方向并分类（使用该段落的映射）
                 logger.info("  检测文件方向...")
                 portrait_list, landscape_list = self.classify_placeholders_by_orientation(
                     valid_placeholders,
-                    resource_mappings
+                    paragraph_resource_mappings
                 )
 
                 # 🆕 收集方向信息（用于返回给Linux）
@@ -929,7 +1191,8 @@ class WordControlContentInserter:
                         control,
                         generated_content,
                         portrait_list,
-                        landscape_list
+                        landscape_list,
+                        font_tuple=(ctrl_font_ascii, ctrl_font_fareast, ctrl_font_size)
                     )
 
                 inserted_controls.append(control_title)
@@ -937,7 +1200,7 @@ class WordControlContentInserter:
             # 保存并关闭文档（第一步完成）
             temp_output = str(Path(output_file).absolute())
             doc.SaveAs(temp_output)
-            logger.info(f"\n✅ 第一步完成，保存文档: {Path(output_file).name}")
+            logger.info(f"✅ 第一步完成，保存文档: {Path(output_file).name}")
 
             # 关闭文档
             try:
@@ -956,20 +1219,22 @@ class WordControlContentInserter:
             logger.info("⏳ 等待 Word 进程完全退出...")
 
             # ===== 第二步：重新打开文档，替换占位符为实际文件 =====
-            # 只替换实际被使用的占位符（在 resource_orientations 中记录的）
-            used_placeholders = list(resource_orientations.keys())
+            # 🆕 采用新策略：按占位符位置遍历，反向查找所在控件
+            # 判定条件：检查是否有任何段落包含 resource_mappings
+            has_resource_mappings = any(
+                result.get("resource_mappings") for result in generation_results
+            )
 
-            if used_placeholders:
+            if has_resource_mappings:
                 logger.info("=" * 70)
-                logger.info(f"第二步：替换 {len(used_placeholders)} 个占位符为实际文件")
+                logger.info("第二步：替换占位符为实际文件（按位置遍历）")
                 logger.info("=" * 70)
 
-                # 🆕 重新连接 Word，带重试机制
+                # 重新连接 Word
                 max_connect_retries = 3
                 for connect_attempt in range(max_connect_retries):
                     try:
                         self._connect_word()
-                        # 重新打开文档
                         doc = self.word.Documents.Open(temp_output)
                         logger.info(f"✅ 重新打开文档: {Path(output_file).name}")
                         break
@@ -978,10 +1243,9 @@ class WordControlContentInserter:
                         if connect_attempt < max_connect_retries - 1:
                             self._cleanup()
                             import time
-                            time.sleep(3)  # 等待更长时间再重试
+                            time.sleep(3)
                         else:
                             logger.error("❌ 无法重新连接 Word，跳过占位符替换")
-                            # 即使第二步失败，第一步的文件已保存
                             return ContentInsertResult(
                                 success=True,
                                 message="文本内容已插入，但占位符替换失败",
@@ -992,61 +1256,155 @@ class WordControlContentInserter:
                                 error=f"第二步失败: {connect_err}"
                             )
 
-                # 只替换实际使用的占位符
+                # 🆕 构建控件标题到段落信息的映射
+                control_to_paragraph = {}
+                for result in generation_results:
+                    control_title = result.get("paragraph_id")
+                    paragraph_mappings = result.get("resource_mappings", {})
+                    if paragraph_mappings:
+                        control_to_paragraph[control_title] = {
+                            "paragraph_id": result.get("paragraph_id"),
+                            "mappings": paragraph_mappings
+                        }
+
+                # 🆕 按文档顺序遍历所有占位符
+                logger.info("开始按位置遍历占位符...")
                 replace_errors = []
-                word_reconnect_needed = False
+                search_start = 0
 
-                for placeholder in used_placeholders:
-                    if placeholder not in resource_mappings:
-                        logger.warning(f"  ⚠️ 占位符无映射: {placeholder}")
-                        continue
+                while search_start < doc.Content.End - 4:
+                    # 搜索 "{{" 作为占位符起始标记
+                    find_range = doc.Range(search_start, doc.Content.End)
+                    find_range.Find.ClearFormatting()
+                    find_range.Find.Text = "{{"
 
-                    mapping = resource_mappings[placeholder]
-                    if not Path(mapping.path).exists():
-                        logger.warning(f"  ⚠️ 文件不存在: {mapping.path}")
-                        continue
+                    if not find_range.Find.Execute():
+                        break
 
-                    # 🆕 如果之前检测到 Word 连接断开，尝试重新连接
-                    if word_reconnect_needed:
-                        logger.info("  🔄 尝试重新连接 Word...")
-                        try:
-                            self._cleanup()
-                            import time
-                            time.sleep(2)
-                            self._connect_word()
-                            doc = self.word.Documents.Open(temp_output)
-                            word_reconnect_needed = False
-                            logger.info("  ✅ Word 重新连接成功")
-                        except Exception as reconnect_err:
-                            logger.error(f"  ❌ 重新连接失败: {reconnect_err}，跳过剩余占位符")
-                            break
+                    placeholder_start = find_range.Start
 
-                    # 直接替换（分节符已在第一步处理）
+                    # 提取完整占位符 {{...}}
+                    placeholder_end = min(placeholder_start + 50, doc.Content.End)
                     try:
-                        self.replace_placeholder_with_file(doc, placeholder, mapping)
-                        inserted_resources.append(placeholder)
-                    except Exception as replace_err:
-                        error_msg = f"替换 {placeholder} 失败: {replace_err}"
-                        logger.error(f"  ❌ {error_msg}")
-                        replace_errors.append(error_msg)
+                        text_range = doc.Range(placeholder_start, placeholder_end)
+                        text = text_range.Text
+                        import re as regex_module
+                        match = regex_module.match(r'\{\{[^}]+\}\}', text)
+                        if not match:
+                            search_start = placeholder_start + 2
+                            continue
+                        placeholder = match.group(0)
+                    except Exception:
+                        search_start = placeholder_start + 2
+                        continue
 
-                        # 检查 Word 连接是否仍然有效
+                    logger.info(f"  找到占位符: {placeholder} (位置: {placeholder_start})")
+
+                    # 检查占位符所在的控件
+                    try:
+                        check_range = doc.Range(placeholder_start, placeholder_start)
+                        parent_cc = check_range.ParentContentControl
+
+                        if parent_cc is None:
+                            logger.info(f"    ⏭️ 不在控件内，跳过")
+                            search_start = placeholder_start + len(placeholder)
+                            continue
+
+                        control_title = parent_cc.Title if hasattr(parent_cc, 'Title') else None
+                        if not control_title:
+                            logger.warning(f"    ⚠️ 控件无标题，跳过")
+                            search_start = placeholder_start + len(placeholder)
+                            continue
+
+                        logger.info(f"    所在控件: {control_title}")
+
+                        # 查找控件对应的段落信息
+                        paragraph_info = control_to_paragraph.get(control_title)
+                        if not paragraph_info:
+                            logger.warning(f"    ⚠️ 未找到控件 '{control_title}' 的映射信息，跳过")
+                            search_start = placeholder_start + len(placeholder)
+                            continue
+
+                        # 获取占位符对应的文件映射
+                        mapping_info = paragraph_info["mappings"].get(placeholder)
+                        if not mapping_info:
+                            logger.warning(f"    ⚠️ 占位符 '{placeholder}' 无映射，跳过")
+                            search_start = placeholder_start + len(placeholder)
+                            continue
+
+                        # 获取文件路径（只需要 path 属性）
+                        if isinstance(mapping_info, dict):
+                            file_path = mapping_info.get("path", "")
+                        elif isinstance(mapping_info, ResourceMapping):
+                            file_path = mapping_info.path
+                        else:
+                            logger.warning(f"    ⚠️ 未知的映射类型")
+                            search_start = placeholder_start + len(placeholder)
+                            continue
+
+                        # 获取字体信息
+                        font_info = control_fonts.get((control_title, placeholder))
+                        if font_info:
+                            font_ascii, font_fareast, font_size = font_info
+                        else:
+                            font_ascii = 'Times New Roman'
+                            font_fareast = '宋体'
+                            font_size = 12
+
+                        # 检查文件存在
+                        if not file_path or not Path(file_path).exists():
+                            logger.warning(f"    ⚠️ 文件不存在: {file_path}")
+                            search_start = placeholder_start + len(placeholder)
+                            continue
+
+                        # 执行替换
+                        file_ext = Path(file_path).suffix.lower()
+                        replace_range = doc.Range(placeholder_start, placeholder_start + len(placeholder))
+
                         try:
-                            _ = self.word.Version
-                        except Exception:
-                            logger.warning("  ⚠️ Word 连接已断开，将尝试重新连接")
-                            word_reconnect_needed = True
+                            replace_range.text = ' '
 
-                # 保存并关闭文档（第二步完成）
+                            if file_ext in ['.docx', '.doc']:
+                                doc_len_before = doc.Content.End
+                                replace_range.InsertFile(str(Path(file_path).absolute()))
+                                logger.info(f"    ✅ InsertFile: {Path(file_path).name}")
+                                insert_end = doc.Content.End
+                                inserted_len = insert_end - doc_len_before
+                                if inserted_len > 0:
+                                    insert_range = doc.Range(placeholder_start, placeholder_start + inserted_len)
+                                    for para in insert_range.Paragraphs:
+                                        para.Range.Font.NameAscii = font_ascii
+                                        para.Range.Font.NameFarEast = font_fareast
+                                        para.Range.Font.Size = font_size
+                            elif file_ext == '.rtf':
+                                replace_range.InsertFile(str(Path(file_path).absolute()))
+                                logger.info(f"    ✅ InsertFile (RTF): {Path(file_path).name}")
+
+                            inserted_resources.append(f"{control_title}:{placeholder}")
+
+                        except Exception as replace_err:
+                            logger.error(f"    ❌ 替换失败: {replace_err}")
+                            replace_errors.append(f"{control_title}:{placeholder}")
+
+                        # 更新搜索起点
+                        search_start = placeholder_start + 1
+
+                    except Exception as check_err:
+                        logger.warning(f"    ⚠️ 检查控件失败: {check_err}")
+                        search_start = placeholder_start + len(placeholder)
+                        continue
+
+                if inserted_resources:
+                    logger.info(f"✅ 占位符替换完成，共 {len(inserted_resources)} 个")
+                if replace_errors:
+                    logger.warning(f"替换错误: {len(replace_errors)} 个")
+
+                # 保存文档
                 try:
                     doc.SaveAs(temp_output)
                     logger.info(f"✅ 第二步完成，保存文档: {Path(output_file).name}")
                 except Exception as save_err:
-                    # 保存失败时，记录错误但不立即失败
-                    # 因为第一步的文件可能已经保存成功
                     logger.error(f"  ❌ 第二步保存失败: {save_err}")
-                    logger.info("  ℹ️ 第一步的文件已保存，但占位符替换可能不完整")
-                    # 不抛出异常，让函数继续返回部分成功的结果
 
                 try:
                     doc.Close(False)
@@ -1054,7 +1412,34 @@ class WordControlContentInserter:
                 except Exception as close_err:
                     logger.warning(f"关闭文档时出错: {close_err}")
             else:
-                logger.info("\n✅ 没有占位符需要替换，跳过第二步")
+                logger.info("✅ 没有占位符需要替换，跳过第二步")
+
+            # ===== 第三步：删除模板表格区域（如果指定了 replace_tag）=====
+            # 遍历 generation_results，对每个表格段落检查是否需要删除模板表格
+            delete_tags = []
+            for result in generation_results:
+                if result.get("status") != "success":
+                    continue
+                is_table = str(result.get("is_table", "false")).lower() == "true"
+                replace_tag = result.get("replace_tag")
+                if is_table and replace_tag:
+                    delete_tags.append(replace_tag)
+
+            if delete_tags:
+                logger.info("=" * 70)
+                logger.info(f"第三步：删除 {len(delete_tags)} 个模板表格区域")
+                logger.info("=" * 70)
+
+                for tag in delete_tags:
+                    success = self.delete_template_table_region(temp_output, tag)
+                    if success:
+                        logger.info(f"  ✅ 已删除模板表格: {tag}")
+                    else:
+                        logger.warning(f"  ⚠️ 删除模板表格失败或未找到: {tag}")
+
+                logger.info("✅ 模板表格清理完成")
+            else:
+                logger.info("✅ 没有需要删除的模板表格区域")
 
             logger.info("=" * 70)
             logger.info("✅ 插入完成")
@@ -1090,53 +1475,80 @@ class WordControlContentInserter:
         finally:
             self._cleanup()
 
-    @staticmethod
-    def build_resource_mappings_from_extraction(
-            extracted_data: Dict[str, Any]
-    ) -> Dict[str, ResourceMapping]:
+    def delete_template_table_region(self, doc_path: str, replace_tag: str) -> bool:
         """
-        从提取数据构建资源映射
+        用 python-docx 删除模板表格区域
+
+        删除范围：{{Table_X_Start}} 到 {{Table_X_End}} 之间的所有内容（包括标记本身）
 
         Args:
-            extracted_data: 提取数据，包含 extracted_items，其中有 tfl_insert_mappings
+            doc_path: Word文档路径
+            replace_tag: 要删除的标记（如 Table_1）
 
         Returns:
-            Dict[str, ResourceMapping]: 占位符到资源的映射
+            是否删除成功
         """
-        mappings = {}
+        if not replace_tag:
+            return False
 
-        items = extracted_data.get('extracted_items', [])
-        for item in items:
-            tfl_mappings = item.get('tfl_insert_mappings', [])
-            for mapping in tfl_mappings:
-                placeholder = mapping.get('Placeholder')
-                path = mapping.get('Path')
-                source = mapping.get('Source', '')
+        try:
+            from docx import Document
+            import copy
 
-                if placeholder and path:
-                    # 判断类型
-                    file_ext = Path(path).suffix.lower()
-                    if file_ext in ['.xlsx', '.xls']:
-                        resource_type = 'excel'
-                    elif file_ext in ['.docx', '.doc', '.rtf']:
-                        resource_type = 'table'
-                    else:
-                        resource_type = 'unknown'
+            logger.info(f"删除模板表格区域: {replace_tag}")
 
-                    mappings[placeholder] = ResourceMapping(
-                        placeholder=placeholder,
-                        path=path,
-                        type=resource_type,
-                        source_file=source
-                    )
+            doc = Document(doc_path)
+            body = doc._element.body
+            elements = list(body)
 
-        return mappings
+            start_tag = f"{{{{{replace_tag}_Start}}}}"
+            end_tag = f"{{{{{replace_tag}_End}}}}"
 
+            # 辅助函数：从XML元素提取文本
+            def get_element_text(el) -> str:
+                texts = []
+                for node in el.iter():
+                    tag = str(getattr(node, 'tag', '') or '')
+                    if tag.endswith('t') and getattr(node, 'text', None):
+                        texts.append(node.text)
+                return ''.join(texts).strip()
+
+            # 找到 Start 和 End 标记的索引
+            start_idx = None
+            end_idx = None
+
+            for i, el in enumerate(elements):
+                text = get_element_text(el)
+                if text == start_tag:
+                    start_idx = i
+                elif text == end_tag and start_idx is not None:
+                    end_idx = i
+                    break
+
+            if start_idx is not None and end_idx is not None:
+                # 删除整个区域（从 Start 到 End，包括标记本身）
+                logger.info(f"找到标记区域: index {start_idx} 到 {end_idx}")
+                for el in elements[start_idx:end_idx + 1]:
+                    body.remove(el)
+                logger.info(f"已删除 {end_idx - start_idx + 1} 个元素")
+                doc.save(doc_path)
+                return True
+            else:
+                logger.warning(f"未找到标记区域: {replace_tag}")
+                return False
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            logger.error(f"删除模板表格区域失败: {e}")
+            return False
+
+    @staticmethod
     def test_word_control_insert(self):
         """测试Word控件内容插入 - IDE调试版本"""
 
         # ========== 在这里修改你的测试参数 ==========
-        word_file_path = r"C:\Users\yeedo\Desktop\4028829e9d0abef0019d23aa03bd0430.doc"  # 修改为你的Word文件路径
+        word_file_path = r"D:\Code\ai\4028829e9d0abef0019d23aa03bd0430.doc"  # 修改为你的Word文件路径
         control_title = "main_research_objectives"  # 修改为你的控件标题
         new_content = """队列1主要目的：评价高脂餐对健康参与者口服GFH375片的药代动力学影响。
 队列2主要目的：评价艾司奥美拉唑镁肠溶片对健康参与者口服GFH375片的药代动力学影响。"""
@@ -1152,6 +1564,7 @@ class WordControlContentInserter:
             print(f"🎯 控件标题: {control_title}")
             print(f"📝 新内容: {new_content}")
             print("-" * 50)
+            new_content = self._clean_text_for_word(new_content)
 
             # 启动Word
             import win32com as win32com
@@ -1222,9 +1635,5 @@ if __name__ == "__main__":
     队列2主要目的：评价艾司奥美拉唑镁肠溶片对健康参与者口服GFH375片的药代动力学影响。"""
     text = new_content.replace('\r\n', '\r')
     print(text)
-    # import pythoncom
-    # pythoncom.CoInitialize()
-    # inserter = WordControlContentInserter()  # 创建实例
-    # inserter.test_word_control_insert()
 
 

@@ -59,17 +59,19 @@ class TwoStageExtractionService:
                            chunks_dir: str,
                            extraction_query: str,
                            task_name: Optional[str] = None,
-                           doc_type: str = "word") -> Dict[str, Any]:
+                           doc_type: str = "word",
+                           ragflow_content: Optional[str] = None) -> Dict[str, Any]:
         """
         从文档分块中进行两阶段提取
-        
+
         Args:
             chunks_index_path: 分块索引文件路径（chunks_index.json）
             chunks_dir: 分块文件目录
             extraction_query: 用户的提取需求
             task_name: 任务名称（可选）
             doc_type: 文档类型，"word" 或 "pdf"（默认"word"）
-        
+            ragflow_content: RAGFlow 知识库检索内容（可选），在阶段2拼入本地分块
+
         Returns:
             Dict: 提取结果
             {
@@ -123,19 +125,33 @@ class TwoStageExtractionService:
             total_chunks = len(chunks_index.get("sections", chunks_index.get("chunks", [])))
             
             if not relevant_chunks:
+                # 构建 localchunks（所有分块均未被筛选）
+                all_chunks_info = filtering_result.get("all_chunks_info", [])
+                localchunks = [
+                    {
+                        "id": chunk.get("id", ""),
+                        "used": "false",
+                        "title": chunk.get("title", ""),
+                        "score": "0",
+                        "reason": "未找到与提取内容相关的信息"
+                    }
+                    for chunk in all_chunks_info
+                ]
+
                 return {
                     "success": True,
                     "extracted_content": "",
                     "stage1_result": filtering_result,
                     "stage2_result": None,
                     "chunks_used": [],
+                    "localchunks": localchunks,  # ✅ 新增
                     "summary": {
                         "total_chunks": total_chunks,
                         "selected_chunks": 0,
                         "message": "未找到相关分块"
                     }
                 }
-            
+
             # 3. 加载筛选出的分块内容
             logger.info(f"加载{len(relevant_chunks)}个相关分块的内容")
             chunks_content = self._load_chunks_content(
@@ -146,11 +162,14 @@ class TwoStageExtractionService:
             
             # 4. 阶段2：从筛选的分块中提取内容
             logger.info(f"阶段2：开始内容提取（文档类型：{doc_type}）")
+            if ragflow_content:
+                logger.info(f"📌 包含 RAGFlow 内容: {len(ragflow_content)} 字符")
             extraction_result = self._extract_from_selected_chunks(
                 chunks_content,
                 extraction_query,
                 task_name,
-                doc_type
+                doc_type,
+                ragflow_content
             )
             
             if not extraction_result.get("success"):
@@ -178,7 +197,39 @@ class TwoStageExtractionService:
             if extraction_result.get("success"):
                 # 从提取阶段获取已构建的分块文本
                 selected_chunks_text = self._build_selected_chunks_text(chunks_content)
-            
+
+            # 构建 localchunks（对比完整分块列表和筛选结果）
+            all_chunks_info = filtering_result.get("all_chunks_info", [])
+            relevant_sections = filtering_result.get("parsed_result", {}).get("relevant_sections", [])
+            relevant_ids = {s.get("section_id") or s.get("id") for s in relevant_sections}
+
+            localchunks = []
+            for chunk in all_chunks_info:
+                chunk_id = chunk.get("id")
+                if chunk_id in relevant_ids:
+                    # 找到对应的筛选结果
+                    matched = next(
+                        (s for s in relevant_sections
+                         if (s.get("section_id") or s.get("id")) == chunk_id),
+                        {}
+                    )
+                    localchunks.append({
+                        "id": chunk_id,
+                        "used": "true",
+                        "title": chunk.get("title", ""),
+                        "score": str(matched.get("relevance_score", 0)),
+                        "reason": matched.get("reason", "")
+                    })
+                else:
+                    # 未被筛选的分块
+                    localchunks.append({
+                        "id": chunk_id,
+                        "used": "false",
+                        "title": chunk.get("title", ""),
+                        "score": "0",
+                        "reason": "未找到与提取内容相关的信息"
+                    })
+
             # 7. 返回完整结果
             return {
                 "success": True,
@@ -188,6 +239,7 @@ class TwoStageExtractionService:
                 "chunks_used": relevant_chunks,
                 "selected_chunks_content": selected_chunks_text,  # 添加筛选的分块内容
                 "full_prompt": full_prompt,  # 添加合并的完整提示词
+                "localchunks": localchunks,  # 完整分块信息（标记used）
                 "summary": {
                     "total_chunks": total_chunks,
                     "selected_chunks": len(relevant_chunks),
@@ -266,12 +318,26 @@ class TwoStageExtractionService:
             total_chunks = len(chunks_index.get("sections", chunks_index.get("chunks", [])))
 
             if not relevant_chunks:
+                # 构建 localchunks（所有分块均未被筛选）
+                all_chunks_info = filtering_result.get("all_chunks_info", [])
+                localchunks = [
+                    {
+                        "id": chunk.get("id", ""),
+                        "used": "false",
+                        "title": chunk.get("title", ""),
+                        "score": "0",
+                        "reason": "未找到与提取内容相关的信息"
+                    }
+                    for chunk in all_chunks_info
+                ]
+
                 return {
                     "success": True,
                     "extracted_content": "",
                     "stage1_result": filtering_result,
                     "stage2_result": None,
                     "chunks_used": [],
+                    "localchunks": localchunks,  # ✅ 新增
                     "summary": {
                         "total_chunks": total_chunks,
                         "selected_chunks": 0,
@@ -311,6 +377,8 @@ class TwoStageExtractionService:
                 "chunks_used": relevant_chunks,
                 "selected_chunks_content": final_content,
                 "full_prompt": extraction_query,
+                # 构建 localchunks
+                "localchunks": self._build_localchunks(filtering_result, relevant_chunks),
                 "summary": {
                     "total_chunks": total_chunks,
                     "selected_chunks": len(relevant_chunks),
@@ -384,7 +452,7 @@ class TwoStageExtractionService:
             prompt = system_prompt_manager.build_prompt(template_name, variables)
             
             logger.info(f"📝 筛选提示词已构建，长度: {len(prompt)}字符")
-            logger.info(f"📝 筛选提示词（前500字符）:\n{prompt[:500]}")
+            # logger.info(f"📝 筛选提示词（前500字符）:\n{prompt[:500]}")
             
             # 调用模型
             logger.info(f"🤖 正在调用LLM进行分块筛选...")
@@ -392,7 +460,7 @@ class TwoStageExtractionService:
             
             # ✅ 调试：输出LLM原始响应
             logger.info(f"🔍 LLM原始输出长度: {len(model_output)}字符")
-            logger.info(f"🔍 LLM原始输出（前1000字符）:\n{model_output[:1000]}")
+            # logger.info(f"🔍 LLM原始输出（前1000字符）:\n{model_output[:1000]}")
             current_output = model_output
             # 解析结果 带重试
             max_retries = 2
@@ -444,6 +512,17 @@ class TwoStageExtractionService:
             
             # ✅ 保存筛选阶段完整溯源数据
             from datetime import datetime
+
+            # 获取完整分块列表（不含content，只保留id和title）
+            sections = chunks_index.get("sections", chunks_index.get("chunks", []))
+            all_chunks_info = [
+                {
+                    "id": s.get("section_id") or s.get("id") or s.get("chunk_id"),
+                    "title": s.get("title", "")
+                }
+                for s in sections
+            ]
+
             filtering_result = {
                 "success": True,
                 "stage": "chunk_filtering",
@@ -462,10 +541,12 @@ class TwoStageExtractionService:
                 "parsed_result": {
                     # 优先使用新字段名 relevant_sections，兼容旧字段名 relevant_chunks
                     "relevant_sections": parsed.get("relevant_sections", []) or parsed.get("relevant_chunks", []),
-                    "relevant_chunks": parsed.get("relevant_sections", []) or parsed.get("relevant_chunks", []),  # 保持兼容
+                    # "relevant_chunks": parsed.get("relevant_sections", []) or parsed.get("relevant_chunks", []),  #与上面的内容重复
                     "total_selected": parsed.get("total_selected", 0),
                     "selection_summary": parsed.get("selection_summary", "")
-                }
+                },
+                #  完整分块列表（不含content）
+                "all_chunks_info": all_chunks_info
             }
             
             # 保存筛选结果到文件
@@ -647,7 +728,8 @@ class TwoStageExtractionService:
                                      chunks_content: List[Dict[str, Any]],
                                      extraction_query: str,
                                      task_name: Optional[str] = None,
-                                     doc_type: str = "word") -> Dict[str, Any]:
+                                     doc_type: str = "word",
+                                     ragflow_content: Optional[str] = None) -> Dict[str, Any]:
         """
         阶段2：从筛选的分块中提取内容
         
@@ -656,17 +738,28 @@ class TwoStageExtractionService:
             extraction_query: 提取需求
             task_name: 任务名称
             doc_type: 文档类型，"word" 或 "pdf"
-        
+            ragflow_content: RAGFlow 知识库检索内容（可选），拼在本地分块后
         Returns:
             Dict: 提取结果
         """
         try:
             # 构建分块内容文本
             selected_chunks_text = self._build_selected_chunks_text(chunks_content)
-            
+
+            # ✅ 统一添加来源标识，让模型区分不同数据源
+            if ragflow_content and ragflow_content.strip():
+                logger.info(f"📌 拼接 RAGFlow 内容到本地分块")
+                selected_chunks_text = (
+                    f"【本地筛选分块】\n{selected_chunks_text}\n\n"
+                    f"【RAGFlow检索分块】\n{ragflow_content}"
+                )
+            else:
+                # 只有本地分块时也加上标识，保持格式一致
+                selected_chunks_text = f"【本地筛选分块】\n{selected_chunks_text}"
+
             # 根据文档类型选择提示词模板
             template_name = "chunk_based_extraction_pdf" if doc_type == "pdf" else "chunk_based_extraction"
-            
+
             # 构建提示词（不包含task_name）
             variables = {
                 "extraction_query": extraction_query,
@@ -674,10 +767,10 @@ class TwoStageExtractionService:
                 "project_desc": os.getenv("CURRENT_PROJECT_DESC", "")
             }
             prompt = system_prompt_manager.build_prompt(template_name, variables)
-            
+
             # 调用模型
             model_output = self.llm.generate_single(prompt)
-            
+
             # ✅ 保存提取阶段完整溯源数据
             from datetime import datetime
             extraction_result = {
@@ -688,7 +781,8 @@ class TwoStageExtractionService:
                     "extraction_query": extraction_query,
                     "task_name": task_name or "内容提取",
                     "doc_type": doc_type,
-                    "chunks_count": len(chunks_content)
+                    "chunks_count": len(chunks_content),
+                    "ragflow_content_length": len(ragflow_content) if ragflow_content else 0
                 },
                 "chunks_used": [
                     {
@@ -708,9 +802,9 @@ class TwoStageExtractionService:
                 "content": model_output,
                 "output_length": len(model_output),
                 "extraction_query": extraction_query,
-                "source_chunks": selected_chunks_text  # 保存源分块内容
+                "source_chunks": selected_chunks_text  # 保存源分块内容（含RAGFlow）
             }
-            
+
             # 可选：保存提取结果到文件
             self._save_extraction_result(extraction_result)
             
@@ -809,8 +903,8 @@ class TwoStageExtractionService:
         logger.error("无法解析JSON响应")
         return None
     
-    def _get_paragraph_prompts_dir(self) -> Path:
-        """获取当前段落的生成基目录：output/generation/single/<paragraph_id>
+    def _get_paragraph_prompts_dir(self) -> tuple[Path, str]:
+        """获取当前段落的生成基目录：output/extraction/<paragraph_id>
         注意：下游保存函数会在该基目录下创建 prompts/ outputs/ provenance/ 子目录。
         """
         from pathlib import Path as _Path
@@ -825,11 +919,11 @@ class TwoStageExtractionService:
             # fallback: 使用默认目录
             paragraph_id = "default"
         
-        # 生成阶段：单段落级别目录
-        base_dir = _Path(output_dir) / "generation" / "single" / paragraph_id
+        # 提取阶段：单段落级别目录
+        base_dir = _Path(output_dir) / "extraction" / paragraph_id
         base_dir.mkdir(parents=True, exist_ok=True)
         
-        return base_dir
+        return base_dir, paragraph_id
     
     def _save_loaded_chunks_data(self, chunks_index: Dict[str, Any], chunks_index_path: str) -> None:
         """保存读取的chunks数据（始终保存）"""
@@ -837,7 +931,7 @@ class TwoStageExtractionService:
             import json
             from datetime import datetime
             
-            base_dir = self._get_paragraph_prompts_dir()
+            base_dir,paragraph_id  = self._get_paragraph_prompts_dir()
             provenance_dir = base_dir / "provenance"
             provenance_dir.mkdir(parents=True, exist_ok=True)
             
@@ -863,7 +957,7 @@ class TwoStageExtractionService:
             }
             
             # 保存摘要JSON
-            json_filename = f"chunks_loaded_{timestamp}.json"
+            json_filename = f"chunks_loaded_{paragraph_id}_{timestamp}.json"
             json_filepath = provenance_dir / json_filename
             with open(json_filepath, 'w', encoding='utf-8') as f:
                 json.dump(chunks_summary, f, ensure_ascii=False, indent=2)
@@ -880,7 +974,7 @@ class TwoStageExtractionService:
             import json
             from datetime import datetime
             
-            base_dir = self._get_paragraph_prompts_dir()
+            base_dir,paragraph_id  = self._get_paragraph_prompts_dir()
             provenance_dir = base_dir / "provenance"
             prompts_dir = base_dir / "prompts"
             outputs_dir = base_dir / "outputs"
@@ -892,19 +986,19 @@ class TwoStageExtractionService:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             
             # 1. 保存完整溯源数据JSON
-            json_filename = f"filtering_provenance_{timestamp}.json"
+            json_filename = f"filtering_provenance_{paragraph_id}_{timestamp}.json"
             json_filepath = provenance_dir / json_filename
             with open(json_filepath, 'w', encoding='utf-8') as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
             
             # 2. 保存提示词TXT
-            prompt_filename = f"filtering_prompt_{timestamp}.txt"
+            prompt_filename = f"filtering_prompt_{paragraph_id}_{timestamp}.txt"
             prompt_filepath = prompts_dir / prompt_filename
             with open(prompt_filepath, 'w', encoding='utf-8') as f:
                 f.write(result.get("full_prompt", ""))
             
             # 3. 保存模型输出TXT
-            output_filename = f"filtering_output_{timestamp}.txt"
+            output_filename = f"filtering_output_{paragraph_id}_{timestamp}.txt"
             output_filepath = outputs_dir / output_filename
             with open(output_filepath, 'w', encoding='utf-8') as f:
                 f.write(result.get("model_output", ""))
@@ -921,7 +1015,7 @@ class TwoStageExtractionService:
             import json
             from datetime import datetime
             
-            base_dir = self._get_paragraph_prompts_dir()
+            base_dir, paragraph_id = self._get_paragraph_prompts_dir()
             provenance_dir = base_dir / "provenance"
             prompts_dir = base_dir / "prompts"
             outputs_dir = base_dir / "outputs"
@@ -935,19 +1029,19 @@ class TwoStageExtractionService:
             # 1. 保存完整溯源数据JSON（限制source_chunks大小）
             save_result = result.copy()
             
-            json_filename = f"extraction_provenance_{timestamp}.json"
+            json_filename = f"extraction_provenance_{paragraph_id}_{timestamp}.json"
             json_filepath = provenance_dir / json_filename
             with open(json_filepath, 'w', encoding='utf-8') as f:
                 json.dump(save_result, f, ensure_ascii=False, indent=2)
             
             # 2. 保存提示词TXT
-            prompt_filename = f"extraction_prompt_{timestamp}.txt"
+            prompt_filename = f"extraction_prompt_{paragraph_id}_{timestamp}.txt"
             prompt_filepath = prompts_dir / prompt_filename
             with open(prompt_filepath, 'w', encoding='utf-8') as f:
                 f.write(result.get("full_prompt", ""))
             
             # 3. 保存模型输出TXT
-            output_filename = f"extraction_output_{timestamp}.txt"
+            output_filename = f"extraction_output_{paragraph_id}_{timestamp}.txt"
             output_filepath = outputs_dir / output_filename
             with open(output_filepath, 'w', encoding='utf-8') as f:
                 f.write(result.get("model_output", ""))
@@ -957,7 +1051,51 @@ class TwoStageExtractionService:
             import traceback
             traceback.print_exc()
             logger.warning(f"保存提取溯源数据失败: {e}")
-    
+
+    def _build_localchunks(self, filtering_result: Dict[str, Any], relevant_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        构建 localchunks（完整分块信息，标记 used）
+
+        Args:
+            filtering_result: 筛选结果，包含 all_chunks_info 和 parsed_result
+            relevant_chunks: 筛选出的相关分块列表
+
+        Returns:
+            localchunks: [{id, used, title, score, reason}]
+        """
+        all_chunks_info = filtering_result.get("all_chunks_info", [])
+        relevant_sections = filtering_result.get("parsed_result", {}).get("relevant_sections", [])
+        relevant_ids = {s.get("section_id") or s.get("id") for s in relevant_sections}
+
+        localchunks = []
+        for chunk in all_chunks_info:
+            chunk_id = chunk.get("id")
+            if chunk_id in relevant_ids:
+                # 找到对应的筛选结果
+                matched = next(
+                    (s for s in relevant_sections
+                     if (s.get("section_id") or s.get("id")) == chunk_id),
+                    {}
+                )
+                localchunks.append({
+                    "id": chunk_id,
+                    "used": "true",
+                    "title": chunk.get("title", ""),
+                    "score": str(matched.get("relevance_score", 0)),
+                    "reason": matched.get("reason", "")
+                })
+            else:
+                # 未被筛选的分块
+                localchunks.append({
+                    "id": chunk_id,
+                    "used": "false",
+                    "title": chunk.get("title", ""),
+                    "score": "0",
+                    "reason": "未找到与提取内容相关的信息"
+                })
+
+        return localchunks
+
     def _calculate_avg_score(self, chunks: List[Dict[str, Any]]) -> float:
         """计算平均相关性评分"""
         if not chunks:

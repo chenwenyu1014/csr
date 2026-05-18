@@ -38,7 +38,7 @@ async def preprocess_batch_simple(
     extract_assets: bool = Form(True),
     chunking_enabled: bool = Form(True),
     force_ocr: bool = Form(False),
-    callback_url: str = Form("http://192.168.3.32:8088/ky/KM/kmFile/updateFileStatus"),
+    callback_url: str = Form(os.getenv("CALLBACK_BASE_URL")+"/ky/KM/kmFile/updateFileStatus"),
     combinationId: str | None = Form(None, description="组合ID"),
     project_desc: str | None = Form(None, description="项目背景"),
 ):

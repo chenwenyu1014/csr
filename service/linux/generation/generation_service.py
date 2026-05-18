@@ -63,108 +63,6 @@ class GenerationService:
     # 公开方法 - 同步执行
     # ============================================================
     
-    # def run_sync(
-    #     self,
-    #     cfg_obj: dict,
-    #     base_data_dir: Optional[str] = None,
-    #     output_dir: Optional[str] = None,
-    #     combinationId: Optional[str] = None,
-    #     project_desc: Optional[str] = None,
-    #     skip_validation: bool = True,  # 默认跳过校验
-    # ) -> dict:
-    #     """
-    #     同步执行生成任务（不走回调，直接返回结果）
-    #
-    #     用于 compose 接口，同步返回完整结果
-    #
-    #     Args:
-    #         cfg_obj: 配置对象
-    #         base_data_dir: 基础数据目录
-    #         output_dir: 输出目录
-    #         combinationId: 组合ID
-    #         project_desc: 项目描述
-    #         skip_validation: 是否跳过提取校验（默认False）
-    #
-    #     Returns:
-    #         包含生成结果的字典
-    #     """
-    #     # 开始总计时
-    #     total_timer = Timer("同步生成任务", parent="生成服务")
-    #     total_timer.start()
-    #
-    #     try:
-    #         # 设置环境变量
-    #         with Timer("设置环境变量", parent="生成服务"):
-    #             self._setup_environment(cfg_obj, combinationId, project_desc)
-    #
-    #         # 创建输出目录
-    #         with Timer("创建输出目录", parent="生成服务"):
-    #             run_dir = self._create_output_dir(output_dir)
-    #
-    #         # 保存配置
-    #         with Timer("保存配置文件", parent="生成服务"):
-    #             cfg_path = self._save_config(run_dir, cfg_obj)
-    #
-    #         # 执行生成流程
-    #         from service.linux.generation.flow_controller import CSRFlowController, FlowConfig
-    #
-    #         with Timer("初始化流程控制器", parent="生成服务"):
-    #             fc = FlowConfig(
-    #                 config_path=str(cfg_path),
-    #                 base_data_dir=base_data_dir or self.settings.base_data_dir,
-    #                 cache_dir=self.settings.cache_dir,
-    #                 output_dir=output_dir or self.settings.compose_output_dir,
-    #                 word_template_file=None,
-    #                 word_output_file=None,
-    #                 enable_word_integration=False,
-    #                 skip_validation=skip_validation,  # 传递跳过校验参数
-    #             )
-    #
-    #             fc.early_export_regions = True
-    #             fc.compose_insert_url = None
-    #
-    #             controller = CSRFlowController(fc)
-    #             controller.word_post_processor = None
-    #
-    #         try:
-    #             # 执行生成（同步）
-    #             with Timer("执行段落生成", parent="生成服务") as gen_timer:
-    #                 flow_res = controller.generate_all_paragraphs()
-    #
-    #             if generation_timer:
-    #                 generation_timer.record("段落生成", gen_timer.duration, parent="生成服务")
-    #
-    #             if not flow_res.success:
-    #                 raise Exception(flow_res.error or flow_res.message or "生成失败")
-    #
-    #             # 处理结果
-    #             with Timer("构建返回结果", parent="生成服务"):
-    #                 result = self._build_result(flow_res, run_dir)
-    #
-    #             total_timer.stop()
-    #
-    #             # 记录总耗时
-    #             if generation_timer:
-    #                 generation_timer.record("同步生成完成", total_timer.duration, parent="生成服务")
-    #
-    #             logger.info(f"✅ 同步生成任务完成 [总耗时: {total_timer.duration_str}]")
-    #
-    #             # 打印耗时摘要
-    #             try:
-    #                 if generation_timer:
-    #                     generation_timer.print_summary()
-    #             except Exception:
-    #                 pass
-    #
-    #             return result
-    #         finally:
-    #             # 清理会话级别的日志 Handler，避免后续日志混入本次会话
-    #             controller.cleanup()
-    #
-    #     except Exception as e:
-    #         total_timer.stop()
-    #         logger.error(f"❌ 同步生成失败 [耗时: {total_timer.duration_str}]: {e}", exc_info=True)
-    #         raise
     
     # ============================================================
     # 公开方法 - 异步执行（后台线程）
@@ -181,12 +79,13 @@ class GenerationService:
         callback_url: Optional[str] = None,
         result_callback_url: Optional[str] = None,
         project_id: Optional[str] = None,
+        project_name: Optional[str] = None,
         auth_token: Optional[str] = None,
         skip_validation: bool = True  # 默认跳过校验
     ) -> threading.Thread:
         """
         启动后台线程执行异步生成任务
-        
+
         Args:
             task_id: 任务ID
             cfg_obj: 配置对象
@@ -196,19 +95,20 @@ class GenerationService:
             project_desc: 项目描述
             callback_url: 进度状态回调URL
             result_callback_url: 结果回调URL
-            project_id: 项目ID
+            project_id: 项目ID（用于回调标识）
+            project_name: 项目名称（用于RAGFlow知识库查找）
             auth_token: 认证Token
             skip_validation: 是否跳过提取校验（默认True）
-        
+
         Returns:
             启动的线程对象
         """
         thread = threading.Thread(
             target=self._run_async,
             args=(
-                task_id, cfg_obj, base_data_dir, output_dir, 
-                combinationId, project_desc, callback_url, 
-                result_callback_url, project_id, auth_token,
+                task_id, cfg_obj, base_data_dir, output_dir,
+                combinationId, project_desc, callback_url,
+                result_callback_url, project_id, project_name, auth_token,
                 skip_validation
             ),
             daemon=True
@@ -226,13 +126,14 @@ class GenerationService:
         project_desc: Optional[str] = None,
         template_file: Optional[str] = None,
         project_id: Optional[str] = None,
+        project_name: Optional[str] = None,
         auth_token: Optional[str] = None,
         callback_url: Optional[str] = None,
         skip_validation: bool = True  # 默认跳过校验
     ) -> threading.Thread:
         """
         启动后台线程执行异步完整流程任务（生成 + 插入）
-        
+
         Args:
             task_id: 任务ID
             cfg_obj: 配置对象
@@ -241,20 +142,21 @@ class GenerationService:
             combinationId: 组合ID
             project_desc: 项目描述
             template_file: 模板文件路径
-            project_id: 项目ID
+            project_id: 项目ID（用于回调标识）
+            project_name: 项目名称（用于RAGFlow知识库查找）
             auth_token: 认证Token
             callback_url: 完成时回调URL
             skip_validation: 是否跳过提取校验（默认True）
-        
+
         Returns:
             启动的线程对象
         """
         thread = threading.Thread(
             target=self._run_compose_async,
             args=(
-                task_id, cfg_obj, base_data_dir, output_dir, 
+                task_id, cfg_obj, base_data_dir, output_dir,
                 combinationId, project_desc, template_file,
-                project_id, auth_token, callback_url,
+                project_id, project_name, auth_token, callback_url,
                 skip_validation
             ),
             daemon=True
@@ -277,6 +179,7 @@ class GenerationService:
         callback_url: Optional[str] = None,
         result_callback_url: Optional[str] = None,
         project_id: Optional[str] = None,
+        project_name: Optional[str] = None,
         auth_token: Optional[str] = None,
         skip_validation: bool = True  # 默认跳过校验
     ):
@@ -337,6 +240,8 @@ class GenerationService:
                 word_output_file=None,
                 enable_word_integration=False,
                 skip_validation=skip_validation,  # 传递跳过校验参数
+                project_id=project_id,  # 项目ID（用于回调标识）
+                project_name=project_name  # 项目名称（用于RAGFlow）
             )
             
             fc.early_export_regions = True
@@ -355,7 +260,7 @@ class GenerationService:
                 # 回调：开始提取
                 callback.notify_extraction_started()
                 task_logger.info("开始数据提取")
-                
+
                 # 执行生成
                 flow_res = controller.generate_all_paragraphs()
                 
@@ -366,9 +271,18 @@ class GenerationService:
                     return
                 
                 task_logger.info("生成流程完成")
-                
+
                 # 处理结果
-                result = self._build_result(flow_res, run_dir)
+                result = self._build_result(flow_res, run_dir, cfg_obj)
+                json_result = json.dumps(result, ensure_ascii=False)
+                task_logger.info(f"生成结果已保存：{json_result}", )
+
+                # 保存插入数据到文件，
+                insertion_config = result.get("insertion_config", {})
+                data_json_str = json.dumps(insertion_config, ensure_ascii=False, indent=2)
+                insertion_data_path = run_dir / "inputs" / "insertion_data.json"
+                insertion_data_path.write_text(data_json_str, encoding='utf-8')
+                task_logger.info("插入数据已保存", path=str(insertion_data_path))
                 
                 # 更新每个段落的标签状态
                 self._update_paragraph_status(result, callback)
@@ -412,6 +326,7 @@ class GenerationService:
         project_desc: Optional[str] = None,
         template_file: Optional[str] = None,
         project_id: Optional[str] = None,
+        project_name: Optional[str] = None,
         auth_token: Optional[str] = None,
         callback_url: Optional[str] = None,
         skip_validation: bool = True  # 默认跳过校验
@@ -461,6 +376,8 @@ class GenerationService:
                 word_output_file=None,
                 enable_word_integration=False,
                 skip_validation=skip_validation,  # 传递跳过校验参数
+                project_id=project_id,  # 项目ID（用于回调标识）
+                project_name=project_name  # 项目名称（用于RAGFlow）
             )
             
             fc.early_export_regions = True
@@ -491,7 +408,7 @@ class GenerationService:
                     return
                 flow_steps = "处理生成结果"
                 # 处理生成结果
-                result = self._build_result(flow_res, run_dir)
+                result = self._build_result(flow_res, run_dir, cfg_obj)
                 logger.info(f"[Compose异步] 步骤1完成: 文本生成成功")
                 task_logger.info("步骤1完成: 文本生成成功")
                 
@@ -502,7 +419,15 @@ class GenerationService:
                     task_logger.info("开始步骤2: 模板插入", template_file=template_file)
 
                     insertion_config = result.get("insertion_config", {})
-                    data_json_str = json.dumps(insertion_config, ensure_ascii=False)
+                    data_json_str = json.dumps(insertion_config, ensure_ascii=False,indent=2)
+
+                    # 保存插入数据到文件，避免日志输出过大
+                    insertion_data_path = run_dir / "inputs" / "insertion_data.json"
+                    insertion_data_path.write_text(data_json_str, encoding='utf-8')
+                    task_logger.info("插入数据已保存", path=str(insertion_data_path))
+
+                    # 仅记录简要信息，不输出完整JSON
+                    logger.info(f"[Compose异步] 步骤2: 模板插入 - 插入数据已保存到: {insertion_data_path}")
 
                     from service.linux.bridge.windows_bridge_client import WindowsBridgeClient
 
@@ -611,51 +536,104 @@ class GenerationService:
             if isinstance(para, dict) and para.get("id"):
                 paragraph_ids.append(para["id"])
         return paragraph_ids
-    
-    def _build_result(self, flow_res, run_dir: Path) -> dict:
+
+    def _build_result(self, flow_res, run_dir: Path, cfg_obj: dict = None) -> dict:
         """构建返回结果"""
         data_obj = flow_res.data or {}
-        results = []
-        
-        # 读取运行结果
+        paragraphs_data = []
+
+        # 构建原始段落配置映射（id -> {is_table, replace_tag}）
+        original_para_map = {}
+        if cfg_obj:
+            for para in cfg_obj.get("paragraphs", []):
+                if isinstance(para, dict) and para.get("id"):
+                    original_para_map[para["id"]] = {
+                        "is_table": para.get("is_table", "false"),
+                        "replace_tag": para.get("replace_tag")
+                    }
+
+        # 优先读取溯源结果，如果没有则回退到旧的运行结果
         try:
-            run_output_file = data_obj.get('run_output_file')
-            if run_output_file and Path(run_output_file).exists():
-                with open(run_output_file, 'r', encoding='utf-8') as f:
-                    run_json = json.load(f)
-                results = run_json.get('results', []) or []
+            provenance_file = data_obj.get('prov_path') or data_obj.get('provenance_file')
+            if provenance_file and Path(provenance_file).exists():
+                # 使用 provenance 文件构建结果
+                with open(provenance_file, 'r', encoding='utf-8') as f:
+                    prov_json = json.load(f)
+
+                # 解析 provenance 文件结构
+                prov_paragraphs = prov_json.get('paragraphs', [])
+                for p in prov_paragraphs:
+                    paragraph_data = {
+                        "paragraph_id": p.get("paragraph_id", ""),
+                        "result": p.get("result", {}),
+                        "extraction": p.get("extraction", {}),
+                        "generation": p.get("generation", {})
+                    }
+                    paragraphs_data.append(paragraph_data)
         except Exception as e:
             import traceback
             traceback.print_exc()
             logger.warning(f"读取运行结果失败: {e}")
-        
+
+        # 读取 extracted_data_file，建立 paragraph_id -> items 的映射
+        extracted_items_map = {}
+        try:
+            extracted_data_file = data_obj.get('extracted_data_file')
+            if extracted_data_file and Path(extracted_data_file).exists():
+                with open(extracted_data_file, 'r', encoding='utf-8') as f:
+                    extracted_json = json.load(f)
+                for p in extracted_json.get('paragraphs', []):
+                    extracted_items_map[p.get('paragraph_id')] = p.get('items', [])
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            logger.warning(f"读取extracted_data文件失败: {e}")
+
         # 构建返回数据
-        all_resource_mappings = {}
         paragraphs = []
         traceability_list = []
 
-        for r in results:
+        for r in paragraphs_data:
+            # 根据数据源不同，获取字段的方式也不同
             pid = r.get("paragraph_id", "")
-            gen_txt = r.get("generated_content", "")
-            status_str = r.get("status", "success")
-            paragraphs.append({
+            result = r.get("result", {})
+            gen_txt = result.get("generated_content", "")
+            status_str = result.get("status", "success")
+            # 从 extracted_items 数据获取溯源信息
+            prov_items = extracted_items_map.get(pid)
+
+            # 从原始配置中获取表格相关字段
+            original_para = original_para_map.get(pid, {})
+
+            # 获取该段落的 resource_mappings（优先从 result，其次从 generation.inputs）
+            paragraph_resource_mappings = {}
+            result_resource_mappings = result.get("resource_mappings", {})
+            if result_resource_mappings:
+                paragraph_resource_mappings = result_resource_mappings
+            elif 'generation' in r:
+                generation = r.get("generation", {})
+                inputs = generation.get("inputs", {})
+                resource_mappings = inputs.get("resource_mappings", {})
+                if resource_mappings:
+                    paragraph_resource_mappings = resource_mappings
+
+            # 段落条目（resource_mappings 嵌入到段落）
+            para_entry = {
                 "paragraph_id": pid,
                 "generated_content": gen_txt,
-                "status": status_str
-            })
+                "status": status_str,
+                "is_table": original_para.get("is_table", "false"),
+                "replace_tag": original_para.get("replace_tag"),
+                "resource_mappings": paragraph_resource_mappings
+            }
+            paragraphs.append(para_entry)
 
-            # 构建溯源信息
-            prov_items = self._build_provenance_items(r)
-            
             traceability_list.append({
                 "paragraph_id": pid,
                 "generated_content": gen_txt,
                 "status": status_str,
-                "provenance": {"extracted_items": prov_items}
+                "provenance": prov_items
             })
-
-            if "resource_mappings" in r:
-                all_resource_mappings.update(r["resource_mappings"])
 
         return {
             "success": True,
@@ -663,106 +641,15 @@ class GenerationService:
             "run_dir": data_obj.get('run_dir') or str(run_dir),
             "generated_content": {
                 "paragraphs": paragraphs,
-                "resource_mappings": all_resource_mappings
+                "resource_mappings": {}  # 保留空字典，向后兼容
             },
             "traceability": traceability_list,
             "insertion_config": {
-                "generation_results": paragraphs,
-                "resource_mappings": all_resource_mappings
+                "generation_results": paragraphs,  # 每个段落已携带 resource_mappings
+                "resource_mappings": {}  # 保留空字典，向后兼容
             }
         }
-    
-    def _build_provenance_items(self, result: dict) -> List[dict]:
-        """构建溯源信息项"""
-        prov_items = []
-        try:
-            eitems = (result.get("extracted_data") or {}).get("extracted_items", [])
-            for it in eitems:
-                if not isinstance(it, dict) or it.get("status") != "success":
-                    continue
-                
-                data_type = (it.get("data_type") or "").lower()
-                extract_item = it.get("extract_item") or it.get("extract") or ""
-                extract_text = it.get("content", "")
 
-                # 构建 used_data
-                used_data = self._build_used_data(it, data_type)
-                
-                # 构建 data_source
-                data_source = self._build_data_source(it, data_type)
-
-                prov_items.append({
-                    "extract_item": extract_item,
-                    "extract_text": extract_text,
-                    "used_data": used_data,
-                    "data_source": data_source
-                })
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            logger.warning(f"构建溯源失败: {e}")
-        
-        return prov_items
-    
-    def _build_used_data(self, item: dict, data_type: str) -> Dict[str, Any]:
-        """构建 used_data 字段"""
-        used_data = {}
-        
-        if data_type in ("word", "pdf"):
-            used_data["kind"] = "chunk"
-            cfile = item.get("chunks_file")
-            
-            # 处理 chunks_file
-            if isinstance(cfile, list) and cfile:
-                used_data["structured_chunks_file"] = self._normalize_path(str(cfile[0]))
-            elif isinstance(cfile, str) and cfile:
-                used_data["structured_chunks_file"] = self._normalize_path(cfile)
-            
-            # 处理 sections
-            sections = item.get("chunks_used_sections") or []
-            if sections:
-                used_data["section_id"] = sections[0]
-            
-            # 处理标题
-            try:
-                cu = (item.get("extraction_result") or {}).get("chunks_used", [])
-                if cu:
-                    title0 = cu[0].get("heading")
-                    if title0:
-                        used_data["title"] = title0
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                pass
-                
-        elif data_type in ("excel", "rtf"):
-            used_data["kind"] = "sheet"
-            sres = item.get("sheets_results") or (item.get("extraction_result") or {}).get("sheets_results") or []
-            if sres:
-                used_data["sheet_name"] = sres[0].get("sheet_name")
-                used_data["sheet_index"] = 1
-                md_file = sres[0].get("md_file")
-                if md_file:
-                    used_data["markdown_path"] = self._normalize_path(str(md_file))
-        
-        return used_data
-    
-    def _build_data_source(self, item: dict, data_type: str) -> Dict[str, str]:
-        """构建 data_source 字段"""
-        src = item.get("source_file") or ""
-        if isinstance(src, list):
-            src = src[0] if src else ""
-        if isinstance(src, str) and "," in src:
-            src = src.split(",")[0].strip()
-        
-        ds_type = "word" if data_type in ("word", "pdf") else ("excel" if data_type in ("excel", "rtf") else data_type)
-        normalized_src = self._normalize_path(str(src)) if src else ""
-        
-        return {
-            "name": (Path(normalized_src).name if normalized_src else ""),
-            "path": normalized_src,
-            "type": ds_type or ""
-        }
     
     def _normalize_path(self, path: str) -> str:
         """规范化路径，移除 AAA/ 前缀"""
@@ -847,8 +734,7 @@ class GenerationService:
             
             logger.info(f"[Compose回调] 发送回调到: {callback_url}")
             logger.info(f"[Compose回调] project_id: {project_id}")
-            logger.info(f"[Compose回调] 数据: {data_json_str[:200]}")
-            logger.info(f"[Compose回调] 插入信息: {data.get('insertion_config','')}")  # 方便插入流程出错后测试
+            # logger.info(f"[Compose回调] 数据: {data_json_str[:200]}")
             logger.info(f"[Compose回调] 数据: status={data.get('status')}, success={data.get('success')}")
             
             with httpx.Client(timeout=30.0) as client:

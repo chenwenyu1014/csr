@@ -50,11 +50,11 @@ _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="callback_")
 # ========== 标签状态更新接口配置 ==========
 # 可通过环境变量 TAG_STATUS_API_BASE 配置基础URL
 # 默认使用 192.168.3.32:8088（所有回调统一IP和端口）
-TAG_STATUS_API_BASE = os.getenv("TAG_STATUS_API_BASE", "http://192.168.3.32:8088")
+TAG_STATUS_API_BASE = os.getenv("CALLBACK_BASE_URL", "http://192.168.3.32:8088")
 TAG_STATUS_API_PATH = "/ky/sys/projectTagsSourceInfo/updateStatus"
 
 # ========== 标签结果回调接口配置 ==========
-TAG_RESULT_API_BASE = os.getenv("TAG_RESULT_API_BASE", "http://192.168.3.32:8088")
+TAG_RESULT_API_BASE = os.getenv("CALLBACK_BASE_URL", "http://192.168.3.32:8088")
 TAG_RESULT_API_PATH = "/ky/sys/projectTagsSourceInfo/getTagAIResult"
 
 
@@ -438,97 +438,6 @@ class ProgressCallback:
         if update_tag_status:
             self._update_all_tags_status(stage)
     
-    # # ========== 便捷方法 ==========
-    #
-    # def set_tag_ids(self, tag_ids: List[str]):
-    #     """
-    #     设置要更新的标签ID列表
-    #
-    #     可以在任务执行过程中动态设置，比如根据配置中的 paragraph_id 设置
-    #     """
-    #     self.tag_ids = tag_ids
-    #     logger.info(f"设置标签ID列表: {tag_ids}")
-    #
-    # def add_tag_id(self, tag_id: str):
-    #     """添加一个标签ID"""
-    #     if tag_id not in self.tag_ids:
-    #         self.tag_ids.append(tag_id)
-    #
-    # def notify_accepted(self, message: str = "任务已接收"):
-    #     """通知任务已接收"""
-    #     self._update_and_send(
-    #         stage=TaskStage.PENDING,
-    #         message=message,
-    #         progress=0
-    #     )
-    #
-    # def notify_preprocessing(
-    #     self,
-    #     message: str,
-    #     progress: int = 10,
-    #     current: int = 0,
-    #     total: int = 0,
-    #     detail: Optional[dict] = None
-    # ):
-    #     """通知预处理进度"""
-    #     self._update_and_send(
-    #         stage=TaskStage.PREPROCESSING,
-    #         message=message,
-    #         progress=progress,
-    #         current_step=current,
-    #         total_steps=total,
-    #         detail=detail
-    #     )
-    #
-    # def notify_extraction(
-    #     self,
-    #     message: str,
-    #     progress: int = 30,
-    #     current: int = 0,
-    #     total: int = 0,
-    #     detail: Optional[dict] = None
-    # ):
-    #     """通知数据提取进度"""
-    #     self._update_and_send(
-    #         stage=TaskStage.EXTRACTION,
-    #         message=message,
-    #         progress=progress,
-    #         current_step=current,
-    #         total_steps=total,
-    #         detail=detail
-    #     )
-    #
-    # def notify_generation(
-    #     self,
-    #     message: str,
-    #     progress: int = 60,
-    #     current: int = 0,
-    #     total: int = 0,
-    #     detail: Optional[dict] = None
-    # ):
-    #     """通知内容生成进度"""
-    #     self._update_and_send(
-    #         stage=TaskStage.GENERATION,
-    #         message=message,
-    #         progress=progress,
-    #         current_step=current,
-    #         total_steps=total,
-    #         detail=detail
-    #     )
-    #
-    # def notify_postprocessing(
-    #     self,
-    #     message: str,
-    #     progress: int = 90,
-    #     detail: Optional[dict] = None
-    # ):
-    #     """通知后处理进度"""
-    #     self._update_and_send(
-    #         stage=TaskStage.POSTPROCESSING,
-    #         message=message,
-    #         progress=progress,
-    #         detail=detail
-    #     )
     
     def notify_complete(self, result: dict, message: str = "生成完成"):
         """
@@ -713,47 +622,6 @@ class ProgressCallback:
         logger.error(f"任务失败通知已发送: {self.task_id} - {error}")
         _task_log_error(f"任务失败: {error}", task_id=self.task_id)
     
-    # def notify_custom(
-    #     self,
-    #     stage: str,
-    #     message: str,
-    #     progress: int,
-    #     current: int = 0,
-    #     total: int = 0,
-    #     detail: Optional[dict] = None
-    # ):
-    #     """
-    #     自定义进度通知
-    #
-    #     Args:
-    #         stage: 自定义阶段名称
-    #         message: 进度消息
-    #         progress: 进度百分比
-    #         current: 当前步骤
-    #         total: 总步骤
-    #         detail: 额外详情
-    #     """
-    #     # 尝试映射到标准阶段
-    #     stage_map = {
-    #         "pending": TaskStage.PENDING,
-    #         "preprocessing": TaskStage.PREPROCESSING,
-    #         "extraction": TaskStage.EXTRACTION,
-    #         "generation": TaskStage.GENERATION,
-    #         "postprocessing": TaskStage.POSTPROCESSING,
-    #         "completed": TaskStage.COMPLETED,
-    #         "failed": TaskStage.FAILED,
-    #     }
-    #
-    #     task_stage = stage_map.get(stage.lower(), TaskStage.GENERATION)
-    #
-    #     self._update_and_send(
-    #         stage=task_stage,
-    #         message=message,
-    #         progress=progress,
-    #         current_step=current,
-    #         total_steps=total,
-    #         detail=detail
-    #     )
     
     def update_single_tag_status(self, tag_id: str, status: str):
         """

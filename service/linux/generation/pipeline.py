@@ -27,7 +27,7 @@ from utils.tag_error_manager import (
     record_tag_error,
     is_tag_failed
 )
-
+from utils.ragflow_client import ragflow_client
 logger = logging.getLogger(__name__)
 
 
@@ -47,19 +47,25 @@ class CSRGenerationPipeline:
                  base_data_dir: str = "data/rtf&index",
                  cache_dir: str = "cache",
                  use_mock_services: bool = False,
-                 model_service=None):
+                 model_service=None,
+                 project_id:Optional[str] = None,
+                 project_name:Optional[str] = None):
         """
         初始化生成流水线
-        
+
         Args:
             config_path: 配置文件路径
             base_data_dir: 数据目录
             cache_dir: 缓存目录
             use_mock_services: 是否使用模拟服务
             model_service: 模型服务实例
+            project_id: 项目ID（用于回调标识）
+            project_name: 项目名称（用于RAGFlow知识库查找）
         """
         self.config_path = config_path
         self.use_mock_services = use_mock_services
+        self.project_id = project_id
+        self.project_name = project_name
 
         # 阶段回调钩子（由外部设置）
         self.on_extraction_completed = None  # 提取完毕回调
@@ -77,227 +83,6 @@ class CSRGenerationPipeline:
         self.paragraphs = self.config_parser.parse()
         logger.info(f"成功加载 {len(self.paragraphs)} 个段落配置")
 
-    # def generate_single_paragraph(self, paragraph_id: str) -> Dict[str, Any]:
-    #     """
-    #     生成单个段落内容
-    #
-    #     错误处理策略：
-    #     - 使用错误管理器跟踪标签状态
-    #     - 遇到错误时记录错误并标记失败
-    #     - 返回包含错误信息的结果
-    #
-    #     Args:
-    #         paragraph_id: 段落ID
-    #
-    #     Returns:
-    #         生成结果字典
-    #     """
-    #     # 获取错误管理器（单段落生成使用全局实例）
-    #     error_manager = get_error_manager()
-    #
-    #     # 开始处理标签
-    #     error_manager.start_tag(paragraph_id)
-    #
-    #     try:
-    #         # 查找指定段落
-    #         target_paragraph = None
-    #         for para in self.paragraphs:
-    #             if para.id == paragraph_id:
-    #                 target_paragraph = para
-    #                 break
-    #
-    #         if not target_paragraph:
-    #             record_tag_error(
-    #                 tag_id=paragraph_id,
-    #                 stage="initialization",
-    #                 error_type="NOT_FOUND",
-    #                 message=f"未找到段落ID: {paragraph_id}"
-    #             )
-    #             return {
-    #                 "paragraph_id": paragraph_id,
-    #                 "status": "error",
-    #                 "error_message": f"未找到段落ID: {paragraph_id}",
-    #                 "generated_content": ""
-    #             }
-    #
-    #         # 数据提取
-    #         error_manager.set_stage(paragraph_id, "extraction")
-    #         logger.info(f"开始提取段落 {paragraph_id} 的数据")
-    #         paragraph_dict = {
-    #             "id": target_paragraph.id,
-    #             "data": [
-    #                 {
-    #                     "extract": item.extract,
-    #                     "datas": item.datas,
-    #                     "insert_original": item.insert_original,
-    #                     "quote": item.quote  # 传递quote字段
-    #                 }
-    #                 for item in target_paragraph.data
-    #             ],
-    #             "generate": target_paragraph.generate,
-    #             "example": target_paragraph.example
-    #         }
-    #
-    #         extracted_data = self.data_extractor.extract_data_for_paragraph(paragraph_dict)
-    #
-    #         # 检查提取结果中是否有错误
-    #         extracted_items = extracted_data.get("extracted_items", [])
-    #         error_items = [item for item in extracted_items if item.get("status") == "error"]
-    #         if error_items:
-    #             first_error = error_items[0]
-    #             error_msg = first_error.get("error", "数据提取失败")
-    #             record_tag_error(
-    #                 tag_id=paragraph_id,
-    #                 stage="extraction",
-    #                 error_type="DATA_EXTRACTION_ERROR",
-    #                 message=error_msg,
-    #                 context={"failed_items": len(error_items), "total_items": len(extracted_items)}
-    #             )
-    #             return {
-    #                 "paragraph_id": paragraph_id,
-    #                 "status": "error",
-    #                 "error_message": error_msg,
-    #                 "generated_content": "",
-    #                 "extracted_data": extracted_data
-    #             }
-    #
-    #         # 设置生成阶段
-    #         error_manager.set_stage(paragraph_id, "generation")
-    #
-    #         # 内容生成或跳过生成（仅依据 generate 是否为空）
-    #         logger.info(f"开始生成段落 {paragraph_id} 的内容")
-    #         skipped_generation = False
-    #         generation_result = {}  # 初始化，避免后续引用报错
-    #         # 当且仅当 生成提示词为空 时跳过生成
-    #         if not (target_paragraph.generate or "").strip():
-    #             # ✅ 跳过生成：直接把提取的结果当做生成的结果使用
-    #             skipped_generation = True
-    #             parts: List[str] = []
-    #             tfl_placeholders: List[str] = []  # 收集TFL占位符（RTF/Excel原文模式）
-    #
-    #             for item in extracted_data.get("extracted_items", []):
-    #                 if item.get("status") == "success":
-    #                     content = item.get("content", "")
-    #
-    #                     # ✅ 直接使用提取内容（Word/PDF的content已包含{{Table_1_Start}}等占位符）
-    #                     if content:
-    #                         # 清理可能的调试信息（如 ## Source: xxx）
-    #                         import re
-    #                         cleaned_content = re.sub(r'^##\s*Source:.*$', '', content, flags=re.MULTILINE)
-    #                         # ✅ 清理模型可能幻觉出的无效占位符（如 {{ORIGINAL_CONTENT:...}}）
-    #                         cleaned_content = re.sub(r'\{\{ORIGINAL_CONTENT:[^}]*\}\}', '', cleaned_content)
-    #                         cleaned_content = cleaned_content.strip()
-    #                         if cleaned_content:
-    #                             parts.append(cleaned_content)
-    #
-    #                     # 收集TFL占位符（RTF/Excel原文模式）
-    #                     tfl_mappings = item.get("tfl_insert_mappings", [])
-    #                     for m in tfl_mappings:
-    #                         ph = m.get("Placeholder", "")
-    #                         if ph:
-    #                             tfl_placeholders.append(ph)
-    #
-    #             # 组合内容：提取的内容 + TFL占位符
-    #             all_parts = parts[:]
-    #             if tfl_placeholders:
-    #                 all_parts.extend(tfl_placeholders)
-    #
-    #             generated_content = "\n\n".join(all_parts).strip()
-    #             logger.info(f"✅ [跳过生成] 直接使用提取结果作为生成内容，共{len(parts)}个数据块")
-    #
-    #             if tfl_placeholders:
-    #                 logger.info(f"✅ [跳过生成] 包含{len(tfl_placeholders)}个TFL占位符")
-    #         else:
-    #             # 调用大模型生成内容
-    #             try:
-    #                 if self.use_mock_services:
-    #                     generated_content = f"[模拟生成] 段落 {paragraph_id} 的内容\n根据提取的数据和生成要求生成的内容..."
-    #                 else:
-    #                     # 使用段落生成服务
-    #                     generation_result = self.paragraph_generation_service.generate_paragraph(
-    #                         generate_prompt=target_paragraph.generate,
-    #                         extracted_data=extracted_data,
-    #                         example=target_paragraph.example,
-    #                         paragraph_id=target_paragraph.id
-    #                     )
-    #
-    #                     # 检查生成结果是否成功
-    #                     if not generation_result.get('success', True):
-    #                         error_msg = generation_result.get('error', '生成失败')
-    #                         record_tag_error(
-    #                             tag_id=paragraph_id,
-    #                             stage="generation",
-    #                             error_type="GENERATION_ERROR",
-    #                             message=error_msg,
-    #                             context={"generation_result": generation_result}
-    #                         )
-    #                         return {
-    #                             "paragraph_id": paragraph_id,
-    #                             "status": "error",
-    #                             "error_message": error_msg,
-    #                             "generated_content": "",
-    #                             "extracted_data": extracted_data
-    #                         }
-    #
-    #                     generated_content = generation_result.get('generated_content', '')
-    #             except Exception as gen_e:
-    #                 # 生成过程中遇到异常
-    #                 record_tag_error(
-    #                     tag_id=paragraph_id,
-    #                     stage="generation",
-    #                     error_type="GENERATION_EXCEPTION",
-    #                     message=str(gen_e),
-    #                     exception=gen_e,
-    #                     context={"paragraph_id": paragraph_id}
-    #                 )
-    #                 logger.error(f"生成段落 {paragraph_id} 异常: {gen_e}", exc_info=True)
-    #                 return {
-    #                     "paragraph_id": paragraph_id,
-    #                     "status": "error",
-    #                     "error_message": str(gen_e),
-    #                     "generated_content": "",
-    #                     "extracted_data": extracted_data
-    #                 }
-    #
-    #         # 标记标签成功
-    #         error_manager.mark_success(paragraph_id)
-    #
-    #         # ✅ 收集溯源信息
-    #         return {
-    #             "paragraph_id": paragraph_id,
-    #             "status": "success",
-    #             "generated_content": generated_content,
-    #             "extracted_data": extracted_data,
-    #             "generation_input": {
-    #                 "generate_prompt": target_paragraph.generate,
-    #                 "example": target_paragraph.example
-    #             },
-    #             "skipped_generation": skipped_generation,
-    #             # ✅ 溯源信息
-    #             "extraction_traceability": extracted_data.get('traceability', {}),
-    #             "generation_traceability": generation_result.get('traceability', {}) if not skipped_generation else {}
-    #         }
-    #
-    #     except Exception as e:
-    #         # 记录错误并标记标签失败
-    #         record_tag_error(
-    #             tag_id=paragraph_id,
-    #             stage="unknown",
-    #             error_type="UNEXPECTED_ERROR",
-    #             message=str(e),
-    #             exception=e,
-    #             context={"paragraph_id": paragraph_id}
-    #         )
-    #         logger.error(f"生成段落 {paragraph_id} 失败: {e}", exc_info=True)
-    #         task_logger = get_task_logger()
-    #         if task_logger:
-    #             task_logger.error(f"生成段落 {paragraph_id} 失败", exc=e, paragraph_id=paragraph_id)
-    #         return {
-    #             "paragraph_id": paragraph_id,
-    #             "status": "error",
-    #             "error_message": str(e),
-    #             "generated_content": ""
-    #         }
 
     def generate_all_paragraphs(self) -> List[Dict[str, Any]]:
         """
@@ -362,14 +147,75 @@ class CSRGenerationPipeline:
                 # 构建data items并从preprocessed.json中enrichment元数据
                 enriched_data = []
                 for item in para.data:
-                    # ✅ 关键：在enrichment前就包含quote字段
+                    # ✅ 关键：在enrichment前就包含所有溯源字段
                     data_item = {
                         "extract": item.extract,
                         "datas": item.datas,
                         "original_mode": item.original_mode,
-                        "insert_original":item.insert_original,
-                        "quote": getattr(item, "quote", None)  # 从DataItem对象读取quote属性
+                        "insert_original": item.insert_original,
+                        "quote": getattr(item, "quote", None),  # 从DataItem对象读取quote属性
+                        "file_name": item.file_name,
+                        "item_id": item.item_id,                # 资料编号
+                        "directory": item.directory,            # 来源目录
                     }
+                    # 1. 先获取 dataset_id，判断知识库是否存在
+                    dataset_id = None
+                    file_names_for_rag = item.file_name or []  # ✅ 安全处理 None
+                    if self.project_name:
+                        dataset_id = ragflow_client.get_dataset_id(self.project_name)
+                        if dataset_id:
+                            logger.info(f"📌 找到知识库 ID: {dataset_id}")
+                        else:
+                            logger.info(f"📌 未找到知识库: {self.project_name}")
+
+                    # 2. 批量获取 document_ids
+                    rag_file_ids = []
+                    if dataset_id and file_names_for_rag:
+                        logger.info(f"📌 批量获取 document_ids...")
+                        logger.info(f"   - file_name: {file_names_for_rag}")
+                        logger.info(f"   - project_name: {self.project_name}")
+                        rag_file_ids = ragflow_client.get_document_ids_batch(file_names_for_rag, self.project_name)
+
+                    # 3. 保存文件名到 document_id 的映射，供后续 per-file 检索使用
+                    if rag_file_ids:
+                        # 构建 file_name -> document_id 映射
+                        file_to_doc_id = {}
+                        for idx, fn in enumerate(file_names_for_rag):
+                            if idx < len(rag_file_ids):
+                                file_to_doc_id[fn] = rag_file_ids[idx]
+
+                        data_item["rag_file_to_doc_id"] = file_to_doc_id
+                        data_item["rag_question"] = item.extract
+                        data_item["rag_dataset_id"] = dataset_id
+                        logger.info(f"📌 设置 RAGFlow 映射: {file_to_doc_id}")
+
+                    # 建立预处理文件 ID(datas) -> 原始文件名(file_name) 的映射
+                    # 用于在 _build_doc_structure 中查找 RAGFlow document_id
+                    if item.datas:
+                        preprocessed_to_original = {}
+                        for idx, data_entry in enumerate(item.datas):
+                            pp_id = None
+                            original_name = None
+                            if isinstance(data_entry, dict):
+                                # 格式1：datas 数组元素是字典，包含 fileId 和 fileName
+                                pp_id = data_entry.get("fileId") or data_entry.get("file", "")
+                                original_name = data_entry.get("fileName") or data_entry.get("file_name", "")
+                            else:
+                                # 格式2：datas 是字符串（fileId），从 item.file_name 获取对应文件名
+                                pp_id = data_entry
+                                if item.file_name and idx < len(item.file_name):
+                                    original_name = item.file_name[idx]
+
+                            if pp_id and original_name:
+                                preprocessed_to_original[pp_id] = original_name
+
+                        if preprocessed_to_original:
+                            data_item["preprocessed_to_original"] = preprocessed_to_original
+                            logger.info(f"📌 设置预处理ID映射: {preprocessed_to_original}")
+
+                    if self.project_id:
+                        data_item["project_id"] = self.project_id
+
 
                     # Enrichment: 从preprocessed.json读取file_type, chunks_file等
                     # enrichment会保留data_item中已有的quote字段
@@ -378,7 +224,6 @@ class CSRGenerationPipeline:
                         if enriched:
                             data_item.update(enriched)  # 合并enriched数据，不覆盖已有的quote
                     except Exception as e:
-                        import traceback
                         traceback.print_exc()
                         logger.warning(f"Enrichment失败: {e}")
 
@@ -403,11 +248,12 @@ class CSRGenerationPipeline:
                     # 有数据项提取失败，记录错误并标记标签失败
                     first_error = error_items[0]
                     error_msg = first_error.get("error", "数据提取失败")
+                    actual_error_type = first_error.get("error_type", "DATA_EXTRACT_ERROR")
                     stack_trace = first_error.get("stack_trace", "")
                     record_tag_error(
                         tag_id=paragraph_id,
                         stage="extraction",
-                        error_type="DATA_EXTRACTION_ERROR",
+                        error_type=actual_error_type,
                         message=f"数据提取失败: {error_msg}",
                         context={
                             "failed_items": len(error_items),
@@ -425,10 +271,9 @@ class CSRGenerationPipeline:
                 return result
 
             except Exception as e:
-                import traceback
                 traceback.print_exc()
                 stack_trace = traceback.format_exc()
-                print(stack_trace)
+                logger.warning(stack_trace)
                 # 提取过程中遇到异常，记录错误并标记标签失败
                 record_tag_error(
                     tag_id=paragraph_id,
@@ -522,10 +367,9 @@ class CSRGenerationPipeline:
                     try:
                         extracted = future.result()
                     except Exception as e:
-                        import traceback
                         traceback.print_exc()
                         stack_trace = traceback.format_exc()
-                        print(stack_trace)
+                        logger.warning(stack_trace)
                         # ✅ 修复：并发执行异常时也要标记标签失败
                         record_tag_error(
                             tag_id=para.id,
@@ -554,7 +398,6 @@ class CSRGenerationPipeline:
             try:
                 self.on_extraction_completed()
             except Exception as e:
-                import traceback
                 traceback.print_exc()
                 logger.warning(f"提取完毕回调执行失败: {e}")
 
@@ -564,7 +407,6 @@ class CSRGenerationPipeline:
             try:
                 self.on_generation_started()
             except Exception as e:
-                import traceback
                 traceback.print_exc()
                 logger.warning(f"开始生成回调执行失败: {e}")
 
@@ -598,7 +440,7 @@ class CSRGenerationPipeline:
             }
 
             # 仅依据 generate 是否为空判断是否跳过
-            if not (para.generate or "").strip():
+            if not (para.generate or "").strip() and not para.is_table:
                 parts: List[str] = []
                 tfl_placeholders: List[str] = []  # 收集TFL占位符（RTF/Excel原文模式）
                 placeholders_to_insert: List[str] = []  # 收集要插入的占位符
@@ -650,11 +492,6 @@ class CSRGenerationPipeline:
                         # TFL占位符
                         all_parts.extend(tfl_placeholders)
                         logger.info(f"✅ 已附加{len(tfl_placeholders)}个TFL占位符到段落末尾: {tfl_placeholders}")
-                    # word 可以提取到表格占位符，不需要手动添加
-                    # if placeholders_to_insert:
-                    #     # 图表占位符
-                    #     all_parts.extend(placeholders_to_insert)
-                    #     logger.info(f"✅ 已附加{len(placeholders_to_insert)}个图表占位符到段落末尾: {placeholders_to_insert}")
 
 
                 generated_content = "\n\n".join(all_parts).strip()
@@ -691,7 +528,6 @@ class CSRGenerationPipeline:
                             "content_preview": preview,
                         })
                 except Exception as e:
-                    import traceback
                     traceback.print_exc()
                     pass
 
@@ -724,13 +560,15 @@ class CSRGenerationPipeline:
                             extracted_data=extracted_data,
                             insert_original=para.insert_original,
                             example=para.example,
-                            paragraph_id=para.id
+                            paragraph_id=para.id,
+                            is_table=para.is_table,
+                            html=para.html
                         )
 
                         # 检查生成结果是否成功
                         if not generation_result.get('success', True):
                             stack_trace = traceback.format_exc()
-                            print(stack_trace)
+                            logger.warning(stack_trace)
                             error_msg = generation_result.get('error', '生成失败')
                             record_tag_error(
                                 tag_id=paragraph_id,
@@ -749,11 +587,10 @@ class CSRGenerationPipeline:
 
                         generated_content = generation_result.get('generated_content', '')
                 except Exception as e:
-                    import traceback
                     traceback.print_exc()
                     # 生成过程中遇到异常，记录错误并标记标签失败
                     stack_trace = traceback.format_exc()
-                    print(stack_trace)
+                    logger.warning(stack_trace)
                     record_tag_error(
                         tag_id=paragraph_id,
                         stage="generation",
@@ -798,7 +635,6 @@ class CSRGenerationPipeline:
                             "content_preview": preview,
                         })
                 except Exception as  e:
-                    import traceback
                     traceback.print_exc()
                     pass
 
@@ -881,10 +717,9 @@ class CSRGenerationPipeline:
                     try:
                         res = future.result()
                     except Exception as e:
-                        import traceback
                         traceback.print_exc()
                         stack_trace = traceback.format_exc()
-                        print(stack_trace)
+                        logger.warning(stack_trace)
                         # ✅ 修复：并发执行异常时也要标记标签失败
                         record_tag_error(
                             tag_id=para.id,
@@ -931,32 +766,6 @@ class CSRGenerationPipeline:
         """
         logger.debug("skip saving extracted data to standalone file; unified output manager will handle run summary")
 
-    # def generate_paragraphs_by_ids(self, paragraph_ids: List[str]) -> List[Dict[str, Any]]:
-    #     """
-    #     根据段落ID列表生成指定段落
-    #
-    #     Args:
-    #         paragraph_ids: 段落ID列表
-    #
-    #     Returns:
-    #         指定段落的生成结果列表
-    #     """
-    #     results = []
-    #
-    #     for paragraph_id in paragraph_ids:
-    #         logger.info(f"处理指定段落: {paragraph_id}")
-    #         result = self.generate_single_paragraph(paragraph_id)
-    #         results.append(result)
-    #
-    #     return results
-    #
-    # def save_results(self, results: List[Dict[str, Any]], output_path: str = "output/generated_paragraphs.txt"):
-    #     """
-    #     保留接口（不再单独落盘文本文件）。
-    #     统一由上层流程在一次运行结束时集中保存。
-    #     """
-    #     logger.debug("skip saving generated paragraphs to standalone text; unified output manager will handle run summary")
-    #
     def get_paragraph_list(self) -> List[Dict[str, Any]]:
         """
         获取所有段落的列表信息
@@ -1117,11 +926,9 @@ class CSRGenerationPipeline:
                         matched_files.append((file_name, local_pp, pp_data))
                         found_file_names.add(file_name)  # ✅ 记录已找到
                     except Exception as _e:
-                        import traceback
                         traceback.print_exc()
                         logger.debug(f"读取preprocessed.json失败(file_mappings): {_e}")
         except Exception as e:
-            import traceback
             traceback.print_exc()
             logger.debug(f"读取file_mappings失败: {e}")
 
@@ -1151,7 +958,6 @@ class CSRGenerationPipeline:
                                 matched_files.append((file_name, preprocessed_file, pp_data))
                                 continue
                             except Exception as e:
-                                import traceback
                                 traceback.print_exc()
                                 logger.warning(f"读取preprocessed.json失败: {e}")
 
@@ -1193,7 +999,6 @@ class CSRGenerationPipeline:
                             break
 
                     except Exception as e:
-                        import traceback
                         traceback.print_exc()
                         logger.warning(f"读取preprocessed.json失败: {e}")
                         continue
@@ -1217,7 +1022,6 @@ class CSRGenerationPipeline:
                             break
 
                     except Exception as e:
-                        import traceback
                         traceback.print_exc()
                         logger.debug(f"读取preprocessed.json失败: {e}")
                         continue
@@ -1225,31 +1029,6 @@ class CSRGenerationPipeline:
         if not matched_files:
             logger.warning(f"❌ 未找到匹配的预处理文件: {file_names}")
             return None
-
-        # 收集所有匹配的预处理结果
-        # matched_files = []
-
-        # for file_name in file_names:
-        #     for preprocessed_file in Path(getattr(self.data_extractor, 'base_data_dir', 'AAA/Preprocessing')).rglob('preprocessed.json'):
-        #         try:
-        #             with open(preprocessed_file, 'r', encoding='utf-8') as f:
-        #                 pp_data = json.load(f)
-        #             
-        #             source_file = pp_data.get('source_file', '')
-        #             
-        #             # 检查source_file是否匹配file_name
-        #             if Path(source_file).name == file_name or file_name in source_file:
-        #                 logger.info(f"✓ 找到匹配: {file_name} -> {preprocessed_file.parent.name}")
-        #                 matched_files.append((file_name, preprocessed_file, pp_data))
-        #                 break
-
-        #         except Exception as e:
-        #             logger.debug(f"读取preprocessed.json失败: {e}")
-        #             continue
-
-        # if not matched_files:
-        #     logger.warning(f"❌ 未找到匹配的预处理文件: {file_names}")
-        #     return None
 
         # 分类：Word/PDF vs Excel/RTF
         doc_files = []  # Word/PDF
@@ -1267,34 +1046,10 @@ class CSRGenerationPipeline:
         if doc_files:
             return self._build_doc_structure(doc_files, Path('AAA/Preprocessing'), original_data_item=data_item)
         elif table_files:
-            return self._build_table_structure(table_files, Path('AAA/Preprocessing'))
+            return self._build_table_structure(table_files, Path('AAA/Preprocessing'), original_data_item=data_item)
         else:
             return None
 
-    # def _merge_preprocessing_results(self, matched_files: List, base_dir: Path) -> Dict[str, Any]:
-    #     """
-    #     合并多个预处理结果
-    #     """
-    #     # 分类：Word/PDF vs Excel/RTF
-    #     doc_files = []  # Word/PDF
-    #     table_files = []  # Excel/RTF
-    #
-    #     for file_name, preprocessed_file, pp_data in matched_files:
-    #         file_type = pp_data.get('file_type', '').lower()
-    #
-    #         if file_type in ['word', 'doc', 'docx', 'pdf']:
-    #             doc_files.append((file_name, preprocessed_file, pp_data))
-    #         elif file_type in ['excel', 'xlsx', 'rtf']:
-    #             table_files.append((file_name, preprocessed_file, pp_data))
-    #
-    #     # 根据文件类型构建不同的结构
-    #     if doc_files:
-    #         return self._build_doc_structure(doc_files, base_dir)
-    #     elif table_files:
-    #         return self._build_table_structure(table_files, base_dir)
-    #     else:
-    #         return None
-    #
     def _build_doc_structure(self, doc_files: List, base_dir: Path, original_data_item: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         构建Word/PDF文件的数据结构
@@ -1305,6 +1060,7 @@ class CSRGenerationPipeline:
         all_regions = []
         source_files = []
         available_resources = []  # ✅ 新增：可用的资源（表格/图片）
+        per_file_ragflow_list = []  # ✅ 新增：收集每个文件的 RAGFlow 内容
 
         for file_name, preprocessed_file, pp_data in doc_files:
             # 收集chunks_file
@@ -1366,9 +1122,18 @@ class CSRGenerationPipeline:
                         norm_path = str(Path('AAA') / rel)
                     except Exception:
                         norm_path = str(chunks_path.absolute())
-                    chunks_file_list.append(norm_path)
-                    source_files.append(pp_data.get('source_file', file_name))
-                    logger.info(f"  ✓ 添加chunks文件: {norm_path}")
+                    # 改为字典结构，携带 fileId 和原始文件名信息
+                    file_id = preprocessed_file.parent.name  # 预处理目录名就是 fileId
+                    # 使用 preprocessed_to_original 映射将 fileId 转换为原始文件名
+                    preprocessed_to_original = original_data_item.get("preprocessed_to_original", {}) if original_data_item else {}
+                    original_file_name = preprocessed_to_original.get(file_name, file_name)  # file_name 可能是 fileId，需要转换
+                    chunks_file_list.append({
+                        "chunks_path": norm_path,
+                        "file_id": file_id,
+                        "original_file_name": original_file_name  # 真正的原始文件名
+                    })
+                    source_files.append(pp_data.get('source_file', original_file_name))
+                    logger.info(f"  ✓ 添加chunks文件: {norm_path}, fileId: {file_id}, original_file_name: {original_file_name}")
                 else:
                     logger.warning(f"  ❌ chunks文件不存在: {chunks_path}")
             else:
@@ -1405,7 +1170,6 @@ class CSRGenerationPipeline:
                                 if candidate.exists():
                                     full_path = candidate
                         except Exception as e:
-                            import traceback
                             traceback.print_exc()
                             pass
 
@@ -1437,7 +1201,6 @@ class CSRGenerationPipeline:
                                 try:
                                     logger.info(f"  ✓ 使用回退路径: {candidate.relative_to(Path.cwd())}")
                                 except Exception as e:
-                                    import traceback
                                     traceback.print_exc()
                                     logger.info(f"  ✓ 使用回退路径: {candidate}")
 
@@ -1447,7 +1210,6 @@ class CSRGenerationPipeline:
                                 rel = full_path.absolute().resolve().relative_to(aaa_base)
                                 res_path = str(Path('AAA') / rel)
                             except Exception as e:
-                                import traceback
                                 traceback.print_exc()
                                 res_path = str(full_path.absolute())
                             available_resources.append({
@@ -1475,6 +1237,31 @@ class CSRGenerationPipeline:
                         'regions': str(regions_dir)
                     })
 
+            # Per-file RAGFlow 检索：使用 preprocessed_to_original 映射获取原始文件名
+            # 然后用原始文件名查找 rag_file_to_doc_id 映射获取 document_id
+            preprocessed_to_original = original_data_item.get("preprocessed_to_original", {}) if original_data_item else {}
+            original_file_name = preprocessed_to_original.get(file_name, "")  # file_name 是预处理文件 ID
+            if not original_file_name:
+                # 回退：尝试从 source_file 获取（可能仍是预处理文件 ID）
+                source_file_name = pp_data.get('source_file', '')
+                original_file_name = Path(source_file_name).name if source_file_name else file_name
+
+            per_file_rag = self._retrieve_ragflow_for_file(
+                file_to_doc_id=original_data_item.get("rag_file_to_doc_id", {}) if original_data_item else {},
+                file_name=original_file_name,
+                question=original_data_item.get("rag_question", "") if original_data_item else "",
+                dataset_id=original_data_item.get("rag_dataset_id", "") if original_data_item else ""
+            )
+            if per_file_rag:
+                # 同时记录预处理文件 ID（用于匹配）和原始文件名（用于显示）
+                per_file_ragflow_list.append({
+                    "file_name": original_file_name,
+                    "preprocessed_file_id": file_name,  # 预处理文件 ID，用于匹配 chunks_file 的父目录名
+                    "ragflow_content": per_file_rag.get("marked_content", ""),  # 用于 LLM生成
+                    "ragflow_chunks": per_file_rag.get("chunks", [])  # 用于溯源
+                })
+                logger.info(f"  ✓ RAGFlow 检索成功: {original_file_name} (ID: {file_name}), {len(per_file_rag.get('chunks', []))} 个分块")
+
         if not chunks_file_list:
             logger.warning("❌ 未找到任何chunks文件")
             return None
@@ -1487,7 +1274,11 @@ class CSRGenerationPipeline:
             'available_resources': available_resources  # ✅ 新增：可用的资源列表
         }
 
-        # ✅ 保留原始data_item的关键字段（extract, original_mode, quote）
+        # 附加 per-file RAGFlow 内容列表
+        if per_file_ragflow_list:
+            enriched['per_file_ragflow_list'] = per_file_ragflow_list
+
+        # 保留原始data_item的关键字段（extract, original_mode, quote, file_name）
         if original_data_item:
             if 'extract' in original_data_item:
                 enriched['extract'] = original_data_item['extract']
@@ -1495,7 +1286,12 @@ class CSRGenerationPipeline:
                 enriched['original_mode'] = original_data_item['original_mode']
             if 'quote' in original_data_item:
                 enriched['quote'] = original_data_item['quote']
-                logger.info(f"✅ Enrichment保留quote字段: {original_data_item['quote']}")
+            # 传递 file_name 字段，用于构建 scheme_data
+            if 'file_name' in original_data_item:
+                enriched['file_name'] = original_data_item['file_name']
+            # 传递 fileId -> 原始文件名的映射，用于建立 per_file_contents
+            if 'preprocessed_to_original' in original_data_item:
+                enriched['preprocessed_to_original'] = original_data_item['preprocessed_to_original']
 
         # 添加regions信息（保留旧字段兼容性）
         if all_regions:
@@ -1505,22 +1301,21 @@ class CSRGenerationPipeline:
                 enriched['regions'] = all_regions  # 多个返回数组
 
         logger.info(f"✓ 构建文档结构: {len(chunks_file_list)} 个chunks文件, {len(available_resources)} 个可用资源")
-        import json
-        logger.info(f"  Enriched结果: {json.dumps(enriched, ensure_ascii=False, indent=2)}")
         return enriched
 
-    def _build_table_structure(self, table_files: List, base_dir: Path) -> Dict[str, Any]:
+    def _build_table_structure(self, table_files: List, base_dir: Path, original_data_item: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         构建Excel/RTF文件的数据结构
-        
+
         data_extractor期望的结构：
         - markdown_files: 文件列表 (List[str])
         - source_file: 字符串(单文件) 或 列表(多文件)
         """
 
-        all_markdown_files = []
+        # 改为字典结构，按目录组织，携带 file_id 和原始文件名
+        markdown_file_groups = []
         source_files_list = []
-        processed_dirs = set()  # ✅ 记录已处理的目录，避免重复
+        processed_dirs = set()
 
         for file_name, preprocessed_file, pp_data in table_files:
             # Excel: 查找所有markdown文件
@@ -1528,17 +1323,18 @@ class CSRGenerationPipeline:
             if not markdown_dir.exists():
                 markdown_dir = preprocessed_file.parent / 'markdown'
 
-            # ✅ 跳过已处理的目录
+            # 跳过已处理的目录
             dir_key = str(markdown_dir.absolute().resolve()) if markdown_dir.exists() else None
             if dir_key and dir_key in processed_dirs:
                 logger.debug(f"跳过已处理的目录: {markdown_dir}")
                 continue
 
             if markdown_dir.exists():
-                processed_dirs.add(dir_key)  # ✅ 标记为已处理
+                processed_dirs.add(dir_key)
 
                 # 获取目录中所有.md文件
                 md_files = list(markdown_dir.glob('*.md'))
+                md_file_paths = []
                 for md_file in md_files:
                     try:
                         aaa_base = Path.cwd() / 'AAA'
@@ -1546,23 +1342,35 @@ class CSRGenerationPipeline:
                         md_norm = str(Path('AAA') / rel)
                     except Exception:
                         md_norm = str(md_file)
-                    all_markdown_files.append(md_norm)
+                    md_file_paths.append(md_norm)
 
-                logger.info(f"找到 {len(md_files)} 个markdown文件: {file_name}")
+                # 构建字典结构，携带 file_id 和原始文件名
+                file_id = preprocessed_file.parent.name  # 预处理目录名就是 fileId
+                # 使用 preprocessed_to_original 映射将 fileId 转换为原始文件名
+                preprocessed_to_original = original_data_item.get("preprocessed_to_original", {}) if original_data_item else {}
+                original_file_name = preprocessed_to_original.get(file_name, file_name)  # file_name 可能是 fileId，需要转换
+                markdown_file_groups.append({
+                    "markdown_dir": str(markdown_dir),
+                    "markdown_files": md_file_paths,
+                    "file_id": file_id,
+                    "original_file_name": original_file_name  # 真正的原始文件名
+                })
 
-            # 添加source_file（✅ 也需要去重）
+                logger.info(f"找到 {len(md_files)} 个markdown文件: {original_file_name}, fileId: {file_id}")
+
+            # 添加source_file
             source_file = pp_data.get('source_file', '')
             if source_file and source_file not in source_files_list:
                 source_files_list.append(source_file)
 
-        if not all_markdown_files:
+        if not markdown_file_groups:
             logger.warning("❌ 未找到任何markdown文件")
             return None
 
         # 构建返回结构
         enriched = {
             'file_type': table_files[0][2].get('file_type', 'excel'),
-            'markdown_files': all_markdown_files,  # 文件列表，不是目录
+            'markdown_files': markdown_file_groups,  # 字典结构列表
         }
 
         # source_file: 单个返回字符串，多个返回列表
@@ -1571,8 +1379,72 @@ class CSRGenerationPipeline:
         else:
             enriched['source_file'] = source_files_list
 
-        logger.info(f"✓ 构建表格结构: {len(all_markdown_files)} markdown文件")
+        # 保留原始 data_item 中的关键字段
+        if original_data_item:
+            if original_data_item.get('project_id'):
+                enriched['project_id'] = original_data_item['project_id']
+            # 传递 file_name 字段，用于构建 scheme_data
+            if 'file_name' in original_data_item:
+                enriched['file_name'] = original_data_item['file_name']
+            if 'extract' in original_data_item:
+                enriched['extract'] = original_data_item['extract']
+            if 'original_mode' in original_data_item:
+                enriched['original_mode'] = original_data_item['original_mode']
+            if 'quote' in original_data_item:
+                enriched['quote'] = original_data_item['quote']
+
+        logger.info(f"✓ 构建表格结构: {len(markdown_file_groups)} 个文件组")
         return enriched
+
+    def _retrieve_ragflow_for_file(self, file_to_doc_id: Dict[str, str], file_name: str,
+                                    question: str, dataset_id: str) -> Dict[str, Any]:
+        """
+        为单个文件执行 RAGFlow 检索
+
+        Args:
+            file_to_doc_id: 文件名 -> RAGFlow document_id 映射
+            file_name: 当前文件名
+            question: 检索问题（即 extract 提示词）
+            dataset_id: 知识库 ID
+
+        Returns:
+            {
+                "marked_content": str,  # 标记后的 RAGFlow 分块文本（用于 LLM）
+                "chunks": List[Dict],   # 原始分块列表（用于溯源）
+            }
+            失败返回 None
+        """
+        doc_id = file_to_doc_id.get(file_name)
+        if not doc_id:
+            logger.debug(f"文件 {file_name} 无对应的 RAGFlow document_id")
+            return None
+        if not question or not dataset_id:
+            return None
+
+        try:
+            # 获取 10 个 RAGFlow 分块
+            chunks = ragflow_client.retrieve(
+                document_ids=[doc_id],
+                question=question,
+                dataset_id=dataset_id,
+                page_size=10
+            )
+            if not chunks:
+                return None
+
+            marked_parts = []
+            for chunk in chunks:
+                cid = chunk.get('chunk_id', 'unknown')
+                content = chunk.get('content', '')
+                marked_parts.append(f"【RAGFlow分块-{cid}】\n{content}")
+
+            return {
+                "marked_content": "\n\n".join(marked_parts),  # 用于 LLM
+                "chunks": chunks  # 用于溯源
+            }
+        except Exception as e:
+            logger.warning(f"RAGFlow 单文件检索失败: {file_name} - {e}")
+            return None
 
     def _enrich_by_type(self, data_item: Dict[str, Any], item_type: str) -> Optional[Dict[str, Any]]:
         """
@@ -1673,7 +1545,6 @@ class CSRGenerationPipeline:
                             f"找到匹配的preprocessed.json: {preprocessed_file.parent.name}, file_type={file_type}")
 
                 except Exception as e:
-                    import traceback
                     traceback.print_exc()
                     logger.debug(f"读取preprocessed.json失败 ({preprocessed_file}): {e}")
                     continue
@@ -1700,7 +1571,6 @@ class CSRGenerationPipeline:
             return None
 
         except Exception as e:
-            import traceback
             traceback.print_exc()
             logger.error(f"Enrichment过程异常: {e}", exc_info=True)
             return None
@@ -1744,50 +1614,14 @@ class CSRGenerationPipeline:
             line = re.sub(r'!\[.*?\]\(.*?\)', '', line)
             # 去除标题开头的#（保留#后面的内容）
             line = re.sub(r'^#+\s*', '', line)
+            #去除加粗格式(**text** 或 __text__)
+            line = re.sub(r'\*\*(.+?)\*\*', r'\1', line)
+            line = re.sub(r'__(.+?)__', r'\1', line)
             # 如果处理后的行不为空（去除空白字符后），添加到结果中
             if line.strip():
                 result_lines.append(line)
+        after_text = '\n'.join(result_lines)
+        logger.info(
+            f"去除MD格式，处理前字数: {len(text)}, 处理后字数: {len(after_text)}")
+        return after_text
 
-        return '\n'.join(result_lines)
-
-# def main():
-#     """测试完整流水线"""
-#     import sys
-#     import os
-#     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-#
-#     # 设置日志
-#     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-#
-#     try:
-#         # 创建流水线
-#         pipeline = CSRGenerationPipeline(use_mock_services=True)
-#
-#         # 显示段落列表
-#         logging.info("=== 可用段落列表 ===")
-#         paragraphs = pipeline.get_paragraph_list()
-#         for para in paragraphs:
-#             logging.info(f"ID: {para['id']}")
-#             logging.info(f"  生成要求: {para['generate']}")
-#             logging.info(f"  示例: {para['example']}")
-#             logging.info(f"  数据项数量: {para['data_count']}")
-#             logging.info("")
-#
-#         # 测试生成第一个段落
-#         if paragraphs:
-#             first_para_id = paragraphs[0]['id']
-#             logging.info(f"=== 测试生成段落: {first_para_id} ===")
-#             result = pipeline.generate_single_paragraph(first_para_id)
-#
-#             logging.info(f"生成状态: {result['status']}")
-#             if result['status'] == 'success':
-#                 logging.info(f"生成内容: {result['generated_content'][:200]}...")
-#             else:
-#                 logging.error(f"错误信息: {result.get('error_message')}")
-#
-#     except Exception:
-#         logging.exception("测试失败")
-#
-#
-# if __name__ == "__main__":
-#     main()

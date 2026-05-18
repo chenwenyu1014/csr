@@ -53,6 +53,16 @@
         "md_file": "../generation/paragraph.md"
       },
       "variables": ["generate_prompt", "scheme_data", "example", "project_desc"]
+    },
+    "csr_generation_table": {
+      "name": "CSR表格生成提示词模板",
+      "description": "用于根据提取数据生成CSR表格的提示词模板",
+      "usage": "CSR表格生成",
+      "used_by": ["ContentGenerator"],
+      "template": {
+        "md_file": "../generation/table.md"
+      },
+      "variables": ["generate_prompt", "scheme_data", "html","example", "project_desc"]
     }
     ,
     "data_source_validation": {
