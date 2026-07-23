@@ -48,7 +48,7 @@ class TemplateMarker:
     END_MARKER_PATTERN = re.compile(r'^\{\{(TemplateTable|Image)_(\d+)_End\}\}$')
 
     # 标题最大长度
-    MAX_TITLE_LENGTH = 50
+    MAX_TITLE_LENGTH = 20
 
     # 默认标题
     DEFAULT_TITLE = "无标题表格"

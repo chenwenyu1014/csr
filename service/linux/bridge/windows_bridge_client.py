@@ -134,7 +134,9 @@ class WindowsBridgeClient:
             logger.warning(f"读取文件失败 {file_path}: {e}")
             return None
 
-    def insert_content(
+    # # ============================================================
+    # # 内容插入方法（同步）
+    # # ============================================================
     
     def insert_content(
         self,
@@ -177,6 +179,49 @@ class WindowsBridgeClient:
             logger.error(f"[同步] insert_content 调用失败: {e}")
             return {"success": False, "error": str(e)}
     
+    def convert_doc_to_docx(
+        self,
+        doc_path: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        通过 Windows 端 Word COM 将文档重存为过渡格式(Transitional).docx（无损保真）。
+
+        - .doc 输入：在源文件同目录产出同名 .docx（源 .doc 保留）。
+        - .docx 输入：原地规范化 严格格式(Strict)OOXML → 过渡格式。
+
+        Args:
+            doc_path: .doc 或 .docx 文件路径（相对于 AAA 目录）
+
+        Returns:
+            结果字典：成功 {"success": True, "docx_path": ..., "docx_abs_path": ...}；
+            失败 {"success": False, "error": ...}；未配置返回 None。
+        """
+        if not self.is_configured():
+            logger.warning("WindowsBridge未配置")
+            return None
+
+        url = f"{self.base_url}/api/v1/document/doc-to-docx"
+        data = {"doc_path": doc_path}
+
+        try:
+            logger.info(f"[同步] Word COM 重存为过渡格式: {doc_path}")
+            resp = requests.post(url, data=data, timeout=self.timeout, headers=self._headers())
+
+            if resp.status_code == 200:
+                result = resp.json()
+                if result.get("success"):
+                    logger.info("[同步] Word COM 重存成功")
+                else:
+                    logger.warning(f"[同步] Word COM 重存失败: {result.get('error')}")
+                return result
+            else:
+                error_text = resp.text[:200] if resp.text else ""
+                logger.warning(f"[同步] convert_doc_to_docx 失败: {resp.status_code} {error_text}")
+                return {"success": False, "error": f"HTTP {resp.status_code}: {error_text}"}
+        except Exception as e:
+            logger.error(f"[同步] convert_doc_to_docx 调用失败: {e}")
+            return {"success": False, "error": str(e)}
+
     # ============================================================
     # 异步方法
     # ============================================================
@@ -187,51 +232,6 @@ class WindowsBridgeClient:
             raise RuntimeError("aiohttp未安装，请运行: pip install aiohttp")
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         return aiohttp.ClientSession(timeout=timeout)
-    
-    async def clean_document_async(
-        self,
-        file_path: str,
-        output_path: Optional[str] = None,
-        remove_first_line: bool = True,
-        remove_content_controls: bool = True
-    ) -> Optional[Dict[str, Any]]:
-        """
-        异步清理Word文档
-        
-        Args:
-            file_path: 文件路径
-            output_path: 输出路径（可选）
-            remove_first_line: 是否删除首行
-            remove_content_controls: 是否清理控件
-        """
-        if not self.is_configured():
-            logger.warning("WindowsBridge未配置")
-            return None
-        
-        url = f"{self.base_url}/api/v1/document/clean"
-        data = {
-            "file_path": file_path,
-            "remove_first_line": str(remove_first_line).lower(),
-            "remove_content_controls": str(remove_content_controls).lower(),
-        }
-        if output_path:
-            data["output_path"] = output_path
-        
-        try:
-            logger.info(f"[异步] 清理文档: {file_path}")
-            async with await self._get_aiohttp_session() as session:
-                async with session.post(url, data=data, headers=self._async_headers()) as resp:
-                    if resp.status == 200:
-                        result = await resp.json()
-                        logger.info(f"[异步] 文档清理成功")
-                        return result
-                    else:
-                        text = await resp.text()
-                        logger.warning(f"[异步] clean_document 失败: {resp.status} {text[:200]}")
-                        return {"success": False, "error": f"HTTP {resp.status}: {text[:200]}"}
-        except Exception as e:
-            logger.error(f"[异步] clean_document 调用失败: {e}")
-            return {"success": False, "error": str(e)}
     
     async def insert_content_async(
         self,

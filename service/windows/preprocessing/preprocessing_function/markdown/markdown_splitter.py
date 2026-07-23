@@ -19,6 +19,7 @@ import re
 import logging
 from pathlib import Path
 from typing import List, Dict, Tuple
+from utils.output_manager import save_text
 from service.windows.preprocessing.preprocessing_function.markdown.markdown_image_extractor import extract_base64_images
 
 logger = logging.getLogger(__name__)
@@ -204,7 +205,7 @@ def split_markdown_by_regions(markdown_text: str, output_dir: str | Path) -> Lis
         
         # 保存Markdown文件
         md_file = region_dir / f"{region['name']}.md"
-        md_file.write_text(cleaned_content, encoding='utf-8')
+        save_text(md_file, cleaned_content)
         
         results.append({
             "name": region['name'],

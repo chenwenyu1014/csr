@@ -49,15 +49,27 @@ except Exception:
     pass
 
 # 使用统一日志配置（控制台 + 文件双输出）
-from utils.logging_config import setup_logging
+from utils.logging_config import setup_logging 
 setup_logging(service_name="Bridge")
 
 # 设置本模块的logger
 logger = logging.getLogger(__name__)
 app = FastAPI(title="Windows Bridge Service", version="1.0.0")
 # ============================================================
+# Windows 串行任务锁（防止 win32/Office COM 并发导致崩溃）
+#
+# FastAPI 的同步 def 会在线程池中并发执行；但 Word/Excel COM
+# 在同一进程内并发非常脆弱，因此这里对“会触发 Office/COM 的路由”
+# 统一做全局串行化。
+#
+# 环境变量：
+# - WINDOWS_BRIDGE_SERIAL_MODE: "wait"(默认) | "reject"
+# - WINDOWS_BRIDGE_SERIAL_TIMEOUT: 秒；0/空=无限等待（仅 wait 模式有效）
+# - WINDOWS_BRIDGE_SERIAL_IPC_LOCK: "1"(默认) 开启跨进程文件锁；"0" 关闭
+# - WINDOWS_BRIDGE_SERIAL_LOCK_FILE: 锁文件路径（默认 AAA/.windows_bridge.lock）
+# ============================================================
 
-_WIN_BRIDGE_TASK_LOCK = threading.Lock()
+from utils.windows_com import _COM_SERIAL_LOCK as _WIN_BRIDGE_TASK_LOCK
 
 
 def _get_request_id_from_request(request: Request) -> str:
@@ -191,12 +203,6 @@ task_storage: Dict[str, Dict[str, Any]] = {}
 task_results: Dict[str, Any] = {}
 
 
-
-# 统一 JSON 日志
-# setup_json_logging 暂时不使用，直接用标准logging
-
-
-
 def _auth_ok(request: Request) -> bool:
     token = (os.getenv("WINDOWS_BRIDGE_TOKEN") or "").strip()
     if not token:
@@ -303,397 +309,6 @@ def _probe_win32_available() -> bool:
         return True
     except Exception:
         return False
-
-
-# ---------- 清理文档（python-docx，优先方案） ----------
-
-def _clean_document_with_docx(file_path: str, output_path: str, remove_first_line: bool = True) -> Dict[str, Any]:
-    """
-    用 python-docx 清理文档（不依赖 COM，速度快）
-
-    功能：
-    1. 删除首行（水印）
-    2. 清理 Content Control 控件（保留内容）
-    3. 删除占位符标记段落
-
-    Args:
-        file_path: 输入文件路径
-        output_path: 输出文件路径
-        remove_first_line: 是否删除首行
-
-    Returns:
-        Dict: 包含成功状态、清理信息等
-    """
-    result = {
-        "success": False,
-        "controls_removed": 0,
-        "first_line_removed": False,
-        "markers_removed": False,
-        "error": None
-    }
-
-    try:
-        from docx import Document
-        import re
-
-        doc = Document(file_path)
-
-        # 1. 删除首行
-        if remove_first_line and len(doc.paragraphs) > 0:
-            first_para = doc.paragraphs[0]._element
-            parent = first_para.getparent()
-            if parent is not None:
-                parent.remove(first_para)
-                result["first_line_removed"] = True
-                logger.info("✅ 已删除首行")
-
-        # 2. 清理 Content Control（只删除有 tag 的自定义控件，保留内容）
-        body = doc._element.body
-        WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-
-        # 找到所有 sdt 元素
-        sdt_elements = body.findall(f'.//{{{WNS}}}sdt')
-        controls_count = 0
-
-        for sdt in sdt_elements:
-            try:
-                # 检查是否有 tag（自定义控件有 tag，目录控件等没有）
-                sdt_pr = sdt.find(f'{{{WNS}}}sdtPr')
-                if sdt_pr is not None:
-                    tag_elem = sdt_pr.find(f'{{{WNS}}}tag')
-                    if tag_elem is None:
-                        # 没有 tag，不是自定义控件（如目录），跳过
-                        continue
-
-                # 获取 sdtContent 里的内容
-                sdt_content = sdt.find(f'{{{WNS}}}sdtContent')
-                if sdt_content is not None:
-                    # 取出 sdtContent 的所有子元素
-                    children = list(sdt_content)
-                    parent = sdt.getparent()
-                    if parent is not None:
-                        # 用 addnext 从后往前插入，保证最终顺序正确
-                        for child in reversed(children):
-                            sdt.addnext(child)
-                        parent.remove(sdt)
-                        controls_count += 1
-            except Exception:
-                pass
-
-        result["controls_removed"] = controls_count
-        logger.info(f"✅ 已清理 {controls_count} 个 Content Control 控件")
-
-        # 3. 删除占位符标记段落
-        marker_regex = re.compile(r'^\{\{(TemplateTable_\d+_Start|TemplateTable_\d+_End|标题：[^}]+)\}\}$')
-
-        to_delete = []
-        for para in doc.paragraphs:
-            text = para.text.strip()
-            if marker_regex.match(text):
-                to_delete.append(para._element)
-
-        deleted_markers = 0
-        for elem in to_delete:
-            parent = elem.getparent()
-            if parent is not None:
-                parent.remove(elem)
-                deleted_markers += 1
-
-        result["markers_removed"] = deleted_markers > 0
-        if deleted_markers > 0:
-            logger.info(f"✅ 已清理 {deleted_markers} 个占位符标记段落")
-        else:
-            logger.info("ℹ️ 文档中没有占位符标记")
-
-        # 保存
-        doc.save(output_path)
-        result["success"] = True
-        result["output_file"] = output_path
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        result["error"] = str(e)
-        logger.error(f"python-docx 清理失败: {e}", exc_info=True)
-
-    return result
-
-
-# ---------- 清理Content Control并保留内容（COM，回退方案） ----------
-
-def _clean_content_controls_preserve_content(file_path: str, output_path: str, remove_first_line: bool = True) -> Dict[str, Any]:
-    """
-    清理Word文档中的Content Control控件，但保留控件内的内容
-    
-    Args:
-        file_path: 输入文件路径
-        output_path: 输出文件路径
-        remove_first_line: 是否删除首行（水印）
-    
-    Returns:
-        Dict: 包含成功状态、清理的控件数量等信息
-    """
-    try:
-        import win32com.client as win32  # type: ignore
-    except Exception:
-        return {"success": False, "error": "win32com不可用"}
-    from utils.windows_com import safe_dispatch
-    
-    result = {
-        "success": False,
-        "controls_removed": 0,
-        "first_line_removed": False,
-        "markers_removed": False,
-        "error": None
-    }
-    
-    word = None
-    doc = None
-    
-    com_inited = False
-    try:
-        # 初始化COM
-        import pythoncom
-        try:
-            pythoncom.CoInitialize()
-            com_inited = True
-        except:
-            pass
-        
-        word = safe_dispatch("Word.Application", use_ex=False, logger=logger)
-        try:
-            word.Visible = False
-            word.DisplayAlerts = 0
-        except Exception:
-            pass
-        
-        # 打开文档
-        doc = word.Documents.Open(str(Path(file_path).resolve()), ReadOnly=False)
-        logger.info(f"📄 打开文档: {file_path}")
-        
-        # 1. 清理Content Control控件（保留内容）
-        controls_count = 0
-        try:
-            # 获取所有Content Control
-            content_controls = doc.ContentControls
-            total_controls = content_controls.Count
-            logger.info(f"📝 发现 {total_controls} 个Content Control控件")
-            
-            # 从后往前删除，避免索引问题
-            # 注意：COM集合是1-indexed
-            for i in range(total_controls, 0, -1):
-                try:
-                    cc = content_controls.Item(i)
-                    # Delete(False) = 删除控件但保留内容
-                    cc.Delete(False)
-                    controls_count += 1
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    logger.warning(f"删除控件 {i} 失败: {e}")
-            
-            result["controls_removed"] = controls_count
-            if total_controls == 0:
-                logger.info("ℹ️ 文档中没有Content Control控件")
-                result["controls_message"] = "文档中没有Content Control控件"
-            else:
-                logger.info(f"✅ 已清理 {controls_count}/{total_controls} 个Content Control控件")
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            logger.warning(f"清理Content Control失败: {e}")
-        
-        # 2. 删除首行（水印）
-        if remove_first_line:
-            try:
-                para = None
-                try:
-                    # 尝试获取第一节的第一段
-                    para = doc.Sections(1).Range.Paragraphs(1)
-                except Exception:
-                    # 回退到文档的第一段
-                    para = doc.Paragraphs(1)
-                
-                if para is not None:
-                    rng = para.Range
-                    # 获取首行文本用于日志
-                    first_line_text = rng.Text[:50] if rng.Text else ""
-                    logger.info(f"📝 首行内容: {repr(first_line_text)}...")
-                    
-                    # 删除整个段落（包括段落标记）
-                    rng.Delete()
-                    result["first_line_removed"] = True
-                    logger.info("✅ 已删除首行")
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                logger.warning(f"删除首行失败: {e}")
-
-        # 3. 清理模板占位符标记 {{Table_*_Start}}、{{Table_*_End}}、{{标题：...}}
-        # 用 python-docx 处理（更快更可靠）
-        result["markers_removed"] = False
-        try:
-            from docx import Document
-            import re
-
-            # 标记匹配正则
-            marker_regex = re.compile(r'^\{\{(Table_\d+_Start|Table_\d+_End|标题：[^}]+)\}\}$')
-
-            # 先保存当前 COM 文档状态
-            doc.Save()
-            doc.Close(SaveChanges=False)
-
-            # 用 python-docx 打开并处理
-            docx_doc = Document(str(Path(output_path).resolve()))
-
-            # 收集要删除的段落元素
-            to_delete = []
-            for para in docx_doc.paragraphs:
-                text = para.text.strip()
-                if marker_regex.match(text):
-                    to_delete.append(para._element)
-
-            # 删除段落元素（直接操作 XML）
-            deleted_count = 0
-            for elem in to_delete:
-                parent = elem.getparent()
-                if parent is not None:
-                    parent.remove(elem)
-                    deleted_count += 1
-
-            # 保存
-            docx_doc.save(str(Path(output_path).resolve()))
-
-            result["markers_removed"] = deleted_count > 0
-
-            if deleted_count > 0:
-                logger.info(f"✅ 已清理 {deleted_count} 个占位符标记段落")
-            else:
-                logger.info("ℹ️ 文档中没有占位符标记")
-
-            # 重新打开文档（后续流程需要）
-            doc = word.Documents.Open(str(Path(output_path).resolve()), ReadOnly=False)
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            logger.warning(f"清理占位符标记失败: {e}")
-
-        # 保存到输出路径
-        output_path_resolved = str(Path(output_path).resolve())
-        # 确保输出目录存在
-        Path(output_path_resolved).parent.mkdir(parents=True, exist_ok=True)
-        
-        # 保存文件
-        doc.SaveAs(output_path_resolved)
-        logger.info(f"💾 已保存到: {output_path}")
-        
-        result["success"] = True
-        result["output_file"] = output_path
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        logger.error(f"清理文档失败: {e}", exc_info=True)
-        result["error"] = str(e)
-    
-    finally:
-        # 清理资源
-        try:
-            if doc is not None:
-                doc.Close(SaveChanges=False)  # 已经手动保存了
-        except Exception:
-            pass
-        try:
-            if word is not None:
-                word.Quit()
-        except Exception:
-            pass
-        try:
-            if com_inited:
-                import pythoncom  # type: ignore
-                pythoncom.CoUninitialize()
-        except Exception:
-            pass
-    
-    return result
-
-
-# ---------- 清理首行文字（COM） ----------
-
-def _clear_first_line_with_com_bytes(src_bytes: bytes, suffix: str) -> Optional[bytes]:
-    try:
-        import win32com.client as win32  # type: ignore
-    except Exception:
-        return None
-    from utils.windows_com import safe_dispatch
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            td = str(td)
-            inp = os.path.join(td, f"in_{uuid.uuid4().hex[:8]}{suffix}")
-            outp = os.path.join(td, f"out_{uuid.uuid4().hex[:8]}{suffix}")
-            with open(inp, "wb") as f:
-                f.write(src_bytes)
-
-            com_inited = False
-            try:
-                import pythoncom  # type: ignore
-                try:
-                    pythoncom.CoInitialize()
-                    com_inited = True
-                except Exception:
-                    pass
-            except Exception:
-                com_inited = False
-
-            word = safe_dispatch("Word.Application", use_ex=False, logger=logger)
-            try:
-                word.Visible = False
-                word.DisplayAlerts = 0
-            except Exception:
-                pass
-            doc = None
-            try:
-                doc = word.Documents.Open(inp, ReadOnly=False)
-                try:
-                    para = None
-                    try:
-                        para = doc.Sections(1).Range.Paragraphs(1)
-                    except Exception:
-                        para = doc.Paragraphs(1)
-                    if para is not None:
-                        rng = para.Range
-                        try:
-                            rng.End = rng.End - 1
-                        except Exception:
-                            pass
-                        rng.Text = ""
-                except Exception:
-                    pass
-                doc.SaveAs(outp)
-                data = open(outp, "rb").read()
-            finally:
-                try:
-                    if doc is not None:
-                        doc.Close(SaveChanges=True)
-                except Exception:
-                    pass
-                try:
-                    word.Quit()
-                except Exception:
-                    pass
-                try:
-                    if com_inited:
-                        import pythoncom  # type: ignore
-                        pythoncom.CoUninitialize()
-                except Exception:
-                    pass
-            return data
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        logger.warning(f"COM 清理首行失败: {e}")
-        return None
 
 
 @app.post("/ky/sys/ai/insert_direct")
@@ -888,242 +503,271 @@ def _content_control_insert_direct_impl(*, template_file: str, data_json: str, r
         raise HTTPException(status_code=500, detail=error_msg)
 
 
+def _snapshot_word_pids() -> set:
+    """获取当前所有 WINWORD.EXE 的 PID。
 
-# ========== 文档清理接口 ==========
+    用于结束时只 kill 本次新增的进程，不误杀用户原本开着的 Word。
+    """
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq WINWORD.EXE", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        pids = set()
+        for line in out.splitlines():
+            parts = [p.strip().strip('"') for p in line.split(",")]
+            if len(parts) >= 2 and parts[0].upper().startswith("WINWORD"):
+                try:
+                    pids.add(int(parts[1]))
+                except ValueError:
+                    pass
+        return pids
+    except Exception:
+        return set()
 
-@app.post("/api/v1/document/clean")
-def clean_document(
+
+def _kill_word_pids(pids):
+    """taskkill /F 指定 PID（连子进程），单个失败不影响其他。"""
+    import subprocess
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"],
+                           capture_output=True, timeout=10)
+            logger.warning(f"强制终止残留的 WINWORD 进程 pid={pid}")
+        except Exception as e:
+            logger.warning(f"终止 WINWORD 进程 pid={pid} 失败: {e}")
+
+
+def _ensure_word_quit(word, *, pre_pids):
+    """确保 Word 进程被关闭：先正常 Quit()，失败则按 PID 差集兜底 kill。
+
+    无论正常退出还是异常退出都调用，保证不残留 WINWORD.EXE。
+    pre_pids 为进入 COM 前的 WINWORD PID 快照，只杀本次新增的。
+    """
+    if word is not None:
+        try:
+            word.Quit()
+        except Exception as e:
+            logger.warning(f"word.Quit() 失败, 将退回 taskkill: {e}")
+    try:
+        leftover = _snapshot_word_pids() - pre_pids
+        if leftover:
+            _kill_word_pids(leftover)
+    except Exception as e:
+        logger.warning(f"残留的 WINWORD 清理失败: {e}")
+
+
+# ---------- .doc -> .docx（Word COM 无损转换） ----------
+
+@app.post("/api/v1/document/doc-to-docx")
+def doc_to_docx(
     request: Request,
-    file_path: str = Form(..., description="文件路径（相对于AAA目录）"),
-    output_path: str = Form(None, description="输出文件路径（可选，默认覆盖原文件）"),
-    remove_first_line: bool = Form(True, description="是否删除首行（水印）"),
-    remove_content_controls: bool = Form(True, description="是否清理Content Control控件"),
+    doc_path: str = Form(..., description=".doc 或 .docx 文件路径（相对于AAA目录）"),
 ):
     """
-    清理Word文档接口（同步执行，避免阻塞事件循环）
-    
-    功能：
-    1. 清理Content Control控件（保留控件内的内容）
-    2. 删除文件首行（通常是水印）
-    
+    通过 Word COM 将文档重存为过渡格式(Transitional).docx（无损保真）。
+
+    - .doc 输入：在源文件同目录产出同名 .docx（源 .doc 保留）。
+    - .docx 输入：原地规范化（严格格式(Strict)OOXML → 过渡格式）。
+
     Args:
-        file_path: 文件路径，相对于AAA目录
-        output_path: 输出文件路径（可选），如果不提供则覆盖原文件
-        remove_first_line: 是否删除首行（默认True）
-        remove_content_controls: 是否清理Content Control（默认True）
-    
+        doc_path: .doc 或 .docx 文件路径，相对于 AAA 目录
+
     Returns:
-        JSON响应，包含清理结果
+        JSON: {"success": True, "docx_path": "<相对AAA路径>", "docx_abs_path": "<绝对路径>"}
+              失败时 {"success": False, "error": "..."}
     """
     if not _auth_ok(request):
         raise HTTPException(status_code=401, detail="unauthorized")
 
-    with _windows_serial_task_guard("document_clean", request):
-        return _clean_document_impl(
-            request=request,
-            file_path=file_path,
-            output_path=output_path,
-            remove_first_line=remove_first_line,
-            remove_content_controls=remove_content_controls,
-        )
+    with _windows_serial_task_guard("doc_to_docx", request):
+        return _doc_to_docx_impl(request=request, doc_path=doc_path)
 
 
-def _clean_document_impl(
-    *,
-    request: Request,
-    file_path: str,
-    output_path: str | None,
-    remove_first_line: bool,
-    remove_content_controls: bool,
-):
+def _doc_to_docx_impl(*, request: Request, doc_path: str):
     logger.info("=" * 70)
-    logger.info("文档清理服务")
+    logger.info(".doc -> .docx 转换（Word COM）")
     logger.info("=" * 70)
-    
+
+    result: Dict[str, Any] = {"success": False, "error": None}
+
     try:
-        # 清理文件路径（去除引号、空格、统一分隔符）
-        clean_path = file_path.strip().strip('"').strip("'")
-        clean_path = clean_path.replace("\\", "/")  # 统一使用正斜杠
-        
-        logger.info(f"📥 原始路径: {repr(file_path)}")
-        logger.info(f"📥 清理后路径: {clean_path}")
-        
-        # 去除AAA前缀
-        if clean_path.startswith('/AAA/'):
-            clean_path = clean_path[5:]
-        elif clean_path.startswith('AAA/'):
-            clean_path = clean_path[4:]
-        elif clean_path.startswith('/'):
-            clean_path = clean_path[1:]
-        
-        logger.info(f"📥 相对路径: {clean_path}")
-        
-        # 构建完整路径
-        AAA_ROOT = Path(os.getenv("WINDOWS_AAA_ROOT", "AAA")).resolve()
-        
-        # 尝试多个可能的基础路径
-        base_paths = [
-            Path("../AAA").resolve(),
-            Path("AAA").resolve(),
-            AAA_ROOT,
-            Path.cwd() / "AAA",
-            Path.cwd().parent / "AAA",
-        ]
-        
-        logger.info(f"🔍 当前工作目录: {Path.cwd()}")
-        
-        full_path = None
-        tried_paths = []
-        for base in base_paths:
-            test_path = base / clean_path
-            tried_paths.append(str(test_path))
-            logger.info(f"🔍 尝试路径: {test_path} - 存在: {test_path.exists()}")
-            if test_path.exists():
-                full_path = test_path
-                break
-        
-        if full_path is None:
-            error_msg = f"文件不存在: {clean_path}\n尝试过的路径:\n" + "\n".join(f"  - {p}" for p in tried_paths)
-            logger.error(error_msg)
-            raise FileNotFoundError(error_msg)
-        
-        logger.info(f"📄 输入文件: {full_path}")
-        
-        # 确定输出路径（始终复制文件，不直接修改原文件）
-        if output_path:
-            # 清理输出路径（去除引号、空格、统一分隔符）
-            clean_output = output_path.strip().strip('"').strip("'")
-            clean_output = clean_output.replace("\\", "/")
-            
-            if clean_output.startswith('/AAA/'):
-                clean_output = clean_output[5:]
-            elif clean_output.startswith('AAA/'):
-                clean_output = clean_output[4:]
-            elif clean_output.startswith('/'):
-                clean_output = clean_output[1:]
-            
-            # 使用与输入文件相同的基础路径
-            output_full_path = full_path.parent / Path(clean_output).name
-            # 或者如果指定了完整相对路径，使用AAA_ROOT
-            if "/" in clean_output:
-                for base in base_paths:
-                    if base.exists():
-                        output_full_path = base / clean_output
-                        break
-        else:
-            # 如果没有指定输出路径，生成一个带 _cleaned 后缀的文件名
-            # 确保不会覆盖原文件
-            file_stem = full_path.stem
-            file_suffix = full_path.suffix
-            output_full_path = full_path.parent / f"{file_stem}_cleaned{file_suffix}"
-            logger.info(f"📋 未指定输出路径，将生成清理后的文件: {output_full_path}")
-        
-        # 如果输出路径和输入路径相同，自动生成不同的文件名
-        if output_full_path.resolve() == full_path.resolve():
-            file_stem = full_path.stem
-            file_suffix = full_path.suffix
-            output_full_path = full_path.parent / f"{file_stem}_cleaned{file_suffix}"
-            logger.info(f"📋 输出路径与原文件相同，自动生成新文件名: {output_full_path}")
-        
-        # 先复制原文件到输出路径，确保原文件不被修改
-        logger.info(f"📋 复制原文件到: {output_full_path}")
-        output_full_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(full_path, output_full_path)
-        logger.info(f"✅ 文件复制完成，原文件保持不变")
-        
-        logger.info(f"📄 输出文件: {output_full_path}")
-        logger.info(f"🔧 删除首行: {remove_first_line}")
-        logger.info(f"🔧 清理控件: {remove_content_controls}")
-        
-        # 执行清理（优先 python-docx，失败回退 COM）
-        if remove_content_controls:
-            # 先尝试 python-docx（快速）
-            logger.info("🚀 尝试使用 python-docx 清理...")
-            result = _clean_document_with_docx(
-                file_path=str(output_full_path),
-                output_path=str(output_full_path),
-                remove_first_line=remove_first_line
-            )
+        full_path = _resolve_aaa_path(doc_path)
 
-            # 如果失败，回退到 COM
-            if not result.get("success"):
-                logger.warning("⚠️ python-docx 清理失败，回退到 COM 方案")
-                result = _clean_content_controls_preserve_content(
-                    file_path=str(output_full_path),
-                    output_path=str(output_full_path),
-                    remove_first_line=remove_first_line
-                )
+        suffix = full_path.suffix.lower()
+        if suffix not in (".doc", ".docx"):
+            raise ValueError(f"输入文件不是 .doc/.docx: {full_path}")
+
+        # .doc 输入：同目录产出同名 .docx（源 .doc 保留）
+        # .docx 输入：原地规范化（严格格式 → 过渡格式），先存临时文件再覆盖
+        in_place = (suffix == ".docx")
+        if in_place:
+            out_path = full_path
+            tmp_path = full_path.with_name(f"{full_path.stem}_transitional_tmp.docx")
+            logger.info(f"📄 输入 .docx（原地规范化 严格→过渡）: {full_path}")
         else:
-            # 只删除首行，不清理控件
-            result = {"success": False, "error": "仅删除首行功能暂未单独实现"}
-            if remove_first_line:
-                # 使用现有的清理首行函数
-                with open(output_full_path, "rb") as f:
-                    src_bytes = f.read()
-                suffix = output_full_path.suffix
-                cleaned_bytes = _clear_first_line_with_com_bytes(src_bytes, suffix)
-                if cleaned_bytes:
-                    with open(output_full_path, "wb") as f:
-                        f.write(cleaned_bytes)
-                    result = {
-                        "success": True,
-                        "controls_removed": 0,
-                        "first_line_removed": True,
-                        "output_file": str(output_full_path)
-                    }
-        
-        if result.get("success"):
-            logger.info("✅ 文档清理成功")
-            logger.info(f"   - 清理控件: {result.get('controls_removed', 0)} 个")
-            logger.info(f"   - 删除首行: {result.get('first_line_removed', False)}")
-            
-            # 构建返回的相对路径（相对于AAA）
-            output_rel_path = None
+            out_path = full_path.with_suffix(".docx")
+            tmp_path = None
+            logger.info(f"📄 输入 .doc（转为 .docx文档）: {full_path}")
+
+        # 实际 SaveAs2 的目标：.docx 原地场景先写临时文件，避免与正在打开的源文件冲突
+        save_path = tmp_path if tmp_path is not None else out_path
+        # 残留的临时文件先清掉，避免 SaveAs2 受干扰
+        if tmp_path is not None and tmp_path.exists():
             try:
-                for base in [Path("../AAA"), Path("AAA"), AAA_ROOT]:
-                    try:
-                        output_rel_path = "AAA/" + str(Path(output_full_path).relative_to(base)).replace("\\", "/")
-                        break
-                    except ValueError:
-                        continue
+                os.remove(tmp_path)
             except Exception:
-                output_rel_path = str(output_full_path)
-            
-            return JSONResponse({
+                pass
+
+        try:
+            import win32com.client  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"win32com 不可用: {e}")
+
+        from utils.windows_com import safe_dispatch
+
+        word = None
+        doc = None
+        com_inited = False
+        pre_pids = set()
+        try:
+            import pythoncom  # type: ignore
+            try:
+                pythoncom.CoInitialize()
+                com_inited = True
+            except Exception:
+                com_inited = False
+
+            # Dispatch 前快照 WINWORD PID，用于退出时精确兜底清理（只杀本次新增）
+            pre_pids = _snapshot_word_pids()
+
+            word = safe_dispatch("Word.Application", use_ex=False, logger=logger)
+            try:
+                word.Visible = False
+                word.DisplayAlerts = 0
+            except Exception:
+                pass
+
+            doc = word.Documents.Open(str(full_path), ReadOnly=False)
+
+            # 16 = wdFormatXMLDocument (.docx, 过渡格式)；优先 SaveAs2，旧版 Word 回退 SaveAs
+            try:
+                doc.SaveAs2(str(save_path), FileFormat=16)
+            except Exception:
+                doc.SaveAs(str(save_path), FileFormat=16)
+
+            # 先关闭文档释放句柄，再做原地覆盖（.docx 规范化场景）
+            try:
+                doc.Close(SaveChanges=0)
+                doc = None
+            except Exception:
+                pass
+
+            if tmp_path is not None:
+                # 临时文件就绪，原位覆盖源文件
+                os.replace(tmp_path, full_path)
+                logger.info(f"✅ 规范化成功(原地覆盖): {full_path}")
+            else:
+                logger.info(f"✅ 转换成功: {out_path}")
+
+            # 返回相对 AAA 的路径，便于调用方定位
+            try:
+                rel = str(out_path)
+                marker = os.sep + "AAA" + os.sep
+                idx = rel.find(marker)
+                if idx != -1:
+                    rel = rel[idx + len(marker):]
+                else:
+                    sep_aaa = "AAA" + os.sep
+                    if rel.startswith(sep_aaa):
+                        rel = rel[len(sep_aaa):]
+            except Exception:
+                rel = str(out_path)
+
+            result = {
                 "success": True,
-                "output_file": output_rel_path or str(output_full_path),
-                "controls_removed": result.get("controls_removed", 0),
-                "first_line_removed": result.get("first_line_removed", False),
-                "markers_removed": result.get("markers_removed", False)
-            })
-        else:
-            raise HTTPException(status_code=500, detail=f"清理失败: {result.get('error', '未知错误')}")
-    
+                "docx_path": rel.replace("\\", "/"),
+                "docx_abs_path": str(out_path),
+            }
+            return result
+        finally:
+            try:
+                if doc is not None:
+                    doc.Close(SaveChanges=0)
+            except Exception:
+                pass
+            # 正常/异常退出都保证 Word 被关掉：Quit 失败则 taskkill 兜底
+            _ensure_word_quit(word, pre_pids=pre_pids)
+            try:
+                if com_inited:
+                    import pythoncom  # type: ignore
+                    pythoncom.CoUninitialize()
+            except Exception:
+                pass
+            # 失败时清理残留的临时文件（仅 .docx 原地规范化场景）
+            if tmp_path is not None and tmp_path.exists():
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
     except FileNotFoundError as e:
         logger.error(f"文件不存在: {e}")
-        raise HTTPException(status_code=404, detail=str(e))
+        result["error"] = f"文件不存在: {e}"
     except Exception as e:
-        logger.error(f"处理失败: {e}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f".doc -> .docx 转换失败: {e}", exc_info=True)
+        result["error"] = str(e)
+
+    return result
 
 
-# ========== 以下是原bundle接口的剩余代码（已注释） ==========
-# 原接口代码已移至 app_bundle_backup.py 文件
-"""
-原bundle接口的主要流程：
-1. 接收zip文件和JSON数据
-2. 解压到临时目录  
-3. 从解压文件中读取资源
-4. 执行插入操作
-5. 返回结果文档
+def _resolve_aaa_path(rel_path: str) -> Path:
+    """
+    将“相对于 AAA 目录”的路径解析为本地绝对路径。
 
-现在直接模式的优势：
-- 无需打包zip文件
-- 直接使用共享文件夹AAA中的资源
-- 更快速、更简单
-"""
+    多 base 试探策略：
+    依次尝试 ../AAA、AAA、WINDOWS_AAA_ROOT、cwd/AAA、cwd.parent/AAA。
+
+    Args:
+        rel_path: 相对 AAA 的路径，可带 AAA/ /AAA/ // / 等前缀
+
+    Returns:
+        解析后的绝对 Path
+
+    Raises:
+        FileNotFoundError: 所有候选 base 都不存在该文件
+    """
+    clean = rel_path.strip().strip('"').strip("'").replace("\\", "/")
+    if clean.startswith("//"):
+        clean = clean[2:]
+    elif clean.startswith("/AAA/"):
+        clean = clean[5:]
+    elif clean.startswith("AAA/"):
+        clean = clean[4:]
+    elif clean.startswith("/"):
+        clean = clean[1:]
+
+    aaa_root = Path(os.getenv("WINDOWS_AAA_ROOT", "AAA")).absolute()
+    base_paths = [
+        Path("../AAA").absolute(),
+        Path("AAA").absolute(),
+        aaa_root,
+        Path.cwd() / "AAA",
+        Path.cwd().parent / "AAA",
+    ]
+
+    tried = []
+    for base in base_paths:
+        test_path = base / clean
+        tried.append(str(test_path))
+        if test_path.exists():
+            return test_path
+
+    raise FileNotFoundError(
+        f"文件不存在: {clean}\n尝试过的路径:\n" + "\n".join(f"  - {p}" for p in tried)
+    )
 
 
 # ========== Linux转发的预处理接口（新增）==========
@@ -1149,19 +793,18 @@ def preprocessing_process(
     if not _auth_ok(request):
         raise HTTPException(status_code=401, detail="unauthorized")
 
-    with _windows_serial_task_guard("preprocessing_process", request):
-        return _preprocessing_process_impl(
-            request=request,
-            file_path=file_path,
-            folder_path=folder_path,
-            filename=filename,
-            file_id=file_id,
-            force_ocr=force_ocr,
-            extract_regions=extract_regions,
-            extract_assets=extract_assets,
-            chunking_enabled=chunking_enabled,
-            chunking_mode=chunking_mode,
-        )
+    return _preprocessing_process_impl(
+        request=request,
+        file_path=file_path,
+        folder_path=folder_path,
+        filename=filename,
+        file_id=file_id,
+        force_ocr=force_ocr,
+        extract_regions=extract_regions,
+        extract_assets=extract_assets,
+        chunking_enabled=chunking_enabled,
+        chunking_mode=chunking_mode,
+    )
 
 
 def _preprocessing_process_impl(

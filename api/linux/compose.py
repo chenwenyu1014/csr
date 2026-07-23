@@ -24,6 +24,13 @@ router = APIRouter()
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
+# ========== 回调接口配置 ==========
+_CALLBACK_BASE_URL = os.getenv("CALLBACK_BASE_URL", "http://192.168.3.32:8088")
+# 全流程结果回调（无 package_id 时使用）
+SINGLE_REPORT_CALLBACK_URL = _CALLBACK_BASE_URL + "/ky/sys/projectCreateManage/getReportAIResult"
+# 报告包批量生成结果回调（有 package_id 时使用）
+REPORT_PACKAGE_CALLBACK_URL = _CALLBACK_BASE_URL + "/ky/report/reportPackage/getReportAIResult"
+
 
 # ============================================================
 # API 路由 - 任务查询
@@ -76,10 +83,8 @@ async def compose_document(
     combinationId: str | None = Form(None, description="组合ID"),
     project_desc: str | None = Form(None, description="项目背景"),
     project_id: str | None = Form(None, description="项目ID"),
-    callback_url: str | None = Form(
-        os.getenv("CALLBACK_BASE_URL")+"/ky/sys/projectCreateManage/getReportAIResult",
-        description="完成时回调URL"
-    ),
+    package_id: str | None = Form(None, description="报告包ID；有值时回调到报告包批量生成接口（reportPackage/getReportAIResult），空值则回调原全流程接口"),
+    callback_url: str | None = Form(None, description="完成时回调URL（不传则按 package_id 有无自动选择）"),
     skip_validation: bool = Form(True, description="是否跳过提取校验（默认True跳过以加快处理速度，设为False可提高提取质量但更慢）"),
 ):
     """
@@ -147,6 +152,12 @@ async def compose_document(
         project_name = _extract_project_name(cfg_obj)
         final_project_name = (project_name or "unknown") + "_" + (final_project_id or "no_id")
         logger.info(f"project_id: {final_project_id}, project_name: {final_project_name}")
+        logger.info(f"package_id: {package_id}")
+        
+        # 前端若显式传入 callback_url，则优先使用前端指定的
+        if not callback_url:
+            # 按 package_id 有无自动选择回调URL：有值走报告包批量生成接口，空值走原全流程接口
+            callback_url = REPORT_PACKAGE_CALLBACK_URL if package_id else SINGLE_REPORT_CALLBACK_URL
         logger.info(f"callback_url: {callback_url}")
         
         # 创建任务
@@ -165,6 +176,7 @@ async def compose_document(
                 "project_desc": project_desc,
                 "template_file": template_file,
                 "filename": filename,
+                "package_id": package_id,
                 "callback_url": callback_url
             }
         )
@@ -192,6 +204,7 @@ async def compose_document(
             project_name=final_project_name,
             auth_token=auth_token,
             callback_url=callback_url,
+            package_id=package_id,
             skip_validation=skip_validation
         )
         

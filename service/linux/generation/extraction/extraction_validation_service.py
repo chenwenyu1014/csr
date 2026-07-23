@@ -17,6 +17,7 @@ from typing import Dict, Any, Optional
 from service.models import get_llm_service
 from service.prompts.system_prompt_manager import system_prompt_manager
 from utils.context_manager import get_current_output_dir
+from utils.output_manager import save_json, save_text
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +77,11 @@ class ExtractionValidationService:
             
             # 保存提示词
             prompt_file = prompts_dir / f"validation_prompt_{timestamp}_{rand6}.txt"
-            prompt_file.write_text(prompt, encoding='utf-8')
+            save_text(prompt_file, prompt)
             
             # 保存输出
             output_file = prompts_dir / f"validation_output_{timestamp}_{rand6}.txt"
-            output_file.write_text(output or "", encoding='utf-8')
+            save_text(output_file, output or "")
             
             # 保存溯源JSON
             provenance_data = {
@@ -93,7 +94,7 @@ class ExtractionValidationService:
                 "output_file": str(output_file)
             }
             provenance_file = prompts_dir / f"validation_provenance_{timestamp}_{rand6}.json"
-            provenance_file.write_text(json.dumps(provenance_data, ensure_ascii=False, indent=2), encoding='utf-8')
+            save_json(provenance_file, provenance_data)
             
             logger.info(f"✅ 校验提示词已保存: {prompt_file.name}")
             
@@ -141,15 +142,19 @@ class ExtractionValidationService:
                 "source_content": source_content,
                 "extracted_content": extracted_content
             }
-            prompt = system_prompt_manager.build_prompt("extraction_validation", variables)
-            
+            messages = system_prompt_manager.build_messages("extraction_validation", variables)
+            system_prompt = messages.get("system", "")
+            user_prompt = messages.get("user", "")
+            # 留痕用完整文本（system + user）；调用模型时只传 user，system 走独立参数以命中缓存
+            prompt = (system_prompt + "\n\n" + user_prompt) if system_prompt else user_prompt
+
             # 记录提示词大小，便于调试
             logger.info(f"📝 校验提示词大小: {len(prompt)} 字符")
-            
+
             # 2. 调用模型校验
             model_output = None
             try:
-                model_output = self.llm.generate_single(prompt)
+                model_output = self.llm.generate_single(user_prompt, system=system_prompt)
             except Exception as llm_error:
                 import traceback
                 traceback.print_exc()

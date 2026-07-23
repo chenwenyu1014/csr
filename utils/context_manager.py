@@ -5,7 +5,7 @@
 - 统一管理运行时上下文变量
 - 避免分散的环境变量访问
 - 提供类型安全的上下文访问接口
-- **线程安全**：使用 threading.local 确保多线程环境下上下文隔离
+- 并发隔离：使用 contextvars.ContextVar 确保多任务同进程并发时上下文互不串台
 
 使用示例：
     from utils.context_manager import (
@@ -24,29 +24,36 @@
     # 获取上下文
     output_dir = get_current_output_dir()
     project_desc = get_project_desc()
+
+注意：
+    contextvars 默认不随 ThreadPoolExecutor 传播，提交到线程池的 callable
+    需用本模块 inherit_context 包裹，worker 才能读到提交方设置的值。
 """
 
 # ========== 标准库导入 ==========
-import os
-import threading
+import contextvars
+import functools
 from typing import Optional
 
+# ============================================================
+# 上下文变量 - 基于 contextvars，并发任务隔离
+# ============================================================
+
+request_id_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("request_id", default=None)
+_output_dir_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("current_output_dir", default=None)
+_paragraph_id_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("current_paragraph_id", default=None)
+_session_id_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("current_session_id", default=None)
+_project_desc_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("current_project_desc", default=None)
+_combination_id_ctx: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("current_combination_id",default=None)
+
 
 # ============================================================
-# 线程本地存储 - 确保多线程环境下上下文隔离
+# 请求 ID 管理
 # ============================================================
 
-_thread_local = threading.local()
-
-
-def _get_thread_local_attr(name: str, default=None):
-    """安全获取线程本地属性"""
-    return getattr(_thread_local, name, default)
-
-
-def _set_thread_local_attr(name: str, value):
-    """设置线程本地属性"""
-    setattr(_thread_local, name, value)
+def get_request_id() -> Optional[str]:
+    """获取当前请求ID"""
+    return request_id_ctx.get()
 
 
 # ============================================================
@@ -55,17 +62,16 @@ def _set_thread_local_attr(name: str, value):
 
 def set_session_id(session_id: str):
     """
-    设置当前会话ID（线程本地存储 + 环境变量）
+    设置当前会话ID（contextvars）
 
     Args:
         session_id: 会话唯一标识
     
     注意：
         - 用于日志过滤，区分不同会话的日志
-        - 子线程需要显式调用此函数继承父线程的 session_id
+        - 子线程需经本模块 inherit_context 继承提交方的 session_id
     """
-    _set_thread_local_attr("session_id", str(session_id))
-    os.environ["CURRENT_SESSION_ID"] = str(session_id)
+    _session_id_ctx.set(str(session_id))
 
 
 def get_session_id(default: str = "") -> str:
@@ -78,116 +84,87 @@ def get_session_id(default: str = "") -> str:
     Returns:
         当前会话ID
     """
-    # 优先使用线程本地存储
-    thread_sid = _get_thread_local_attr("session_id")
-    if thread_sid:
-        return thread_sid
-    # 回退到环境变量
-    return os.getenv("CURRENT_SESSION_ID", default)
+    sid = _session_id_ctx.get()
+    return sid if sid else default
 
 
 def clear_session_id():
-    """清除当前线程的会话ID"""
-    if hasattr(_thread_local, "session_id"):
-        delattr(_thread_local, "session_id")
+    """清除当前上下文的会话ID（不影响其他并发上下文）"""
+    _session_id_ctx.set(None)
 
 
 # ============================================================
-# 输出目录管理（线程安全版本）
+# 输出目录管理
 # ============================================================
 
 def set_current_output_dir(output_dir: str):
     """
-    设置当前输出目录（同时设置线程本地存储和环境变量）
+    设置当前输出目录（contextvars）
     
     Args:
         output_dir: 输出目录路径
     
     注意：
-        - 线程本地存储确保多线程环境下每个线程有独立的值
-        - 环境变量保持向后兼容性
+        - 每个并发任务在自身上下文副本里 set，互不影响
+        - worker 线程经本模块 inherit_context 继承提交方的值
     """
-    output_dir_str = str(output_dir)
-    # 设置线程本地存储（优先）
-    _set_thread_local_attr("output_dir", output_dir_str)
-    # 同时设置环境变量（向后兼容）
-    os.environ["CURRENT_OUTPUT_DIR"] = output_dir_str
+    _output_dir_ctx.set(str(output_dir))
 
 
 def get_current_output_dir(default: str = "AAA/output") -> str:
     """
-    获取当前输出目录（优先使用线程本地存储）
+    获取当前输出目录
 
     Args:
         default: 默认目录
 
     Returns:
         当前输出目录路径
-
-    注意：
-        优先级：线程本地存储 > 环境变量 > 默认值
     """
-    # 优先使用线程本地存储
-    thread_dir = _get_thread_local_attr("output_dir")
-    if thread_dir:
-        return thread_dir
-    # 回退到环境变量
-    return os.getenv("CURRENT_OUTPUT_DIR", default)
+    output_dir = _output_dir_ctx.get()
+    return output_dir if output_dir else default
 
 
 def clear_thread_output_dir():
-    """清除当前线程的输出目录（不影响其他线程）"""
-    if hasattr(_thread_local, "output_dir"):
-        delattr(_thread_local, "output_dir")
+    """清除当前上下文的输出目录（不影响其他并发上下文）"""
+    _output_dir_ctx.set(None)
 
 
 # ============================================================
-# 段落 ID 管理（线程安全版本）- 新增
+# 段落 ID 管理
 # ============================================================
 
 def set_paragraph_id(paragraph_id: str):
     """
-    设置当前段落 ID（线程本地存储 + 环境变量）
+    设置当前段落 ID（contextvars）
 
     Args:
         paragraph_id: 段落唯一标识
 
     注意：
-        - 线程本地存储确保多线程环境下每个线程有独立的段落 ID
-        - 环境变量保持向后兼容性
+        - 每个并发任务在自身上下文副本里 set，互不影响
+        - worker 线程经本模块 inherit_context 继承提交方的值
     """
-    paragraph_id_str = str(paragraph_id)
-    # 设置线程本地存储（优先）
-    _set_thread_local_attr("paragraph_id", paragraph_id_str)
-    # 同时设置环境变量（向后兼容）
-    os.environ["CURRENT_PARAGRAPH_ID"] = paragraph_id_str
+    _paragraph_id_ctx.set(str(paragraph_id))
 
 
 def get_paragraph_id(default: str = "unknown") -> str:
     """
-    获取当前段落 ID（优先使用线程本地存储）
+    获取当前段落 ID
 
     Args:
         default: 默认值
 
     Returns:
         当前段落 ID
-
-    注意：
-        优先级：线程本地存储 > 环境变量 > 默认值
     """
-    # 优先使用线程本地存储
-    thread_pid = _get_thread_local_attr("paragraph_id")
-    if thread_pid:
-        return thread_pid
-    # 回退到环境变量
-    return os.getenv("CURRENT_PARAGRAPH_ID", default)
+    paragraph_id = _paragraph_id_ctx.get()
+    return paragraph_id if paragraph_id else default
 
 
 def clear_paragraph_id():
-    """清除当前线程的段落 ID（不影响其他线程）"""
-    if hasattr(_thread_local, "paragraph_id"):
-        delattr(_thread_local, "paragraph_id")
+    """清除当前上下文的段落 ID（不影响其他并发上下文）"""
+    _paragraph_id_ctx.set(None)
 
 
 # ============================================================
@@ -201,7 +178,7 @@ def set_project_desc(project_desc: str):
     Args:
         project_desc: 项目背景描述
     """
-    os.environ["CURRENT_PROJECT_DESC"] = str(project_desc)
+    _project_desc_ctx.set(str(project_desc))
 
 
 def get_project_desc(default: str = "") -> str:
@@ -214,7 +191,8 @@ def get_project_desc(default: str = "") -> str:
     Returns:
         项目描述
     """
-    return os.getenv("CURRENT_PROJECT_DESC", default)
+    desc = _project_desc_ctx.get()
+    return desc if desc else default
 
 
 def set_combination_id(combination_id: str):
@@ -224,7 +202,7 @@ def set_combination_id(combination_id: str):
     Args:
         combination_id: 组合ID
     """
-    os.environ["CURRENT_COMBINATION_ID"] = str(combination_id)
+    _combination_id_ctx.set(str(combination_id))
 
 
 def get_combination_id(default: str = "") -> str:
@@ -233,18 +211,19 @@ def get_combination_id(default: str = "") -> str:
     
     Args:
         default: 默认值
-    
+
     Returns:
         组合ID
     """
-    return os.getenv("CURRENT_COMBINATION_ID", default)
+    cid = _combination_id_ctx.get()
+    return cid if cid else default
 
 
 def set_project_context(
-    project_desc: Optional[str] = None,
-    combination_id: Optional[str] = None,
-    output_dir: Optional[str] = None,
-    paragraph_id: Optional[str] = None
+        project_desc: Optional[str] = None,
+        combination_id: Optional[str] = None,
+        output_dir: Optional[str] = None,
+        paragraph_id: Optional[str] = None
 ):
     """
     批量设置项目上下文
@@ -266,44 +245,43 @@ def set_project_context(
 
 
 def clear_project_context():
-    """清除所有项目上下文（包括线程本地存储和环境变量）"""
-    # 清除线程本地存储
+    """清除所有项目上下文（仅当前上下文，不影响其他并发上下文）"""
     clear_thread_output_dir()
     clear_paragraph_id()
-    # 清除环境变量
-    os.environ.pop("CURRENT_OUTPUT_DIR", None)
-    os.environ.pop("CURRENT_PROJECT_DESC", None)
-    os.environ.pop("CURRENT_COMBINATION_ID", None)
-    os.environ.pop("CURRENT_PARAGRAPH_ID", None)
+    _project_desc_ctx.set(None)
+    _combination_id_ctx.set(None)
 
 
 # ============================================================
-# 上下文快照（用于测试或临时保存）
+# 上下文跨线程传播
 # ============================================================
 
-class ProjectContextSnapshot:
-    """项目上下文快照（用于保存和恢复）"""
+def inherit_context(fn):
+    """
+    包装一个 callable，使其在被 ThreadPoolExecutor 调用时继承提交方线程的上下文。
     
-    def __init__(self):
-        self.output_dir = get_current_output_dir()
-        self.project_desc = get_project_desc()
-        self.combination_id = get_combination_id()
-        self.paragraph_id = get_paragraph_id()
+    在提交方线程调用 copy_context() 拍下当前 contextvars 快照，
+    在 worker 内通过 ctx.run(fn, ...) 执行，从而让 worker 看到提交方的
+    output_dir / paragraph_id / session_id / request_id / project_desc /
+    combination_id 等上下文值。
 
-    def restore(self):
-        """恢复快照"""
-        set_current_output_dir(self.output_dir)
-        set_project_desc(self.project_desc)
-        set_combination_id(self.combination_id)
-        set_paragraph_id(self.paragraph_id)
+    contextvars 默认不随 ThreadPoolExecutor 传播，提交到线程池的 callable
+    需用本函数包裹，worker 才能读到提交方设置的值。
 
+    Args:
+        fn: 待提交到线程池的可调用对象
 
-def save_context() -> ProjectContextSnapshot:
-    """保存当前上下文快照"""
-    return ProjectContextSnapshot()
+    Returns:
+        包装后的可调用对象，签名与 fn 一致
 
+    使用示例：
+        from utils.context_manager import inherit_context
+        executor.submit(inherit_context(_worker), i, item)
+    """
+    ctx = contextvars.copy_context()
 
-def restore_context(snapshot: ProjectContextSnapshot):
-    """恢复上下文快照"""
-    snapshot.restore()
+    @functools.wraps(fn)
+    def _wrapper(*args, **kwargs):
+        return ctx.run(fn, *args, **kwargs)
 
+    return _wrapper

@@ -251,6 +251,19 @@ class TaskManager:
             )[:limit]
             return [t.to_dict() for t in tasks]
     
+    # def cleanup_old_tasks(self, max_age_hours: int = 24):
+    #     """清理旧任务"""
+    #     cutoff = time.time() - (max_age_hours * 3600)
+    #     with self._task_lock:
+    #         old_tasks = [
+    #             tid for tid, task in self._tasks.items()
+    #             if task.created_at < cutoff
+    #         ]
+    #         for tid in old_tasks:
+    #             del self._tasks[tid]
+    #
+    #     if old_tasks:
+    #         logger.info(f"清理了 {len(old_tasks)} 个旧任务")
 
 
 # 全局单例

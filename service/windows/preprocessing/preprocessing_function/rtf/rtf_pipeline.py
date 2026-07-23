@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Dict, Any,Tuple, List, Optional
 
 from utils.timing import Timer
-from service.windows.preprocessing.file_processor import ContentType
+from utils.output_manager import save_text
+from service.windows.preprocessing.file_processor import ContentType, _LIBREOFFICE_LOCK
 
 logger = logging.getLogger(__name__)
 
 
 # 主入口（兼容旧接口）
-def run(rtf_path: Path | str, work_dir: Path | str) -> Dict[str, Any]:
+def rtf_run(rtf_path: Path | str, work_dir: Path | str) -> Dict[str, Any]:
     rtf_path = Path(rtf_path)
     work_dir = Path(work_dir)
     try:
@@ -35,7 +36,7 @@ def run(rtf_path: Path | str, work_dir: Path | str) -> Dict[str, Any]:
             f"简化完成，原始始字符数: {len(text)}，简化后: {len(clean_text)},字符数减少: {len(text) - len(clean_text)} (约{((len(text) - len(clean_text)) / len(text) * 100):.1f}%)")
 
         clean_md = work_dir / f"{rtf_path.stem}_clean.md"
-        clean_md.write_text(clean_text, encoding="utf-8")
+        save_text(clean_md, clean_text)
         logger.info(f"保存简化结果到 {clean_md}")
 
         # Step3: 多表拆分
@@ -109,7 +110,9 @@ def rtf_to_docx(rtf_path: Path, output_dir: Path) -> Path:
     ]
     try:
         timer.start()
-        _run_cmd(cmd)
+        # LibreOffice 不支持多实例并发，soffice 调用必须串行（复用全局锁）
+        with _LIBREOFFICE_LOCK:
+            _run_cmd(cmd)
         timer.stop()
     except (FileNotFoundError, RuntimeError) as e:
         logger.error(f"RTF 转 DOCX 失败: {e}")
@@ -169,19 +172,17 @@ def _run_cmd(cmd: list[str]) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            check=True,
+            check=False,          # 不抛 CalledProcessError，保证 result 一定绑定，避免 UnboundLocalError 掩盖真实退出码
             timeout=60,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError("命令执行超时")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"命令执行失败: {e}")
     if result.returncode != 0:
         raise RuntimeError(
             f"Command 命令执行失败:\n{' '.join(cmd)}\n\nSTDERR:\n{result.stderr[:500]}"
         )
 
-
+ 
 # ===简化 Markdown部分===
 
 def simplify_markdown_table(md_content):
@@ -307,11 +308,9 @@ def _flush_current_table(
         raise ValueError("不应 flush 空表格")
     table_name = _extract_table_name(current_header_lines, current_table_lines)
     output_file = output_directory / f"{base_name}_{table_name}_{table_index}.md"
-    with open(output_file, 'w', encoding='utf-8') as f:
-        if current_header_lines:
-            f.write(''.join(current_header_lines))
-        f.write(''.join(current_table_lines))
-        logger.info(f"已生成第{table_index}个文件：{output_file}")
+    content = ''.join(current_header_lines) + ''.join(current_table_lines)
+    save_text(output_file, content)
+    logger.info(f"已生成第{table_index}个文件：{output_file}")
 
     return output_file
 
@@ -339,4 +338,3 @@ def _extract_table_name(header_lines, table_lines) -> str:
             return text[:40]
     return "sheet"
 
-# 原RTF处理逻辑

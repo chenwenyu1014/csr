@@ -13,6 +13,7 @@
 
 from .file_processor import FileProcessor, PreprocessedDocument, ContentType, FileType
 from .service import PreprocessingService
+# from .batch_processor import BatchProcessor, BatchProcessResult, batch_processor
 
 # 创建全局服务实例
 preprocessing_service = PreprocessingService()
@@ -24,6 +25,9 @@ __all__ = [
     "FileType",
     "PreprocessingService",
     "preprocessing_service",
+    # "BatchProcessor",
+    # "BatchProcessResult",
+    # "batch_processor",
 ]
 
 

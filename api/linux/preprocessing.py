@@ -18,6 +18,7 @@ from fastapi import APIRouter, Form, HTTPException
 from fastapi.responses import JSONResponse
 
 # ========== 本地导入 ==========
+from utils.context_manager import set_project_desc, set_combination_id
 from config import get_settings
 
 # ========== 模块配置 ==========
@@ -132,6 +133,6 @@ async def preprocess_batch_simple(
 # ============================================================
 
 def _setup_environment(combinationId: str | None, project_desc: str | None):
-    """设置环境变量"""
-    os.environ["CURRENT_COMBINATION_ID"] = str(combinationId or "")
-    os.environ["CURRENT_PROJECT_DESC"] = str(project_desc or "")
+    """设置项目上下文（contextvars，每请求线程独立）"""
+    set_combination_id(str(combinationId or ""))
+    set_project_desc(str(project_desc or ""))

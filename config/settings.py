@@ -49,20 +49,27 @@ class Settings(BaseSettings):
     
     # ========== LLM配置 ==========
     # 使用的LLM模型名称（用于通用生成）
-    llm_model: str = "qwen3-max"
+    llm_model: str = "qwen3.6-flash"
     # LLM API密钥，用于身份验证
     llm_api_key: str = ""
     # LLM API基础URL，兼容OpenAI格式的API接口
     llm_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     
     # ========== 任务专用模型配置 ==========
-    # 提取任务专用模型（默认使用deepseek-v3.2思考模式）
-    extraction_model: str = "deepseek-v3.2"
-    # 验证任务专用模型（如果为None，则使用extraction_model）
-    validation_model: Optional[str] =  "qwen3-max"
-    # 生成任务专用模型（如果为None，则使用llm_model）
-    generation_model: Optional[str] = None
-    
+    # 提取任务专用模型（默认使用思考模式）
+    extraction_model: str = "qwen3.6-plus"
+    # 验证任务专用模型
+    validation_model: Optional[str] =  "qwen3.6-flash"
+    # 生成任务专用模型
+    generation_model: Optional[str] = "qwen3.7-plus"
+
+    # ========== 按模型独立配置 ==========
+    # 模型配置文件路径（JSON格式，包含限流/思考模式/超时/重试等）
+    # .env 通过 LLM_MODEL_CONFIGS_FILE 指向，此处为默认空值
+    llm_model_configs_file: str = ""
+    # 备用：内联JSON字符串（不推荐，优先用文件）
+    llm_model_configs: str = ""
+
     # ========== Windows Bridge配置 ==========
     # Windows桥接服务URL，用于跨平台调用Windows特定功能
     windows_bridge_url: Optional[str] = None
@@ -90,9 +97,11 @@ class Settings(BaseSettings):
     # 标签（段落）级并发的最大并发数
     max_paragraph_workers: int = 8
     # 标签内数据项的最大并发数
-    max_data_item_workers: int = 3
+    max_data_item_workers: int = 8
     # 摘要生成的最大并发数
     max_summary_workers: int = 8
+    # 生成/全流程任务的最大并发执行数（有界线程池，防止突发流量下线程失控）
+    generation_max_concurrent_tasks: int = 10
 
     # ========== RAGFlow 配置 ==========
     ragflow_api_key: str = os.getenv('RAGFLOW_API_KEY')
@@ -116,57 +125,7 @@ class Settings(BaseSettings):
             str: 输出目录路径，等同于compose_output_dir
         """
         return self.compose_output_dir
-    
-    @property
-    def dashscope_api_key(self) -> str:
-        """
-        DashScope API Key别名属性（兼容旧代码）
-        
-        Returns:
-            str: LLM API密钥
-        """
-        return self.llm_api_key
-    
-    @property
-    def llm_model_name(self) -> str:
-        """
-        LLM模型名称别名属性（兼容旧代码）
-        
-        Returns:
-            str: LLM模型名称
-        """
-        return self.llm_model
-    
-    @property
-    def extraction_model_name(self) -> str:
-        """
-        提取模型名称属性
-        
-        Returns:
-            str: 提取模型名称
-        """
-        return self.extraction_model
-    
-    @property
-    def validation_model_name(self) -> str:
-        """
-        验证模型名称属性
-        
-        Returns:
-            str: 验证模型名称，如果未配置则使用extraction_model
-        """
-        return self.validation_model or self.validation_model
-    
-    @property
-    def generation_model_name(self) -> str:
-        """
-        生成模型名称属性
-        
-        Returns:
-            str: 生成模型名称，如果未配置则使用llm_model
-        """
-        return self.generation_model or self.llm_model
-    
+
     def ensure_dirs(self):
         """
         确保必要的目录存在

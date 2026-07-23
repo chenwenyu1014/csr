@@ -9,8 +9,10 @@
 import re
 import json
 import logging
+import os
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
+from utils.output_manager import save_json
 from service.prompts.system_prompt_manager import SystemPromptManager
 from config import get_settings
 
@@ -122,6 +124,230 @@ class HeadingBasedChunker:
         logger.info(f"分块完成，共 {len(sections)} 个区域")
         return result
     
+    def chunk_by_paragraphs(self, markdown_content: str, file_name: str = "") -> Dict[str, Any]:
+        """
+        按段落感知打包分块（用于无标题/纯文本降级路径，替代固定字符窗口）
+
+        与 chunk_by_h1_headings 输出结构完全一致：{file_name, total_sections, sections[]}
+        每个 section: {section_id, title, content, summary, word_count, has_tables, table_count}
+
+        摘要策略（混合，成本优化）：
+        - 短块(<=CHAR_SUMMARY_DIRECT_CHARS)直接用 content 作 summary，零成本、信号最全
+        - 长块调 LLM 智能摘要(无 LLM 服务/失败时回退 _generate_simple_summary)
+
+        块大小：target≈2500 / max≈4000 / min≈800，env 可覆盖。
+        """
+        logger.info(f"开始按段落打包分块(character模式): {file_name}")
+
+        def _env_int(name: str, default: int) -> int:
+            try:
+                v = os.getenv(name)
+                return int(v) if v else default
+            except (ValueError, TypeError):
+                return default
+
+        target = _env_int('CHAR_SECTION_TARGET_CHARS', 2500)
+        max_chars = _env_int('CHAR_SECTION_MAX_CHARS', 4000)
+        min_chars = _env_int('CHAR_SECTION_MIN_CHARS', 800)
+        direct_chars = _env_int('CHAR_SUMMARY_DIRECT_CHARS', 500)
+
+        paragraphs = self._parse_paragraphs(markdown_content)
+        packed = self._pack_paragraphs(paragraphs, target, max_chars, min_chars)
+
+        logger.info(
+            f"段落打包完成: {len(paragraphs)} 段 -> {len(packed)} 个 section "
+            f"(target={target}, max={max_chars}, min={min_chars})"
+        )
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _process(i: int, paras: List[str]) -> Dict[str, Any]:
+            content = '\n\n'.join(paras).strip()
+            title = self._derive_title(content, i + 1)
+            table_count = self._count_tables(content)
+            summary = self._summarize_section(content, title, direct_chars)
+            return {
+                "index": i,
+                "section_data": {
+                    "section_id": f"sec_{i+1}",
+                    "title": title,
+                    "content": content,
+                    "summary": summary,
+                    "word_count": len(content),
+                    "has_tables": table_count > 0,
+                    "table_count": table_count,
+                },
+            }
+
+        max_workers = settings.max_summary_workers
+        section_results: List[Dict[str, Any]] = [None] * len(packed)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_index = {
+                executor.submit(_process, i, text): i
+                for i, text in enumerate(packed)
+            }
+            completed = 0
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                try:
+                    processed = future.result()
+                    section_results[processed["index"]] = processed["section_data"]
+                    completed += 1
+                    logger.info(f"✅ 已完成 {completed}/{len(packed)} 个 section 的摘要生成")
+                except Exception as e:
+                    logger.error(f"❌ 处理第 {idx+1} 个 section 时出错: {e}")
+                    paras = packed[idx] if idx < len(packed) else []
+                    content = '\n\n'.join(paras).strip()
+                    tc = self._count_tables(content)
+                    section_results[idx] = {
+                        "section_id": f"sec_{idx+1}",
+                        "title": self._derive_title(content, idx + 1),
+                        "content": content,
+                        "summary": "",  # 摘要生成失败，使用空摘要
+                        "word_count": len(content),
+                        "has_tables": tc > 0,
+                        "table_count": tc,
+                    }
+
+        result = {
+            "file_name": file_name,
+            "total_sections": len(section_results),
+            "sections": [s for s in section_results if s],
+        }
+        logger.info(f"分块完成，共 {len(result['sections'])} 个 section")
+        return result
+
+    def _parse_paragraphs(self, markdown_content: str) -> List[str]:
+        """
+        按空行切段落；处于表格内部的行不参与切分，整表作为一个段落单元
+
+        Args:
+            markdown_content: Markdown/纯文本内容
+
+        Returns:
+            List[str]: 段落列表（已 strip，空段已剔除）
+        """
+        if not markdown_content or not markdown_content.strip():
+            return []
+        lines = markdown_content.split('\n')
+        paragraphs: List[str] = []
+        current: List[str] = []
+        table_depth = 0
+        for line in lines:
+            if _TABLE_START_RE.search(line):
+                table_depth += 1
+            stripped = line.strip()
+            if table_depth == 0 and stripped == '' and current:
+                # 表格外空行 → 结束当前段落
+                paragraphs.append('\n'.join(current).strip())
+                current = []
+            else:
+                current.append(line)
+            if _TABLE_END_RE.search(line):
+                table_depth = max(0, table_depth - 1)
+        if current:
+            paragraphs.append('\n'.join(current).strip())
+        return [p for p in paragraphs if p]
+
+    def _pack_paragraphs(self, paragraphs: List[str], target: int,
+                         max_chars: int, min_chars: int) -> List[List[str]]:
+        """
+        贪心打包段落为 section：累加至 target 即 flush，超 max 强制切，末段过小并入上一段
+
+        Args:
+            paragraphs: 段落列表
+            target: 目标块大小（达此值即切，控制块数）
+            max_chars: 硬上限（单段超此值先在句子边界切分）
+            min_chars: 末段低于此值则并入上一段
+
+        Returns:
+            List[List[str]]: 每个 sublist 为一个 section 的段落集合
+        """
+        if not paragraphs:
+            return []
+        # 先把超长单段在句子边界切成子段，避免单段超过 max_chars
+        units: List[str] = []
+        for p in paragraphs:
+            if len(p) <= max_chars:
+                units.append(p)
+            else:
+                units.extend(self._split_long_paragraph(p, max_chars))
+
+        sections: List[List[str]] = []
+        current: List[str] = []
+        cur_len = 0
+        for u in units:
+            ulen = len(u)
+            # 加入后会超 max 且当前已有内容 → 先 flush
+            if current and cur_len + ulen + 1 > max_chars:
+                sections.append(current)
+                current = []
+                cur_len = 0
+            current.append(u)
+            cur_len += ulen + 1  # +1 估算换行
+            # 达 target 即 flush（贪心打包，控制块数）
+            if cur_len >= target:
+                sections.append(current)
+                current = []
+                cur_len = 0
+        if current:
+            # 末段过小则并入上一段
+            if sections and cur_len < min_chars:
+                sections[-1].extend(current)
+            else:
+                sections.append(current)
+        return sections
+
+    def _split_long_paragraph(self, text: str, max_chars: int) -> List[str]:
+        """在句子边界切分超长段落，使每片不超过 max_chars；单句仍超则硬切"""
+        if len(text) <= max_chars:
+            return [text]
+        sentences = re.split(r'(?<=[。！？；\n])', text)
+        sentences = [s for s in sentences if s]
+        pieces: List[str] = []
+        buf = ""
+        for s in sentences:
+            if len(buf) + len(s) <= max_chars:
+                buf += s
+            else:
+                if buf:
+                    pieces.append(buf)
+                    buf = ""
+                if len(s) > max_chars:
+                    # 单句本身超 max → 硬切
+                    for i in range(0, len(s), max_chars):
+                        pieces.append(s[i:i + max_chars])
+                else:
+                    buf = s
+        if buf:
+            pieces.append(buf)
+        return pieces
+
+    def _derive_title(self, text: str, idx: int) -> str:
+        """从 section 内容派生标题：取首条非空、非表格标记行，去前导#，截断~40字；无则回退 第N部分"""
+        for line in text.split('\n'):
+            if _TABLE_START_RE.search(line) or _TABLE_END_RE.search(line):
+                continue
+            t = line.strip().lstrip('#').strip()
+            if t:
+                return t[:40]
+        return f"第{idx}部分"
+
+    def _count_tables(self, content: str) -> int:
+        """统计 content 中的表格标记数（{{..._Start}}）"""
+        return len(_TABLE_START_RE.findall(content or ""))
+
+    def _summarize_section(self, content: str, title: str, direct_chars: int) -> str:
+        """
+        混合摘要：短块(<=direct_chars)直接用 content；长块调 LLM 智能摘要
+        （_generate_summary 内部已处理无 LLM/失败时回退简单摘要）
+        """
+        stripped = (content or "").strip()
+        if len(stripped) <= direct_chars:
+            return stripped
+        return self._generate_summary(content, title)
+
     def _parse_h1_sections(self, markdown_content: str) -> List[Dict[str, Any]]:
         """
         解析一级标题区域，保护表格完整性
@@ -259,9 +485,12 @@ class HeadingBasedChunker:
             
             
             prompt = ""
+            system_prompt = ""  # 兜底路径无 system 段，保持空串；主路径成功时由 build_messages 填充
             try:
                 spm = SystemPromptManager()
-                prompt = spm.build_prompt("chunk_section_summary", {"title": title, "content": clean_content})
+                messages = spm.build_messages("chunk_section_summary", {"title": title, "content": clean_content})
+                system_prompt = messages.get("system", "")
+                prompt = messages.get("user", "")
             except Exception:
                 prompt = ""
 
@@ -300,8 +529,8 @@ class HeadingBasedChunker:
 
             logger.info(f"调用LLM生成摘要: {title}")
             
-            # 调用LLM生成摘要
-            summary = self.llm_service.generate(prompt)
+            # 调用LLM生成摘要（摘要场景使用较短超时）
+            summary = self.llm_service.generate(prompt, timeout=60, system=system_prompt)
             
             if summary and len(summary.strip()) > 0:
                 # 清理生成的摘要
@@ -362,10 +591,7 @@ class HeadingBasedChunker:
         """
         try:
             output_file = Path(output_path)
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(chunks_data, f, ensure_ascii=False, indent=2)
+            save_json(output_file, chunks_data)
             
             logger.info(f"分块结果已保存到: {output_path}")
             return True

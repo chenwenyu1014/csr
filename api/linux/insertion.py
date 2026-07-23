@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 # ========== 本地导入 ==========
 from config import get_settings
+from utils.context_manager import set_project_desc
 
 # ========== 模块配置 ==========
 router = APIRouter()
@@ -64,8 +65,8 @@ async def insert_content_to_template(
         
         logger.info(f"模板插入请求: template={template_file}")
         
-        # 设置环境变量
-        os.environ["CURRENT_PROJECT_DESC"] = str(project_desc or "")
+        # 设置项目上下文（contextvars，每请求线程独立）
+        set_project_desc(str(project_desc or ""))
         
         # 检查 Windows Bridge 配置
         if not settings.windows_bridge_url:

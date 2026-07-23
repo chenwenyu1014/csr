@@ -8,13 +8,18 @@
 import json
 from pathlib import Path
 from datetime import datetime
+from threading import Lock
 from typing import Optional, Dict, Any
 import logging
+from utils.output_manager import save_json
 
 logger = logging.getLogger(__name__)
 
 # 映射文件路径
 MAPPING_FILE = Path('AAA/Preprocessing/file_mappings.json')
+
+# 写操作锁（防止并发写入导致数据覆盖丢失）
+_mapping_lock = Lock()
 
 
 def _load_mappings() -> Dict[str, Any]:
@@ -42,11 +47,8 @@ def _create_empty_mappings() -> Dict[str, Any]:
 def _save_mappings(mappings: Dict[str, Any]) -> None:
     """保存映射文件"""
     try:
-        MAPPING_FILE.parent.mkdir(parents=True, exist_ok=True)
         mappings['last_updated'] = datetime.now().isoformat()
-        
-        with open(MAPPING_FILE, 'w', encoding='utf-8') as f:
-            json.dump(mappings, f, ensure_ascii=False, indent=2)
+        save_json(MAPPING_FILE, mappings)
         
         logger.info(f"✓ 映射文件已保存: {MAPPING_FILE}")
     except Exception as e:
@@ -74,32 +76,33 @@ def add_file_mapping(
         status: 状态（success/fail）
         error_message: 错误信息（如果失败）
     """
-    mappings = _load_mappings()
-    
-    # 确保项目存在
-    if project_name not in mappings['projects']:
-        mappings['projects'][project_name] = {"files": {}}
-    
-    # 构建文件映射
-    file_mapping = {
-        "file_id": file_id,
-        "status": status,
-        "processed_at": datetime.now().isoformat()
-    }
-    
-    if status == "success":
-        file_mapping.update({
-            "preprocessed_json": preprocessed_json_path,
-            "preprocessed_dir": preprocessed_dir
-        })
-    else:
-        file_mapping["error_message"] = error_message or "处理失败"
-    
-    # 添加到映射
-    mappings['projects'][project_name]['files'][file_name] = file_mapping
-    
-    # 保存
-    _save_mappings(mappings)
+    with _mapping_lock:
+        mappings = _load_mappings()
+
+        # 确保项目存在
+        if project_name not in mappings['projects']:
+            mappings['projects'][project_name] = {"files": {}}
+
+        # 构建文件映射
+        file_mapping = {
+            "file_id": file_id,
+            "status": status,
+            "processed_at": datetime.now().isoformat()
+        }
+
+        if status == "success":
+            file_mapping.update({
+                "preprocessed_json": preprocessed_json_path,
+                "preprocessed_dir": preprocessed_dir
+            })
+        else:
+            file_mapping["error_message"] = error_message or "处理失败"
+
+        # 添加到映射
+        mappings['projects'][project_name]['files'][file_name] = file_mapping
+
+        # 保存
+        _save_mappings(mappings)
     
     logger.info(f"✓ 文件映射已更新: {project_name}/{file_name} ({status})")
 
@@ -172,14 +175,15 @@ def remove_file_mapping(project_name: str, file_name: str) -> None:
         project_name: 项目名称
         file_name: 文件名
     """
-    mappings = _load_mappings()
-    
-    if project_name in mappings.get('projects', {}):
-        project = mappings['projects'][project_name]
-        if file_name in project.get('files', {}):
-            del project['files'][file_name]
-            _save_mappings(mappings)
-            logger.info(f"✓ 文件映射已删除: {project_name}/{file_name}")
+    with _mapping_lock:
+        mappings = _load_mappings()
+
+        if project_name in mappings.get('projects', {}):
+            project = mappings['projects'][project_name]
+            if file_name in project.get('files', {}):
+                del project['files'][file_name]
+                _save_mappings(mappings)
+                logger.info(f"✓ 文件映射已删除: {project_name}/{file_name}")
 
 
 def get_project_files(project_name: str) -> Dict[str, Any]:

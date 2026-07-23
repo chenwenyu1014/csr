@@ -21,13 +21,21 @@
 import logging
 import os
 import json
-import hashlib
+import threading
 from pathlib import Path
+from utils.output_manager import save_json, save_text
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+# Word XML 命名空间
+_WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+_WNS_P = f'{{{_WNS}}}'
+
+# LibreOffice 不支持多实例并发，所有 soffice 调用必须串行
+_LIBREOFFICE_LOCK = threading.Lock()
 
 
 class ContentType(Enum):
@@ -44,7 +52,8 @@ class FileType(Enum):
     WORD_DOC = "doc"
     RTF = "rtf"
     PDF = "pdf"
-    EXCEL = "xlsx"
+    EXCEL_XLSX = "xlsx"
+    EXCEL_XLS = "xls"
     MARKDOWN = "markdown"
     UNKNOWN = "unknown"
 
@@ -181,7 +190,7 @@ class FileProcessor:
         
         # 3. 转换为中间格式（统一为Markdown或纯文本）
         converted = self._convert_to_intermediate(file_path, file_type, work_dir, content_type_override)
-        
+
         # 4. 获取Markdown内容；并在此处执行全局图片提取与替换，避免Base64导致正文过长
         marked_content = converted['content']
         global_md_images: List[Dict[str, Any]] = []
@@ -266,18 +275,18 @@ class FileProcessor:
                 pass
         
         # 7. 组装结果
-        processing_time = time.time() - start_time
+        processing_time = 0.0  # 实际总耗时在分块等后续步骤完成后统一计算
         
         # 保存MD文件（仅为了保留原始内容，不用于分块）
         if converted['content_type'] == ContentType.MARKDOWN and marked_content:
             md_file_path = work_dir / f"{file_path.stem}.md"
-            md_file_path.write_text(marked_content, encoding='utf-8')
+            save_text(md_file_path, marked_content)
             logger.info(f"Markdown文件已保存: {md_file_path}")
             if str(md_file_path) not in markdown_files:
                 markdown_files.append(str(md_file_path))
         
         # 确保markdown_files不为空（至少有一个主MD文件）
-        if not markdown_files and file_type == FileType.EXCEL:
+        if not markdown_files and file_type == FileType.EXCEL_XLSX:
             # 对于Excel，如果没有找到markdown文件，尝试从sheets/markdown目录查找
             md_dir = work_dir / "sheets" / "markdown"
             if md_dir.exists():
@@ -344,122 +353,56 @@ class FileProcessor:
                             pass
                         logger.info(f"检测到已有结构化分块文件，跳过重新分块: {existing_chunks}")
                     else:
-                        def _env_int(name: str, default: int) -> int:
-                            try:
-                                v = os.getenv(name)
-                                return int(v) if v else default
-                            except (ValueError, TypeError):
-                                return default
-
                         # 检查分块模式
-                        chunking_mode = os.getenv("CHUNKING_MODE", "heading")  # character | heading (默认使用heading)
+                        # 优先采用降级路径给出的 per-document 建议（无标题文档应走 character，避免 heading 退化为单块）
+                        chunking_mode = (converted.get('metadata', {}) or {}).get('suggested_chunking_mode') or os.getenv("CHUNKING_MODE", "heading")  # character | heading (默认使用heading)
                         
+                        # 初始化LLM服务（用于生成摘要；heading 与 character 两个分支共享）
+                        from service.windows.preprocessing.preprocessing_function.heading_based_chunker import HeadingBasedChunker
+                        llm_service = None
+                        try:
+                            from service.models import get_llm_service
+                            llm_service = get_llm_service("validation")
+                            logger.info("LLM服务初始化成功，将使用智能摘要")
+                        except Exception as e:
+                            logger.warning(f"无法初始化LLM服务，将使用简单摘要: {e}")
+
+                        chunker = HeadingBasedChunker(llm_service=llm_service)
+
                         if chunking_mode == "heading":
                             # 使用基于一级标题的分块器
-                            from service.windows.preprocessing.preprocessing_function.heading_based_chunker import HeadingBasedChunker
-                            
-                            # 初始化LLM服务（用于生成摘要）
-                            llm_service = None
-                            try:
-                                from service.models import get_llm_service
-                                llm_service = get_llm_service("validation")
-                                logger.info("LLM服务初始化成功，将使用智能摘要")
-                            except Exception as e:
-                                logger.warning(f"无法初始化LLM服务，将使用简单摘要: {e}")
-                            
-                            chunker = HeadingBasedChunker(llm_service=llm_service)
                             chunks_data = chunker.chunk_by_h1_headings(
                                 content_for_chunking, 
                                 file_path.name
                             )
-                            
-                            # 保存结构化分块结果（仅保留sections版本）
-                            chunks_json_path = work_dir / f"{file_path.stem}_chunks_structured.json"
-                            chunker.save_chunks_to_json(chunks_data, str(chunks_json_path))
-                            
-                            result.processing_info['chunking_mode'] = 'heading'
-                            # ✅ 保存相对路径（相对于项目根目录），跨平台兼容
-                            try:
-                                from pathlib import Path as P
-                                rel_path = chunks_json_path.relative_to(P.cwd())
-                                result.processing_info['structured_chunks_file'] = str(rel_path).replace("\\", "/")
-                            except ValueError:
-                                result.processing_info['structured_chunks_file'] = f"{file_path.stem}_chunks_structured.json"
-                            
-                            # 设置默认参数（用于索引文件兼容性）
-                            max_chars = 0  # 不适用
-                            min_chars = 0  # 不适用
-                            overlap_sents = 0  # 不适用
-                            
                         else:
-                            # 使用原有的字符数分块器
-                            from service.windows.preprocessing.preprocessing_function.markdown.markdown_chunker import chunk_markdown
-                            
-                            max_chars = _env_int('CHUNK_MAX_CHARS', 1200)
-                            min_chars = _env_int('CHUNK_MIN_CHARS', 600)
-                            overlap_sents = _env_int('CHUNK_OVERLAP_SENTENCES', 1)
-                            chunks = chunk_markdown(
+                            # character 模式：按段落感知打包分块，产出与 heading 一致的 sections 结构
+                            # （短块<=CHAR_SUMMARY_DIRECT_CHARS 直接用内容作 summary；长块调 LLM 智能摘要）
+                            chunks_data = chunker.chunk_by_paragraphs(
                                 content_for_chunking,
-                                max_chars=max_chars,
-                                min_chars=min_chars,
-                                overlap_sentences=overlap_sents
+                                file_path.name
                             )
-                            result.processing_info['chunking_mode'] = 'character'
-                        
-                        # 仅在字符数分块模式下，生成扁平化的 chunks.json（heading 模式不再生成）
-                        if chunking_mode == "character":
-                            total = len(chunks)
-                            chunk_meta_list = []
-                            for idx, ch in enumerate(chunks, start=1):
-                                # 不再生成 MD 文件，只构建元数据
-                                chunk_meta = {
-                                    'index': idx,
-                                    'total': total,
-                                    'chunk_id': f"{file_path.stem}_{idx:04d}",
-                                    'title_path': ch.get('title_path', []),
-                                    'overlap_from_prev': ch.get('overlap_from_prev', 0),
-                                    'char_len': len(ch.get('text') or ''),
-                                    'content': ch.get('text') or '',  # 直接保存内容到 JSON
-                                }
-                                chunk_meta_list.append(chunk_meta)
 
-                            chunks_json_path = work_dir / f"{file_path.stem}_chunks.json"
-                            chunks_data = {
-                                'title': file_path.name,
-                                'total_chunks': total,
-                                'chunks': chunk_meta_list,
-                                'chunking_params': {
-                                    'mode': 'character',
-                                    'max_chars': max_chars,
-                                    'min_chars': min_chars,
-                                    'overlap_sentences': overlap_sents,
-                                }
-                            }
-                            chunks_json_path.write_text(
-                                json.dumps(chunks_data, ensure_ascii=False, indent=2), 
-                                encoding='utf-8'
-                            )
-                            
-                            # 写入 processing_info（字符分块才使用扁平文件）
-                            try:
-                                result.processing_info['chunks_total'] = total
-                                # ✅ 保存相对路径（相对于项目根目录），跨平台兼容
-                                try:
-                                    from pathlib import Path as P
-                                    rel_path = chunks_json_path.relative_to(P.cwd())
-                                    result.processing_info['structured_chunks_file'] = str(rel_path).replace("\\", "/")
-                                except ValueError:
-                                    result.processing_info['structured_chunks_file'] = f"{file_path.stem}_chunks.json"
-                                result.processing_info['chunk_params'] = {
-                                    'max_chars': max_chars,
-                                    'min_chars': min_chars,
-                                    'overlap_sentences': overlap_sents,
-                                    'chunking_mode': chunking_mode,
-                                }
-                            except Exception:
-                                pass
+                        # 保存结构化分块结果（heading 与 character 统一输出文件名与结构）
+                        chunks_json_path = work_dir / f"{file_path.stem}_chunks_structured.json"
+                        chunker.save_chunks_to_json(chunks_data, str(chunks_json_path))
+
+                        result.processing_info['chunking_mode'] = chunking_mode
+                        result.processing_info['chunks_total'] = chunks_data.get('total_sections') or len(chunks_data.get('sections', []))
+                        # ✅ 保存相对路径（相对于项目根目录），跨平台兼容
+                        try:
+                            from pathlib import Path as P
+                            rel_path = chunks_json_path.relative_to(P.cwd())
+                            result.processing_info['structured_chunks_file'] = str(rel_path).replace("\\", "/")
+                        except ValueError:
+                            result.processing_info['structured_chunks_file'] = f"{file_path.stem}_chunks_structured.json"
+                        result.processing_info['chunk_params'] = {'chunking_mode': chunking_mode}
         except Exception as e:
             logger.warning(f"Markdown 分块失败或未执行: {e}")
+
+        # 统一计算总耗时（包含 OCR 兜底、分块、LLM 摘要等全部步骤）
+        processing_time = time.time() - start_time
+        result.processing_info['processing_time'] = processing_time
 
         # 9. 持久化标准化结果（preprocessed.json）
         try:
@@ -541,7 +484,7 @@ class FileProcessor:
                     'work_dir': str(out_dir),
                 }
             # Excel/RTF使用相同结构
-            elif pre.file_type in [FileType.EXCEL, FileType.RTF]:
+            elif pre.file_type in [FileType.EXCEL_XLSX, FileType.RTF]:
                 # Excel/RTF标准化regions
                 standardized_regions = self._ensure_standard_regions(pre.regions or [])
                 standardized_info = self._ensure_standard_processing_info(pre.processing_info or {})
@@ -672,14 +615,55 @@ class FileProcessor:
         elif suffix == '.rtf':
             # RTF文件走独立的RTF Pipeline（RTF→Excel→拆分Sheet→Markdown）
             return FileType.RTF
-        elif suffix in ['.xlsx', '.xls']:
-            return FileType.EXCEL
+        elif suffix == '.xlsx':
+            return FileType.EXCEL_XLSX
+        elif suffix == '.xls':
+            return FileType.EXCEL_XLS
         elif suffix == '.pdf':
             return FileType.PDF
         else:
             return FileType.UNKNOWN
-    
-    
+
+    def _normalize_format(self, file_path: Path, file_type: FileType, work_dir: Path) -> Path:
+        """
+        使用 LibreOffice 将 .doc/.xls 转为 .docx/.xlsx，
+        使后续流程统一使用 python-docx / openpyxl 处理，彻底消除 COM 依赖。
+        """
+        import subprocess
+
+        if file_type == FileType.WORD_DOC:
+            target_fmt = 'docx'
+        elif file_type == FileType.EXCEL_XLS:
+            target_fmt = 'xlsx'
+        else:
+            return file_path
+
+        converted = work_dir / f"{file_path.stem}.{target_fmt}"
+
+        # 复用已有转换结果
+        if converted.exists() and converted.stat().st_size > 0:
+            logger.info(f"复用已有格式转换: {converted}")
+            return converted
+
+        try:
+            with _LIBREOFFICE_LOCK:
+                subprocess.run([
+                    'soffice', '--headless', '--convert-to', target_fmt,
+                    '--outdir', str(work_dir), str(file_path)
+                ], check=True, timeout=120, capture_output=True)
+
+            if converted.exists() and converted.stat().st_size > 0:
+                logger.info(f"格式转换成功: {file_path.name} → {converted.name}")
+                return converted
+            else:
+                raise RuntimeError("LibreOffice 未生成目标文件")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"LibreOffice 转换超时: {file_path.name}")
+        except Exception:
+            raise RuntimeError(
+                f"格式转换失败: {file_path.name}，请确保 LibreOffice 已安装且在 PATH 中"
+            )
+
     def _normalize_content_type(self, content_type: Optional[str]) -> Optional[str]:
         """
         规范化内容类型：将用户输入的类型映射到内部使用的类型
@@ -719,7 +703,7 @@ class FileProcessor:
         if file_type == FileType.RTF:
             # RTF文档 → 独立的RTF Pipeline（RTF→Excel→拆分Sheet→Markdown）
             try:
-                from service.windows.preprocessing.preprocessing_function.rtf.rtf_pipeline import run as rtf_run
+                from service.windows.preprocessing.preprocessing_function.rtf.rtf_pipeline import rtf_run
                 return rtf_run(file_path, work_dir)
             except Exception as e:
                 logger.error(f"RTF Pipeline失败: {e}", exc_info=True)
@@ -731,47 +715,50 @@ class FileProcessor:
             normalized_type = self._normalize_content_type(content_type_override)
             # 委派到 Word Pipeline
             try:
-                from service.windows.preprocessing.preprocessing_function.word.word_pipeline import run_docx as word_run_docx
+                from service.windows.preprocessing.preprocessing_function.word.word_pipeline import word_run as word_run_docx
                 return word_run_docx(file_path, work_dir, mode=normalized_type)
             except Exception as e:
                 logger.warning(f"Word(.docx) 管道失败，回退到内置流程: {e}")
                 return self._convert_word_by_kind(file_path, work_dir, content_type_override=normalized_type)
         
         elif file_type == FileType.WORD_DOC:
-            # 旧版Word文档：尊重内容类型覆盖，否则走稳健路径（PDF+OCR）
+            # .doc → LibreOffice 转 .docx → 走 docx pipeline
+            docx_path = self._normalize_format(file_path, file_type, work_dir)
             normalized_type = self._normalize_content_type(content_type_override)
             try:
-                from service.windows.preprocessing.preprocessing_function.word.word_pipeline import run_doc as word_run_doc
-                return word_run_doc(file_path, work_dir, mode=normalized_type)
+                from service.windows.preprocessing.preprocessing_function.word.word_pipeline import word_run as word_run_docx
+                return word_run_docx(docx_path, work_dir, mode=normalized_type)
             except Exception as e:
                 logger.warning(f"Word(.doc) 管道失败，回退到内置流程: {e}")
-                if normalized_type == 'tables':
-                    return self._word_tables_split_to_docx(file_path, work_dir)
-                elif normalized_type == 'images':
-                    return self._word_doc_images_export_to_docx(file_path, work_dir)
-                return self._word_doc_to_markdown(file_path, work_dir)
+                return self._convert_word_by_kind(docx_path, work_dir, content_type_override=normalized_type)
         
         elif file_type == FileType.PDF:
-            # 正常PDF → 直接转 Markdown
+            # 正常PDF → 直接转 Markdown（OCR 优先，PyMuPDF 兜底）
             try:
-                from service.windows.preprocessing.preprocessing_function.pdf.pdf_pipeline import run as pdf_run
+                from service.windows.preprocessing.preprocessing_function.pdf.pdf_pipeline import pdf_run
                 return pdf_run(file_path, work_dir, scanned=False)
             except Exception as e:
-                logger.warning(f"PDF管道失败，回退到内置流程: {e}")
-                return self._pdf_to_markdown_direct(file_path, work_dir)
-        
-        elif file_type == FileType.EXCEL:
+                logger.error(f"PDF Pipeline失败: {e}", exc_info=True)
+                raise RuntimeError(f"PDF转换失败: {e}")
+
+        elif file_type == FileType.EXCEL_XLS:
+            # .xls → LibreOffice 转 .xlsx → 走 xlsx pipeline
+            xlsx_path = self._normalize_format(file_path, file_type, work_dir)
+            try:
+                from service.windows.preprocessing.preprocessing_function.excel.excel_pipeline import excel_run
+                return excel_run(xlsx_path, work_dir)
+            except Exception as e:
+                logger.error(f"Excel(.xls) 管道失败: {e}", exc_info=True)
+                raise RuntimeError(f"Excel转换失败: {e}")
+
+        elif file_type == FileType.EXCEL_XLSX:
             # 委派到 Excel Pipeline：拆分Sheet并生成Markdown
             try:
-                from service.windows.preprocessing.preprocessing_function.excel.excel_pipeline import run as excel_run
+                from service.windows.preprocessing.preprocessing_function.excel.excel_pipeline import excel_run
                 return excel_run(file_path, work_dir)
             except Exception as e:
                 logger.error(f"Excel 管道失败: {e}", exc_info=True)
-                # 兜底：保持旧行为（仅拆分Sheet），避免整体失败
-                try:
-                    return self._excel_split_sheets(file_path, work_dir)
-                except Exception:
-                    raise
+                raise RuntimeError(f"Excel转换失败: {e}")
         
         else:
             # 未知格式 → 尝试读取纯文本
@@ -834,7 +821,8 @@ class FileProcessor:
                     pass
             
             # Step 1: 标记Word文档中的表格和图片
-            marked_word = self._mark_word_tables_and_images(word_path, work_dir)
+            from service.windows.preprocessing.preprocessing_function.word.word_pipeline import word_marker
+            marked_word = word_marker.mark_tables_and_images(word_path, work_dir)
             if not marked_word or not marked_word.exists():
                 logger.warning("Word标记失败，使用原文件")
                 marked_word = word_path
@@ -861,7 +849,8 @@ class FileProcessor:
                 return self._fallback_word_text_extraction(word_path, marked_word_path=marked_word)
             
             # Step 3: PDF → Markdown（OCR）
-            markdown_content = self._pdf_to_markdown_ocr(pdf_file, work_dir)
+            from service.windows.preprocessing.preprocessing_function.pdf.pdf_pipeline import pdf_to_markdown_ocr
+            markdown_content = pdf_to_markdown_ocr(pdf_file, work_dir)
             if not markdown_content:
                 logger.error("PDF→Markdown失败")
                 if self._ocr_strict():
@@ -871,7 +860,7 @@ class FileProcessor:
             
             # 写入缓存文件与manifest（包括word_regions）
             try:
-                md_file.write_text(markdown_content, encoding="utf-8")
+                save_text(md_file, markdown_content)
                 manifest = {
                     "marked_word": str(marked_word),
                     "pdf_file": str(pdf_file),
@@ -879,7 +868,7 @@ class FileProcessor:
                     "word_regions": word_regions,
                     "created_at": __import__("datetime").datetime.now().isoformat(timespec='seconds')
                 }
-                stage["manifest"].write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+                save_json(stage["manifest"], manifest)
                 stage["done"].write_text("ok", encoding="utf-8")
             except Exception:
                 pass
@@ -905,280 +894,6 @@ class FileProcessor:
             logger.error(f"Word完整转换失败: {e}，回退到简单提取", exc_info=True)
             return self._fallback_word_text_extraction(word_path)
 
-    def _word_doc_to_markdown(self, word_path: Path, work_dir: Path) -> Dict[str, Any]:
-        """
-        旧版 Word (.doc) → PDF → OCR → Markdown 的稳健通道。
-        同时尝试导出所有表格与图片为独立的 .docx 区域文件，便于下游使用。
-        """
-        try:
-            logger.info(f"开始 .doc 转 Markdown 流程: {word_path}")
-            # 使用原Word文件名命名MD文件
-            md_file = work_dir / f"{word_path.stem}.md"
-            stage = self._stage_paths(work_dir, "word_doc_md")
-            # 复用缓存
-            if md_file.exists() and stage["manifest"].exists():
-                try:
-                    manifest = json.loads(stage["manifest"].read_text(encoding="utf-8"))
-                    markdown_content = md_file.read_text(encoding="utf-8")
-                    logger.info("复用缓存的 .doc→Markdown 结果")
-                    # 读取缓存的 regions
-                    cached_regions = manifest.get("word_regions") or []
-                    return {
-                        'content': markdown_content,
-                        'content_type': ContentType.MARKDOWN,
-                        'text': markdown_content,
-                        'word_regions': cached_regions,
-                        'metadata': {
-                            'conversion_method': 'word_doc_pdf_ocr',
-                            'pdf_file': manifest.get('pdf_file'),
-                            'steps': ['word_to_pdf', 'pdf_to_md'],
-                            'tables_total': manifest.get('tables_total', 0),
-                            'images_total': manifest.get('images_total', 0),
-                            'cache_reused': True,
-                        }
-                    }
-                except Exception:
-                    pass
-
-            # Step 1: .doc → PDF（优先 COM，内部已做好资源释放）
-            pdf_file = self._word_to_pdf(word_path, work_dir)
-            if not pdf_file or not pdf_file.exists():
-                logger.error(".doc→PDF转换失败")
-                if self._ocr_strict():
-                    raise RuntimeError("OCR_STRICT=1: .doc→PDF failed")
-                # 使用 COM 提取纯文本作为兜底
-                text = ''
-                try:
-                    import pythoncom  # type: ignore
-                    import win32com.client  # type: ignore
-                    pythoncom.CoInitialize()
-                    try:
-                        from utils.windows_com import safe_dispatch
-                        word_app = safe_dispatch("Word.Application", use_ex=False, logger=logger)
-                        word_app.Visible = False
-                        doc = word_app.Documents.Open(str(word_path.resolve()), ReadOnly=True)
-                        try:
-                            text = str(doc.Content.Text or '')
-                        except Exception:
-                            text = ''
-                        finally:
-                            try:
-                                doc.Close(SaveChanges=False)
-                            except Exception:
-                                pass
-                            try:
-                                word_app.Quit()
-                            except Exception:
-                                pass
-                    finally:
-                        pythoncom.CoUninitialize()
-                except Exception as e:
-                    logger.error(f"COM纯文本提取失败: {e}")
-                return {
-                    'content': text,
-                    'content_type': ContentType.PLAIN_TEXT,
-                    'text': text,
-                    'metadata': {
-                        'conversion_method': 'fallback_doc_text_via_com',
-                        'error': 'word_to_pdf_failed'
-                    }
-                }
-
-            # Step 2: PDF → Markdown（OCR）
-            markdown_content = self._pdf_to_markdown_ocr(pdf_file, work_dir)
-            if not markdown_content:
-                logger.error("PDF→Markdown失败")
-                if self._ocr_strict():
-                    raise RuntimeError("OCR_STRICT=1: PDF→Markdown failed")
-                # 同样兜底用 COM 文本
-                text = ''
-                try:
-                    import pythoncom  # type: ignore
-                    import win32com.client  # type: ignore
-                    pythoncom.CoInitialize()
-                    try:
-                        from utils.windows_com import safe_dispatch
-                        word_app = safe_dispatch("Word.Application", use_ex=False, logger=logger)
-                        word_app.Visible = False
-                        doc = word_app.Documents.Open(str(word_path.resolve()), ReadOnly=True)
-                        try:
-                            text = str(doc.Content.Text or '')
-                        except Exception:
-                            text = ''
-                        finally:
-                            try:
-                                doc.Close(SaveChanges=False)
-                            except Exception:
-                                pass
-                            try:
-                                word_app.Quit()
-                            except Exception:
-                                pass
-                    finally:
-                        pythoncom.CoUninitialize()
-                except Exception as e:
-                    logger.error(f"COM纯文本提取失败: {e}")
-                return {
-                    'content': text,
-                    'content_type': ContentType.PLAIN_TEXT,
-                    'text': text,
-                    'metadata': {
-                        'conversion_method': 'fallback_doc_text_via_com',
-                        'pdf_file': str(pdf_file),
-                        'error': 'pdf_ocr_failed'
-                    }
-                }
-
-            # 可选：导出所有表与图为独立docx区域
-            regions: List[Dict[str, Any]] = []
-            tables_total = 0
-            images_total = 0
-            try:
-                from service.windows.insertion.word_document_service import word_document_service
-                export_dir = work_dir / 'regions_word'
-                export_dir.mkdir(parents=True, exist_ok=True)
-                exported = word_document_service.export_all_tables_and_images(str(word_path), str(export_dir)) or []
-                t_idx = 0
-                i_idx = 0
-                for item in exported:
-                    name = item.get('name') or ''
-                    path = item.get('path') or ''
-                    if not name or not path:
-                        continue
-                    if name.startswith('Table_'):
-                        t_idx += 1
-                        tables_total += 1
-                        regions.append({
-                            "name": name,
-                            "type": "table",
-                            "index": t_idx,
-                            "word_file": path,
-                            "file_path": path
-                        })
-                    elif name.startswith('Image_'):
-                        i_idx += 1
-                        images_total += 1
-                        regions.append({
-                            "name": name,
-                            "type": "image",
-                            "index": i_idx,
-                            "word_file": path,
-                            "file_path": path
-                        })
-            except Exception as e:
-                logger.warning(f"导出 .doc 区域失败（忽略）：{e}")
-
-            # 保存缓存
-            try:
-                md_file.write_text(markdown_content, encoding="utf-8")
-                manifest = {
-                    "pdf_file": str(pdf_file),
-                    "markdown_file": str(md_file),
-                    "word_regions": regions,
-                    "tables_total": tables_total,
-                    "images_total": images_total,
-                    "created_at": __import__("datetime").datetime.now().isoformat(timespec='seconds')
-                }
-                stage["manifest"].write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-                stage["done"].write_text("ok", encoding="utf-8")
-            except Exception:
-                pass
-
-            logger.info(f".doc 转换成功，Markdown长度: {len(markdown_content)} 字符")
-            return {
-                'content': markdown_content,
-                'content_type': ContentType.MARKDOWN,
-                'text': markdown_content,
-                'word_regions': regions,
-                'metadata': {
-                    'conversion_method': 'word_doc_pdf_ocr',
-                    'pdf_file': str(pdf_file),
-                    'steps': ['word_to_pdf', 'pdf_to_md'],
-                    'tables_total': tables_total,
-                    'images_total': images_total
-                }
-            }
-        except Exception as e:
-            if self._ocr_strict():
-                logger.error(f".doc 转换失败(strict): {e}")
-                raise
-            logger.error(f".doc 转换失败: {e}", exc_info=True)
-            return {
-                'content': '',
-                'content_type': ContentType.PLAIN_TEXT,
-                'text': '',
-                'metadata': {
-                    'conversion_method': 'failed',
-                    'error': str(e)
-                }
-            }
-
-    def _word_doc_images_export_to_docx(self, word_path: Path, work_dir: Path) -> Dict[str, Any]:
-        """
-        针对 .doc 的图片导出：使用 COM 将每张图片导出为独立 .docx 文件，并返回 regions。
-        """
-        try:
-            sp = self._stage_paths(work_dir, "word_doc_images_export")
-            # 复用缓存
-            if sp["manifest"].exists():
-                try:
-                    manifest = json.loads(sp["manifest"].read_text(encoding="utf-8"))
-                    regions = manifest.get("regions") or []
-                    if regions:
-                        logger.info("复用缓存的 .doc 图片导出结果")
-                        return {
-                            'content': '',
-                            'content_type': ContentType.STRUCTURED,
-                            'text': '',
-                            'word_regions': regions,
-                            'metadata': {
-                                'conversion_method': 'word_doc_images_export',
-                                'images_total': len(regions),
-                                'cache_reused': True
-                            }
-                        }
-                except Exception:
-                    pass
-
-            from service.windows.insertion.word_document_service import word_document_service
-            export_dir = work_dir / 'regions_word'
-            export_dir.mkdir(parents=True, exist_ok=True)
-            exported = word_document_service.export_all_tables_and_images(str(word_path), str(export_dir)) or []
-            regions: List[Dict[str, Any]] = []
-            idx = 0
-            for item in exported:
-                name = item.get('name') or ''
-                path = item.get('path') or ''
-                if not name or not path:
-                    continue
-                if name.startswith('Image_'):
-                    idx += 1
-                    regions.append({
-                        "name": name,
-                        "type": "image",
-                        "index": idx,
-                        "word_file": path,
-                        "file_path": path
-                    })
-            result = {
-                'content': '',
-                'content_type': ContentType.STRUCTURED,
-                'text': '',
-                'word_regions': regions,
-                'metadata': {
-                    'conversion_method': 'word_doc_images_export',
-                    'images_total': len(regions)
-                }
-            }
-            try:
-                sp["manifest"].write_text(json.dumps({"regions": regions}, ensure_ascii=False, indent=2), encoding="utf-8")
-                sp["done"].write_text("ok", encoding="utf-8")
-            except Exception:
-                pass
-            return result
-        except Exception as e:
-            logger.error(f".doc 图片导出失败: {e}", exc_info=True)
-            return self._skip_processing_output(kind='images', via='word_doc_images_export_failed')
     def _convert_word_by_kind(self, word_path: Path, work_dir: Path, content_type_override: Optional[str] = None) -> Dict[str, Any]:
         """
         根据 Word 内容类型（文本/纯图片/纯表）选择转换策略：
@@ -1191,21 +906,6 @@ class FileProcessor:
             work_dir: 工作目录
             content_type_override: 手动指定的内容类型（'text', 'images', 'tables'），如果提供则覆盖自动分类
         """
-        # 如果是RTF文件，需要先转换为Word格式才能进行分类和处理
-        is_rtf = word_path.suffix.lower() == '.rtf'
-        if is_rtf:
-            # RTF文件通过Word COM转换为临时docx文件，然后按照Word处理
-            try:
-                converted_docx = self._rtf_to_docx(word_path, work_dir)
-                if converted_docx and converted_docx.exists():
-                    word_path = converted_docx
-                    logger.info(f"RTF文件已转换为Word格式: {converted_docx}")
-                else:
-                    # 转换失败，直接走Word处理流程（可能会失败，但至少尝试）
-                    logger.warning(f"RTF转Word失败，尝试直接处理RTF文件")
-            except Exception as e:
-                logger.warning(f"RTF转Word过程出错: {e}，尝试直接处理")
-        
         # 如果提供了手动指定的类型，使用它；否则自动分类
         if content_type_override:
             kind = content_type_override
@@ -1215,13 +915,8 @@ class FileProcessor:
                 kind = self._classify_word_content(word_path)
                 logger.info(f"自动分类Word内容类型: {kind}")
             except Exception as e:
-                # RTF文件可能无法用python-docx打开，使用稳健路径
-                if is_rtf:
-                    logger.warning(f"RTF文件无法自动分类: {e}，使用默认类型: text")
-                    kind = "text"  # RTF通常包含文本，使用text类型
-                else:
-                    kind = "images"  # 无法分类时走稳健路径（PDF+OCR）
-                    logger.warning(f"Word内容分类失败，使用默认类型: {kind}")
+                kind = "text"  # 无法分类时走稳健路径（PDF+OCR）
+                logger.warning(f"Word内容分类失败，{e}，使用默认类型: {kind}")
 
         if kind == "tables":
             # 仅做表格拆分：每个表格导出为独立的 .docx
@@ -1233,11 +928,8 @@ class FileProcessor:
             # 其余（文本为主）：按原本Word路径（标记→PDF→OCR→Markdown）
             out = self._word_to_markdown(word_path, work_dir)
             try:
-                out.setdefault('metadata', {})['word_content_class'] = 'text'
                 if content_type_override:
-                    out['metadata']['content_type_override'] = content_type_override
-                if is_rtf:
-                    out['metadata']['original_file_type'] = 'rtf'
+                    out.setdefault('metadata', {})['content_type_override'] = content_type_override
             except Exception:
                 pass
             return out
@@ -1254,7 +946,7 @@ class FileProcessor:
             from docx import Document  # type: ignore
             doc = Document(word_path)
         except Exception:
-            return "images"  # 无法打开，走稳健路径
+            return "text"  # 无法打开，走稳健路径
 
         try:
             text_chars = sum(len((p.text or '').strip()) for p in doc.paragraphs)
@@ -1303,466 +995,72 @@ class FileProcessor:
             return "images"
         return "text"
 
-    def _word_tables_to_markdown(self, word_path: Path, work_dir: Path) -> Dict[str, Any]:
-        """
-        将 Word 表格抽取为 Markdown 文本（不依赖OCR）。
-        简化规则：
-        - 逐表输出 Markdown 表格
-        - 非表格段落仅保留少量上下文（可选）
-        """
+    def _table_to_markdown(self, table, index: int) -> str:
+        """将单个 docx 表格序列化为 Markdown 表格（含 {{Table_N_Start/End}} 标签）。
+        与 heading_based_chunker 的 _TABLE_START_RE/_TABLE_END_RE 约定一致。"""
+        rows = []
         try:
-            from docx import Document  # type: ignore
-            doc = Document(word_path)
+            for row in table.rows:
+                cells = []
+                for cell in row.cells:
+                    # 合并换行，清理竖线
+                    cell_text = (cell.text or '').replace('\n', ' ').replace('|', '\\|').strip()
+                    cells.append(cell_text)
+                rows.append(cells)
+        except Exception:
+            return ""
 
-            md_parts: list[str] = []
+        if not rows:
+            return ""
 
-            # 可选：保留极少文本上下文（标题）
-            header_texts = []
-            try:
-                for p in doc.paragraphs[:5]:
-                    txt = (p.text or '').strip()
-                    if txt:
-                        header_texts.append(txt)
-            except Exception:
-                pass
-            if header_texts:
-                md_parts.append("\n\n".join(header_texts))
+        # 构造 Markdown 表格（首行作表头，其余为正文行）
+        header = rows[0]
+        body_rows = rows[1:] if len(rows) > 1 else []
+        parts = [f"{{{{Table_{index}_Start}}}}"]
+        parts.append("| " + " | ".join(header) + " |")
+        parts.append("| " + " | ".join(["---"] * len(header)) + " |")
+        for r in body_rows:
+            parts.append("| " + " | ".join(r) + " |")
+        parts.append(f"{{{{Table_{index}_End}}}}")
+        return "\n".join(parts)
 
-            table_index = 0
-            for t in doc.tables:
-                table_index += 1
-                # 收集行
-                rows = []
-                try:
-                    for row in t.rows:
-                        cells = []
-                        for cell in row.cells:
-                            # 合并换行，清理竖线
-                            cell_text = (cell.text or '').replace('\n', ' ').replace('|', '\\|').strip()
-                            cells.append(cell_text)
-                        rows.append(cells)
-                except Exception:
-                    continue
-
-                if not rows:
-                    continue
-
-                # 构造 Markdown 表格
-                # 若首行可作表头，否则也统一按表头格式输出
-                header = rows[0]
-                body_rows = rows[1:] if len(rows) > 1 else []
-
-                md_parts.append(f"{{{{Table_{table_index}_Start}}}}")
-                md_parts.append("| " + " | ".join(header) + " |")
-                md_parts.append("| " + " | ".join(["---"] * len(header)) + " |")
-                for r in body_rows:
-                    md_parts.append("| " + " | ".join(r) + " |")
-                md_parts.append(f"{{{{Table_{table_index}_End}}}}")
-
-            md_text = "\n".join(md_parts).strip()
-            if not md_text:
-                return {
-                    'content': '',
-                    'content_type': ContentType.MARKDOWN,
-                    'text': '',
-                    'metadata': {'conversion_method': 'word_tables_to_markdown', 'empty': True}
-                }
-
-            return {
-                'content': md_text,
-                'content_type': ContentType.MARKDOWN,
-                'text': md_text,
-                'metadata': {'conversion_method': 'word_tables_to_markdown'}
-            }
-        except Exception as e:
-            logger.error(f"提取Word表格为Markdown失败: {e}", exc_info=True)
-            return {
-                'content': '',
-                'content_type': ContentType.MARKDOWN,
-                'text': '',
-                'metadata': {'conversion_method': 'word_tables_to_markdown_failed', 'error': str(e)}
-            }
-
-    def _skip_processing_output(self, kind: str, via: str = "skipped") -> Dict[str, Any]:
-        """
-        生成一个“跳过处理”的标准占位结果，等待后续规则。
-        kind: 'tables' | 'images' | ...
-        """
-        return {
-            'content': '',
-            'content_type': ContentType.MARKDOWN,
-            'text': '',
-            'metadata': {
-                'conversion_method': via,
-                'skipped': True,
-                'word_content_class': kind
-            }
-        }
-
-    def _rtf_to_docx(self, rtf_path: Path, work_dir: Path) -> Optional[Path]:
-        """
-        将RTF文件转换为Word文档格式（.docx）
-        
-        使用Word COM打开RTF文件并另存为DOCX格式。
-        
-        Args:
-            rtf_path: RTF文件路径
-            work_dir: 工作目录
-            
-        Returns:
-            转换后的DOCX文件路径，失败返回None
-        """
+    def _heading_level(self, paragraph) -> "Optional[int]":
+        """从段落样式判断 markdown 标题层级（1-6），非标题返回 None。
+        兼容英文 'Heading N'、中文本地化 '标题 N'、'Title'/'标题'、style_id='HeadingN'。"""
+        import re
         try:
-            output_docx = work_dir / f"{rtf_path.stem}_converted.docx"
-            
-            # 如果已存在转换文件，直接返回
-            if output_docx.exists():
-                logger.info(f"RTF转Word文件已存在，跳过: {output_docx}")
-                return output_docx
-            
-            logger.info(f"开始RTF转换为Word格式: {rtf_path}")
-            
-            # 方法1: 使用Word COM（Windows）
-            try:
-                import pythoncom  # type: ignore
-                import win32com.client as win32  # type: ignore
-                from utils.windows_com import safe_dispatch
-                
-                pythoncom.CoInitialize()
-                try:
-                    word = safe_dispatch("Word.Application", use_ex=True, logger=logger)
-                    word.Visible = False
-                    word.DisplayAlerts = 0
-                    
-                    doc = None
-                    try:
-                        # 打开RTF文件
-                        doc = word.Documents.Open(
-                            str(rtf_path),
-                            ConfirmConversions=False,
-                            ReadOnly=True,
-                            AddToRecentFiles=False
-                        )
-                        
-                        # 另存为DOCX格式
-                        wdFormatXMLDocument = 12  # .docx格式
-                        doc.SaveAs2(
-                            FileName=str(output_docx),
-                            FileFormat=wdFormatXMLDocument,
-                            AddToRecentFiles=False
-                        )
-                        
-                        logger.info(f"RTF转Word成功: {output_docx}")
-                        return output_docx
-                        
-                    finally:
-                        if doc is not None:
-                            doc.Close(SaveChanges=False)
-                        word.Quit()
-                finally:
-                    pythoncom.CoUninitialize()
-                    
-            except ImportError:
-                logger.warning("win32com不可用，无法使用Word COM转换RTF")
-            except Exception as e:
-                logger.warning(f"Word COM转换RTF失败: {e}")
-            
-            
-            # 转换失败
-            logger.error(f"RTF转Word失败，无法处理RTF文件: {rtf_path}")
-            return None
-            
-        except Exception as e:
-            logger.error(f"RTF转Word过程出错: {e}", exc_info=True)
-            return None
-    
-    def _create_marker_paragraph_element(self, marker_text: str) -> 'etree._Element':
-        """
-        创建包含标记文本的段落 XML 元素（不添加到文档）
-
-        Args:
-            marker_text: 标记文本，如 "{{Table_1_Start}}"
-
-        Returns:
-            段落 XML 元素 (w:p)
-        """
-        from lxml import etree
-
-        # Word XML 命名空间
-        WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-
-        # 直接创建段落 XML 元素，不通过 doc.add_paragraph
-        # 结构: <w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>标记文本</w:t></w:r></w:p>
-        p = etree.Element(f'{{{WNS}}}p')
-
-        # 添加段落属性（居中对齐）
-        pPr = etree.SubElement(p, f'{{{WNS}}}pPr')
-        jc = etree.SubElement(pPr, f'{{{WNS}}}jc')
-        jc.set(f'{{{WNS}}}val', 'center')
-
-        # 添加文本内容
-        r = etree.SubElement(p, f'{{{WNS}}}r')
-        t = etree.SubElement(r, f'{{{WNS}}}t')
-        t.text = marker_text
-
-        return p
-
-    # 需要标记为图片的OLE对象ProgID列表（排除Excel等表格类对象）
-    _IMAGE_OLE_PROGIDS = frozenset([
-        'Visio.Drawing',      # Visio绘图（包含各种版本如 Visio.Drawing.11, Visio.Drawing.15 等）
-        'MSVisio',            # Visio的另一种ProgID格式
-        'PowerPoint.Show',    # PowerPoint幻灯片
-        'PowerPoint.Slide',   # PowerPoint幻灯片
-        'Equation',           # 公式编辑器
-        'WordArt',            # 艺术字
-    ])
-
-    def _check_paragraph_has_image(self, p_element: 'etree._Element') -> bool:
-        """
-        检查段落是否包含需要标记的图片元素
-
-        检测规则：
-        1. 标准图片：blip, drawing, pict
-        2. OLE嵌入对象：仅标记Visio等图像类对象，排除Excel表格
-
-        Args:
-            p_element: 段落 XML 元素 (w:p)
-
-        Returns:
-            是否包含需要标记的图片
-        """
-        for elem in p_element.iter():
-            tag_local = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
-
-            # 检查标准图片元素
-            if tag_local in ('blip', 'drawing', 'pict'):
-                return True
-
-            # 检查OLE嵌入对象（w:object）
-            if tag_local == 'object':
-                # 获取OLEObject的ProgID来判断类型
-                for ole_elem in elem.iter():
-                    ole_tag = ole_elem.tag.split('}')[-1] if '}' in ole_elem.tag else ole_elem.tag
-                    if ole_tag == 'OLEObject':
-                        prog_id = ole_elem.get('ProgID', '')
-                        # 检查ProgID是否在图像类列表中（匹配前缀）
-                        for image_prog_prefix in self._IMAGE_OLE_PROGIDS:
-                            if prog_id.startswith(image_prog_prefix):
-                                return True
-                        # Excel等表格类对象不标记为图片，继续检查其他元素
-                        break
-
-        return False
-
-    def _process_nested_table_contents(self, doc: 'Document', tbl_element: 'etree._Element',
-                                        parent_table_idx: int,
-                                        counters: dict) -> None:
-        """
-        递归处理表格单元格内的嵌套内容
-
-        在单元格内检测嵌套表格和图片，在其前后插入标记段落
-
-        Args:
-            doc: Document 对象
-            tbl_element: 表格 XML 元素 (w:tbl)
-            parent_table_idx: 父表格编号
-            counters: 计数器字典，格式: {'nested_table': {parent_idx: count}, 'cell_image': {parent_idx: count}}
-        """
-        # 初始化父表格的计数器
-        if parent_table_idx not in counters['nested_table']:
-            counters['nested_table'][parent_table_idx] = 0
-        if parent_table_idx not in counters['cell_image']:
-            counters['cell_image'][parent_table_idx] = 0
-
-        # Word XML 命名空间
-        WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-
-        # 遍历表格结构: tbl -> tr -> tc
-        for tr in tbl_element:
-            if not tr.tag.endswith('tr'):
-                continue
-            for tc in tr:
-                if not tc.tag.endswith('tc'):
-                    continue
-
-                # 收集单元格内需要处理的元素和插入位置
-                # 格式: (index, 'before'/'after', marker_element)
-                insertions = []
-
-                for idx, child in enumerate(list(tc)):
-                    # 检查嵌套表格
-                    if child.tag.endswith('tbl'):
-                        counters['nested_table'][parent_table_idx] += 1
-                        nested_idx = counters['nested_table'][parent_table_idx]
-                        # 命名格式：Table_父表格_嵌套编号
-                        marker_name = f"Table_{parent_table_idx}_{nested_idx}"
-
-                        # 创建前后标记
-                        start_marker = self._create_marker_paragraph_element(
-                            f"{{{{{marker_name}_Start}}}}"
-                        )
-                        end_marker = self._create_marker_paragraph_element(
-                            f"{{{{{marker_name}_End}}}}"
-                        )
-
-                        insertions.append((idx, 'before', start_marker))
-                        insertions.append((idx + 1, 'after', end_marker, child))
-
-                        # 递归处理更深层嵌套表格
-                        self._process_nested_table_contents(doc, child, nested_idx, counters)
-
-                    # 检查段落中的图片
-                    elif child.tag.endswith('p'):
-                        if self._check_paragraph_has_image(child):
-                            counters['cell_image'][parent_table_idx] += 1
-                            image_idx = counters['cell_image'][parent_table_idx]
-                            # 命名格式：Image_父表格_图片编号
-                            marker_name = f"Image_{parent_table_idx}_{image_idx}"
-
-                            # 创建前后标记
-                            start_marker = self._create_marker_paragraph_element(
-                                f"{{{{{marker_name}_Start}}}}"
-                            )
-                            end_marker = self._create_marker_paragraph_element(
-                                f"{{{{{marker_name}_End}}}}"
-                            )
-
-                            insertions.append((idx, 'before', start_marker))
-                            insertions.append((idx + 1, 'after', end_marker, child))
-
-                # 按倒序处理插入，避免索引变化
-                for insertion in reversed(insertions):
-                    if len(insertion) == 3:
-                        idx, pos, marker = insertion
-                        if pos == 'before':
-                            tc.insert(idx, marker)
-                    elif len(insertion) == 4:
-                        idx, pos, marker, _ = insertion
-                        if pos == 'after':
-                            # 在指定元素后插入
-                            tc.insert(idx, marker)
-
-    def _mark_word_tables_and_images(self, word_path: Path, work_dir: Path) -> Optional[Path]:
-        """
-        标记Word文档中的表格和图片
-        
-        复用现有的 DataExtractorV2 实现：
-        - 优先Word COM（通过word_document_service）
-        - 回退python-docx（直接调用）
-        
-        Returns:
-            标记后的Word文件路径，失败返回None
-        """
+            name = paragraph.style.name
+        except Exception:
+            name = None
         try:
-            marked_file_path = work_dir / f"{word_path.stem}_marked{word_path.suffix}"
-            
-            # 如果已存在标记文件，直接返回
-            if marked_file_path.exists():
-                logger.info(f"标记文件已存在，跳过: {marked_file_path} ")
-                return marked_file_path
-            
-            # 方法1: 使用word_document_service（Word COM）
-            # 暂时禁用COM方法，因为长文件名会导致COM错误
+            style_id = paragraph.style.style_id
+        except Exception:
+            style_id = None
 
-            # 方法2: 使用python-docx（推荐）
-            try:
-                from docx import Document  # type: ignore
-                from docx.enum.text import WD_PARAGRAPH_ALIGNMENT  # type: ignore
-                import shutil
+        if name:
+            m = re.match(r'^(?:heading|标题)\s*(\d+)$', name.strip(), re.IGNORECASE)
+            if m:
+                return min(int(m.group(1)), 6)
+            if name.strip().lower() in ('title', '标题'):
+                return 1
+        if style_id:
+            m = re.match(r'^Heading(\d+)$', str(style_id))
+            if m:
+                return min(int(m.group(1)), 6)
+        return None
 
-                # 复制原文件
-                shutil.copy2(word_path, marked_file_path)
-
-                # 加载文档
-                doc = Document(marked_file_path)
-                table_count = 0
-                image_count = 0
-
-                # 嵌套内容计数器
-                nested_counters = {
-                    'nested_table': {},  # {parent_table_idx: count}
-                    'cell_image': {}     # {parent_table_idx: count}
-                }
-
-                # 获取文档元素
-                body = doc._element.body
-                elements = list(body)
-                new_elements = []
-
-                # 遍历元素，插入标记
-                for element in elements:
-                    # 表格
-                    if element.tag.endswith('tbl'):
-                        table_count += 1
-                        # 开始标记
-                        start_p = doc.add_paragraph()
-                        start_p.text = f"{{{{Table_{table_count}_Start}}}}"
-                        start_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-                        new_elements.append(start_p._element)
-                        # 表格本身
-                        new_elements.append(element)
-                        # 结束标记
-                        end_p = doc.add_paragraph()
-                        end_p.text = f"{{{{Table_{table_count}_End}}}}"
-                        end_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-                        new_elements.append(end_p._element)
-
-                        # 处理表格内的嵌套内容（递归标记嵌套表格和单元格内图片）
-                        self._process_nested_table_contents(doc, element, table_count, nested_counters)
-
-                    # 包含图片的段落
-                    elif element.tag.endswith('p'):
-                        has_image = self._check_paragraph_has_image(element)
-                        if has_image:
-                            image_count += 1
-                            # 开始标记
-                            start_p = doc.add_paragraph()
-                            start_p.text = f"{{{{Image_{image_count}_Start}}}}"
-                            start_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-                            new_elements.append(start_p._element)
-                            # 图片段落
-                            new_elements.append(element)
-                            # 结束标记
-                            end_p = doc.add_paragraph()
-                            end_p.text = f"{{{{Image_{image_count}_End}}}}"
-                            end_p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-                            new_elements.append(end_p._element)
-                        else:
-                            new_elements.append(element)
-                    else:
-                        new_elements.append(element)
-
-                # 重建文档
-                body.clear()
-                for elem in new_elements:
-                    body.append(elem)
-
-                # 保存
-                doc.save(marked_file_path)
-
-                # 统计嵌套内容数量
-                total_nested_tables = sum(nested_counters['nested_table'].values())
-                total_cell_images = sum(nested_counters['cell_image'].values())
-                logger.info(f"Word标记成功（python-docx）: {table_count}表格, {image_count}顶层图片, "
-                           f"{total_nested_tables}嵌套表格, {total_cell_images}单元格内图片")
-                return marked_file_path
-
-            except Exception as e:
-                logger.error(f"python-docx标记失败: {e}", exc_info=True)
-                return None
-
-        except Exception as e:
-            logger.error(f"Word标记失败: {e}", exc_info=True)
-            return None
-    
     def _word_to_pdf(self, word_path: Path, work_dir: Path) -> Optional[Path]:
         """
-        Word转PDF
+        将Word文档转换为PDF格式。
+        使用 LibreOffice 通过命令行工具转换
         
-        优先级：
-        1. Word COM（质量最好）
-        2. LibreOffice（跨平台）
-        3. 失败
+        Args:
+            word_path: 源Word文档的路径
+            work_dir: 工作目录路径，用于存放生成的PDF文件
+        
+        Returns:
+            成功时返回生成PDF文件的路径，失败时返回None
+            如果PDF已存在（上一次转换结果），则直接返回该路径
         """
         try:
             pdf_file = work_dir / f"{word_path.stem}.pdf"
@@ -1772,40 +1070,16 @@ class FileProcessor:
                     return pdf_file
             except Exception:
                 pass
-            
-            # 方法1: Word COM
-            try:
-                import pythoncom  # type: ignore
-                import win32com.client  # type: ignore
-                from utils.windows_com import safe_dispatch
-                
-                # 在当前线程初始化 COM（多线程环境必需）
-                pythoncom.CoInitialize()
-                try:
-                    word_app = safe_dispatch("Word.Application", use_ex=False, logger=logger)
-                    word_app.Visible = False
-                    doc = word_app.Documents.Open(str(word_path.resolve()))
-                    # 17 = wdFormatPDF
-                    doc.SaveAs(str(pdf_file.resolve()), FileFormat=17)
-                    doc.Close(SaveChanges=False)
-                    word_app.Quit()
-                    
-                    if pdf_file.exists():
-                        logger.info(f"Word→PDF成功（COM）: {pdf_file}")
-                        return pdf_file
-                finally:
-                    pythoncom.CoUninitialize()
-            except Exception as e:
-                logger.warning(f"Word COM转PDF失败: {e}")
-            
-            # 方法2: LibreOffice
+            # 使用LibreOffice对文件格式进行转换
             try:
                 import subprocess
-                subprocess.run([
-                    'soffice', '--headless', '--convert-to', 'pdf',
-                    '--outdir', str(work_dir), str(word_path)
-                ], check=True, timeout=60, capture_output=True)
+                with _LIBREOFFICE_LOCK:
+                    subprocess.run([
+                        'soffice', '--headless', '--convert-to', 'pdf',
+                        '--outdir', str(work_dir), str(word_path)
+                    ], check=True, timeout=60, capture_output=True)
                 
+                # 验证转换结果是否生成成功
                 if pdf_file.exists():
                     logger.info(f"Word→PDF成功（LibreOffice）: {pdf_file}")
                     return pdf_file
@@ -1819,44 +1093,13 @@ class FileProcessor:
             logger.error(f"Word→PDF失败: {e}", exc_info=True)
             return None
     
-    def _pdf_to_markdown_ocr(self, pdf_path: Path, work_dir: Path) -> Optional[str]:
-        """
-        PDF → Markdown（通过OCR）
-        
-        调用视觉模型服务进行OCR识别
-        """
-        try:
-            # 调用现有的视觉服务
-            try:
-                from service.models import get_vision_service
-                vision_service = get_vision_service(timeout=600)
-                
-                # 读取PDF文件
-                pdf_bytes = pdf_path.read_bytes()
-                
-                # 调用OCR
-                result = vision_service.process_file(pdf_path, pdf_bytes)
-                
-                if result.get('status') == 'success':
-                    content = result.get('structured_content') or result.get('content', '')
-                    logger.info(f"PDF OCR成功，内容长度: {len(content)} 字符")
-                    return content
-                else:
-                    logger.error(f"PDF OCR失败: {result.get('error')}")
-                    return None
-                    
-            except Exception as e:
-                logger.error(f"视觉服务调用失败: {e}", exc_info=True)
-                return None
-                
-        except Exception as e:
-            logger.error(f"PDF→Markdown失败: {e}", exc_info=True)
-            return None
-    
     def _fallback_word_text_extraction(self, word_path: Path, marked_word_path: Path = None, pdf_path: Path = None) -> Dict[str, Any]:
         """
-        回退方案：直接提取Word文本（不经过PDF/OCR）
-        
+        回退方案：用 python-docx 直接提取 Word 内容并构造结构化 Markdown（不经过 PDF/OCR）。
+        - 段落按样式补 # 标题，保留文档真实顺序
+        - 表格按 {{Table_N}} markdown 表格输出，与 HeadingBasedChunker 的表格约定一致
+        - 无标题样式的文档标记 suggested_chunking_mode='character'，避免 heading 分块退化为单块
+
         Args:
             word_path: 原始Word文档路径
             marked_word_path: 标记后的Word文档路径（如果存在），保留此路径以便后续导出区域
@@ -1864,11 +1107,43 @@ class FileProcessor:
         """
         try:
             from docx import Document  # type: ignore
+            from docx.text.paragraph import Paragraph  # type: ignore
+            from docx.table import Table  # type: ignore
             doc = Document(word_path)
-            text = '\n\n'.join([p.text for p in doc.paragraphs])
-            logger.info(f"回退提取Word文本: {len(text)} 字符")
-            
-            metadata = {'conversion_method': 'fallback_docx_text'}
+
+            md_parts: List[str] = []
+            has_headings = False
+            table_index = 0
+
+            # 按文档真实顺序遍历段落与表格（doc.paragraphs + doc.tables 会丢顺序）
+            for child in doc.element.body:
+                tag = child.tag
+                if tag.endswith('}p'):
+                    p = Paragraph(child, doc)
+                    text = (p.text or '').strip()
+                    level = self._heading_level(p)
+                    if level is not None:
+                        has_headings = True
+                        if text:
+                            md_parts.append(f"{'#' * level} {text}")
+                    else:
+                        if text:
+                            md_parts.append(text)
+                elif tag.endswith('}tbl'):
+                    table_index += 1
+                    table_md = self._table_to_markdown(Table(child, doc), table_index)
+                    if table_md:
+                        md_parts.append(table_md)
+
+            md_content = "\n\n".join(md_parts).strip()
+            logger.info(f"回退提取Word结构化Markdown: {len(md_content)} 字符, has_headings={has_headings}, tables={table_index}")
+
+            metadata = {
+                'conversion_method': 'fallback_docx_structured_md',
+                'has_headings': has_headings,
+                'suggested_chunking_mode': 'heading' if has_headings else 'character',
+                'tables_count': table_index,
+            }
             word_regions: List[Dict[str, Any]] = []
             
             # ⚠️ 关键修复：即使走回退路径，也要导出regions
@@ -1895,9 +1170,9 @@ class FileProcessor:
             metadata['word_regions_count'] = len(word_regions)
             
             return {
-                'content': text,
-                'content_type': ContentType.PLAIN_TEXT,
-                'text': text,
+                'content': md_content,
+                'content_type': ContentType.MARKDOWN,
+                'text': md_content,
                 'word_regions': word_regions,  # ⚠️ 添加word_regions
                 'metadata': metadata
             }
@@ -1909,307 +1184,6 @@ class FileProcessor:
                 'text': '',
                 'word_regions': [],
                 'metadata': {'conversion_method': 'failed', 'error': str(e)}
-            }
-    
-    def _pdf_to_markdown_direct(self, pdf_path: Path, work_dir: Path) -> Dict[str, Any]:
-        """PDF直接转Markdown（通过OCR）- 复用Word→PDF→OCR的流程"""
-        try:
-            markdown_content = self._pdf_to_markdown_ocr(pdf_path, work_dir)
-            if markdown_content:
-                return {
-                    'content': markdown_content,
-                    'content_type': ContentType.MARKDOWN,
-                    'text': markdown_content,
-                    'metadata': {'conversion_method': 'pdf_ocr', 'source': 'direct_pdf'}
-                }
-            else:
-                logger.error("PDF OCR失败，返回空内容（不回退到纯文本）")
-                return {
-                    'content': '',
-                    'content_type': ContentType.MARKDOWN,
-                    'text': '',
-                    'metadata': {'conversion_method': 'pdf_ocr_failed', 'source': 'direct_pdf'}
-                }
-        except Exception as e:
-            logger.error(f"PDF转Markdown失败: {e}（不回退到纯文本）")
-            return {
-                'content': '',
-                'content_type': ContentType.MARKDOWN,
-                'text': '',
-                'metadata': {'conversion_method': 'pdf_ocr_error', 'error': str(e)}
-            }
-    
-    
-    def _excel_split_sheets(self, excel_path: Path, work_dir: Path) -> Dict[str, Any]:
-        """
-        Excel 拆分：将每个 Sheet 导出为单独的 .xlsx 文件，并转换为 Markdown 表格。
-        返回 excel_regions 供上游作为 regions 使用。
-        """
-        # 优先使用 Win32 COM 保留全部格式/样式/合并单元格/图片
-        sheets_dir = work_dir / 'sheets'
-        try:
-            sheets_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-        # 复用缓存
-        sp = self._stage_paths(work_dir, "excel_split_sheets")
-        if sp["manifest"].exists():
-            try:
-                manifest = json.loads(sp["manifest"].read_text(encoding="utf-8"))
-                regions = manifest.get("regions") or []
-                md_regions = manifest.get("markdown_regions") or []
-                if regions:
-                    logger.info("复用缓存的 Excel sheet 拆分结果")
-                    return {
-                        'content': '',
-                        'content_type': ContentType.STRUCTURED,
-                        'text': '',
-                        'excel_regions': regions,
-                        'excel_markdown_regions': md_regions,
-                        'metadata': {
-                            'conversion_method': 'excel_split_sheets_cached',
-                            'sheets_total': len(regions),
-                            'excel_sheets': regions,
-                            'excel_markdown_regions': md_regions,
-                            'cache_reused': True
-                        }
-                    }
-            except Exception:
-                pass
-        regions: List[Dict[str, Any]] = []
-        excel_debug: Dict[str, Any] = {
-            'mode': None,
-            'com_enabled_env': str(os.getenv('EXCEL_COM_ENABLED', '0')),
-            'com_settings_applied': False,
-            'open_path': str(excel_path),
-            'out_dir': str(sheets_dir),
-            'saved_files': [],
-            'errors': [],
-        }
-        # 方法1：Win32 COM（Excel 必须安装在系统上）
-        com_initialized = False
-        try:
-            # 默认禁用 COM（避免任何GUI/弹窗），除非环境变量显式启用
-            _enable_com = str(os.getenv('EXCEL_COM_ENABLED', '0')).strip().lower() in ('1', 'true', 'yes', 'on', 'y')
-            if not _enable_com:
-                raise RuntimeError('Excel COM disabled by default (use EXCEL_COM_ENABLED=1 to enable)')
-            import pythoncom  # type: ignore
-            import win32com.client  # type: ignore
-            from utils.windows_com import safe_dispatch
-            pythoncom.CoInitialize()
-            com_initialized = True
-            excel_app = safe_dispatch("Excel.Application", use_ex=False, logger=logger)
-            # 强制静默模式，避免任何交互式弹窗
-            try:
-                excel_app.Visible = False
-            except Exception:
-                pass
-            try:
-                excel_app.DisplayAlerts = False
-            except Exception:
-                pass
-            try:
-                excel_app.ScreenUpdating = False
-            except Exception:
-                pass
-            try:
-                excel_app.AskToUpdateLinks = False
-            except Exception:
-                pass
-            try:
-                excel_app.AlertBeforeOverwriting = False
-            except Exception:
-                pass
-            try:
-                # 3 = msoAutomationSecurityForceDisable
-                excel_app.AutomationSecurity = 3
-            except Exception:
-                pass
-            try:
-                excel_app.EnableEvents = False
-            except Exception:
-                pass
-            try:
-                excel_app.Interactive = False
-            except Exception:
-                pass
-            # 设置默认保存目录，避免弹出另存为路径选择
-            try:
-                excel_app.DefaultFilePath = str(sheets_dir.resolve())
-            except Exception:
-                pass
-            excel_debug['com_settings_applied'] = True
-            # 打开源工作簿（只读）
-            try:
-                wb = excel_app.Workbooks.Open(str(excel_path), UpdateLinks=False, ReadOnly=True)
-            except Exception:
-                wb = excel_app.Workbooks.Open(str(excel_path))
-            try:
-                # 逐个工作表复制为新工作簿并保存为 .xlsx（FileFormat=51）
-                count = int(wb.Worksheets.Count)
-                for i in range(1, count + 1):
-                    try:
-                        ws = wb.Worksheets(i)
-                        name = str(ws.Name)
-                    except Exception:
-                        name = f"Sheet{i}"
-                    safe_name = (name or f"Sheet{i}").replace('/', '_').replace('\\', '_').replace(':', '_')\
-                                .replace('*', '_').replace('?', '_').replace('"', '_').replace('<', '_')\
-                                .replace('>', '_').replace('|', '_')
-                    out_file = sheets_dir / f"{excel_path.stem}_sheet{i:02d}_{safe_name}.xlsx"
-                    # 复制：不带目标参数将创建包含该工作表的新工作簿
-                    try:
-                        ws.Copy()  # 创建新工作簿为 ActiveWorkbook
-                        new_wb = excel_app.ActiveWorkbook
-                        try:
-                            # 51 = xlOpenXMLWorkbook (.xlsx)
-                            # AccessMode=1 (xlNoChange), ConflictResolution=2 (xlLocalSessionChanges), Local=True
-                            new_wb.SaveAs(
-                                Filename=str(out_file),
-                                FileFormat=51,
-                                Password=None,
-                                WriteResPassword=None,
-                                ReadOnlyRecommended=False,
-                                CreateBackup=False,
-                                AccessMode=1,
-                                ConflictResolution=2,
-                                AddToMru=False,
-                                Local=True,
-                            )
-                        finally:
-                            try:
-                                new_wb.Close(SaveChanges=True)
-                            except Exception:
-                                pass
-                        regions.append({
-                            "name": f"Sheet_{i}",
-                            "type": "sheet",
-                            "index": i,
-                            "file_path": str(out_file)
-                        })
-                        try:
-                            excel_debug['saved_files'].append(str(out_file))
-                        except Exception:
-                            pass
-                    except Exception:
-                        # 某个 sheet 失败则跳过
-                        try:
-                            excel_debug['errors'].append(f"save_sheet_failed_{i}")
-                        except Exception:
-                            pass
-                        continue
-            finally:
-                try:
-                    wb.Close(SaveChanges=False)
-                except Exception:
-                    pass
-                try:
-                    # 恢复设置并退出
-                    try:
-                        excel_app.DisplayAlerts = False
-                    except Exception:
-                        pass
-                    try:
-                        excel_app.EnableEvents = False
-                    except Exception:
-                        pass
-                    try:
-                        excel_app.Interactive = True
-                    except Exception:
-                        pass
-                    excel_app.Quit()
-                except Exception:
-                    pass
-            # 转换 Sheet 为 Markdown
-            markdown_regions = self._convert_excel_sheets_to_markdown(regions, sheets_dir)
-            
-            result = {
-                'content': '',
-                'content_type': ContentType.STRUCTURED,
-                'text': '',
-                'excel_regions': regions,
-                'excel_markdown_regions': markdown_regions,
-                'metadata': {'conversion_method': 'excel_split_sheets_com', 'sheets_total': len(regions), 'markdown_sheets': len(markdown_regions)}
-            }
-            try:
-                sp["manifest"].write_text(json.dumps({"regions": regions, "markdown_regions": markdown_regions}, ensure_ascii=False, indent=2), encoding="utf-8")
-                sp["done"].write_text("ok", encoding="utf-8")
-            except Exception:
-                pass
-            return result
-        except Exception as e:
-            logger.warning(f"Excel COM 拆分不可用或失败，回退到 openpyxl（仅值，不保留格式）: {e}")
-        finally:
-            if com_initialized:
-                try:
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
-        # 方法2：openpyxl 回退（不保留格式）
-        try:
-            from openpyxl import load_workbook  # type: ignore
-            from openpyxl import Workbook  # type: ignore
-            wb = load_workbook(filename=str(excel_path), data_only=False)
-            regions = []
-            idx = 0
-            for sheet_name in wb.sheetnames:
-                idx += 1
-                src_ws = wb[sheet_name]
-                dst_wb = Workbook()
-                dst_ws = dst_wb.active
-                try:
-                    dst_ws.title = sheet_name[:31] if sheet_name else f"Sheet{idx}"
-                except Exception:
-                    dst_ws.title = f"Sheet{idx}"
-                try:
-                    for row in src_ws.iter_rows(values_only=False):
-                        dst_ws.append([c.value for c in row])
-                except Exception:
-                    pass
-                safe_sheet = sheet_name.replace('/', '_').replace('\\', '_').replace(':', '_')\
-                                       .replace('*', '_').replace('?', '_').replace('"', '_')\
-                                       .replace('<', '_').replace('>', '_').replace('|', '_')
-                out_file = sheets_dir / f"{excel_path.stem}_sheet{idx:02d}_{safe_sheet}.xlsx"
-                try:
-                    dst_wb.save(str(out_file))
-                except Exception:
-                    out_file = sheets_dir / f"{excel_path.stem}_sheet{idx:02d}.xlsx"
-                    try:
-                        dst_wb.save(str(out_file))
-                    except Exception:
-                        continue
-                regions.append({
-                    "name": f"Sheet_{idx}",
-                    "type": "sheet",
-                    "index": idx,
-                    "file_path": str(out_file)
-                })
-            
-            # 转换 Sheet 为 Markdown
-            markdown_regions = self._convert_excel_sheets_to_markdown(regions, sheets_dir)
-            
-            result = {
-                'content': '',
-                'content_type': ContentType.STRUCTURED,
-                'text': '',
-                'excel_regions': regions,
-                'excel_markdown_regions': markdown_regions,
-                'metadata': {'conversion_method': 'excel_split_sheets_openpyxl', 'sheets_total': len(regions), 'markdown_sheets': len(markdown_regions)}
-            }
-            try:
-                sp["manifest"].write_text(json.dumps({"regions": regions, "markdown_regions": markdown_regions}, ensure_ascii=False, indent=2), encoding="utf-8")
-                sp["done"].write_text("ok", encoding="utf-8")
-            except Exception:
-                pass
-            return result
-        except Exception as e:
-            logger.error(f"Excel拆分失败: {e}")
-            return {
-                'content': '',
-                'content_type': ContentType.STRUCTURED,
-                'text': '',
-                'excel_regions': [],
-                'metadata': {'conversion_method': 'excel_split_sheets_failed', 'error': str(e), 'excel_sheets': [], 'excel_markdown_regions': []}
             }
     
     def _extract_assets(self, content: str, regions: List[Dict], work_dir: Path) -> List[Dict[str, Any]]:
@@ -2318,14 +1292,14 @@ class FileProcessor:
             }
             # 写入manifest
             try:
-                sp["manifest"].write_text(json.dumps({"regions": regions}, ensure_ascii=False, indent=2), encoding="utf-8")
+                save_json(sp["manifest"], {"regions": regions})
                 sp["done"].write_text("ok", encoding="utf-8")
             except Exception:
                 pass
             return result
         except Exception as e:
-            logger.error(f"Word表格拆分导出失败: {e}")
-            return self._skip_processing_output(kind='tables', via='word_tables_split_failed')
+            logger.error(f"Word表格拆分导出失败，回退到标准Markdown转换: {e}", exc_info=True)
+            return self._word_to_markdown(word_path, work_dir)
 
     def _word_images_extract_to_files(self, word_path: Path, work_dir: Path) -> Dict[str, Any]:
         """
@@ -2390,9 +1364,8 @@ class FileProcessor:
                             count -= 1
                             continue
             except Exception as e:
-                logger.error(f"DOCX图片解包失败: {e}")
-                # 回退：尝试使用 COM 导出为独立 docx，再另行转换为图片（此处先返回失败）
-                return self._skip_processing_output(kind='images', via='word_images_extract_failed')
+                logger.error(f"DOCX图片解包失败，回退到标准Markdown转换: {e}", exc_info=True)
+                return self._word_to_markdown(word_path, work_dir)
             result = {
                 'content': '',
                 'content_type': ContentType.STRUCTURED,
@@ -2405,87 +1378,11 @@ class FileProcessor:
                 }
             }
             try:
-                sp["manifest"].write_text(json.dumps({"regions": extracted, "images_dir": str(images_dir)}, ensure_ascii=False, indent=2), encoding="utf-8")
+                save_json(sp["manifest"], {"regions": extracted, "images_dir": str(images_dir)})
                 sp["done"].write_text("ok", encoding="utf-8")
             except Exception:
                 pass
             return result
         except Exception as e:
-            logger.error(f"Word图片提取失败: {e}")
-            return self._skip_processing_output(kind='images', via='word_images_extract_failed')
-    
-    def _convert_excel_sheets_to_markdown(self, regions: List[Dict[str, Any]], sheets_dir: Path) -> List[Dict[str, Any]]:
-        """
-        将拆分的 Excel Sheet 转换为 Markdown 表格
-        
-        Args:
-            regions: Excel regions 列表，每项包含 'file_path'
-            sheets_dir: Sheet 文件所在目录
-            
-        Returns:
-            Markdown regions 列表
-        """
-        try:
-            from service.windows.preprocessing.preprocessing_function.excel.excel_pipeline import excel_sheet_to_markdown
-        except ImportError:
-            logger.warning("无法导入 excel_to_markdown 模块，跳过 Markdown 转换")
-            return []
-        
-        markdown_regions = []
-        markdown_dir = sheets_dir / "markdown"
-        
-        try:
-            markdown_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            logger.warning(f"无法创建 Markdown 目录: {markdown_dir}")
-            return []
-        
-        for region in regions:
-            try:
-                excel_file = Path(region.get('file_path', ''))
-                if not excel_file.exists():
-                    logger.warning(f"Excel 文件不存在: {excel_file}")
-                    continue
-                
-                sheet_name = region.get('name', 'Sheet')
-                
-                # 转换为 Markdown
-                md_content = excel_sheet_to_markdown(
-                    excel_file,
-                    sheet_name=None,  # 使用默认 active sheet
-                    header_rows=1,
-                    placeholder="...",
-                    fill_mode="dots",
-                    trim=True,
-                    percent_dp=1,
-                    enable_percent=True
-                )
-                
-                # 保存 Markdown 文件
-                safe_name = sheet_name.replace('/', '_').replace('\\', '_').replace(':', '_')\
-                                      .replace('*', '_').replace('?', '_').replace('"', '_')\
-                                      .replace('<', '_').replace('>', '_').replace('|', '_')
-                md_file = markdown_dir / f"{safe_name}.md"
-                md_file.write_text(md_content, encoding='utf-8')
-                
-                # 统计行列数
-                lines = md_content.split('\n')
-                rows = len([l for l in lines if l.startswith('|')])
-                cols = len([l for l in lines if l.startswith('|')][0].split('|')) - 2 if rows > 0 else 0
-                
-                markdown_regions.append({
-                    'sheet_name': sheet_name,
-                    'markdown_file': f"markdown/{safe_name}.md",
-                    'rows': rows,
-                    'cols': cols,
-                    'original_excel': region.get('file_path')
-                })
-                
-                logger.info(f"转换 Excel Sheet 为 Markdown: {md_file} ({rows}行 x {cols}列)")
-            
-            except Exception as e:
-                logger.warning(f"转换 Excel Sheet 失败: {e}")
-                continue
-        
-        return markdown_regions
-
+            logger.error(f"Word图片提取失败，回退到标准Markdown转换: {e}", exc_info=True)
+            return self._word_to_markdown(word_path, work_dir)

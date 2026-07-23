@@ -10,7 +10,6 @@ Windows Bridge 客户端模块
 功能：
 - RTF 文档处理
 - Word 文档处理（标记、扫描、导出）
-- 文档清理（Content Control、首行）
 - 内容插入
 - 文件预处理
 """

@@ -14,10 +14,24 @@ from __future__ import annotations
 import os
 import shutil
 import threading
-from typing import Any, Optional
+from contextlib import contextmanager
+from typing import Any, Generator, Optional
 
 
 _GENPY_REPAIR_LOCK = threading.Lock()
+
+# 所有 COM 操作共享的串行锁（Word/Excel COM 在同进程内并发极易崩溃）
+_COM_SERIAL_LOCK = threading.Lock()
+
+
+@contextmanager
+def com_serial_guard(operation: str = "") -> Generator[None, None, None]:
+    """COM 操作串行化上下文管理器，所有 COM 调用点共享同一把锁。"""
+    _COM_SERIAL_LOCK.acquire()
+    try:
+        yield
+    finally:
+        _COM_SERIAL_LOCK.release()
 
 
 def _str_exc(e: BaseException) -> str:

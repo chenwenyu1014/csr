@@ -29,6 +29,9 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
+# 多进程安全的轮转文件 Handler
+from concurrent_log_handler import ConcurrentRotatingFileHandler
+
 
 def get_log_filename(environment: str, system: str, service_name: str = "main") -> str:
     """
@@ -170,7 +173,7 @@ def setup_logging(
         # 检查是否已有相同的文件 handler
         same_file_handler = None
         for h in existing_file_handlers:
-            if isinstance(h, RotatingFileHandler):
+            if isinstance(h, (RotatingFileHandler, ConcurrentRotatingFileHandler)):
                 try:
                     if str(Path(h.baseFilename).resolve()) == str(log_file_path.resolve()):
                         same_file_handler = h
@@ -181,11 +184,12 @@ def setup_logging(
         # 如果没有相同的 handler，则添加新的
         if same_file_handler is None:
             try:
-                file_handler = RotatingFileHandler(
+                file_handler = ConcurrentRotatingFileHandler(
                     str(log_file_path),
                     maxBytes=max_bytes,
                     backupCount=backup_count,
-                    encoding='utf-8'
+                    encoding='utf-8',
+                    use_gzip=False,
                 )
                 file_handler.setLevel(level)
                 file_handler.setFormatter(formatter)
@@ -260,18 +264,19 @@ def get_service_logger(
 
     # 检查是否已有 handler
     has_file_handler = any(
-        isinstance(h, RotatingFileHandler) and
+        isinstance(h, (RotatingFileHandler, ConcurrentRotatingFileHandler)) and
         str(Path(h.baseFilename).resolve()) == str(log_file_path.resolve())
         for h in service_logger.handlers
     )
 
     if not has_file_handler:
         try:
-            file_handler = RotatingFileHandler(
+            file_handler = ConcurrentRotatingFileHandler(
                 str(log_file_path),
                 maxBytes=max_bytes,
                 backupCount=backup_count,
-                encoding='utf-8'
+                encoding='utf-8',
+                use_gzip=False,
             )
             file_handler.setLevel(level)
             file_handler.setFormatter(formatter)

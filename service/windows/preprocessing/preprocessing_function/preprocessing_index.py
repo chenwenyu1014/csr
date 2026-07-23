@@ -8,6 +8,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional
 from threading import Lock
+from utils.output_manager import save_json
 
 logger = logging.getLogger(__name__)
 
@@ -87,15 +88,11 @@ class PreprocessingIndex:
     def _save_index(cls, index_data: Dict[str, Any]) -> bool:
         """保存索引文件"""
         try:
-            # 确保目录存在
-            cls.INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
-            
             # 更新时间
             index_data["last_updated"] = datetime.now().isoformat()
-            
+
             # 保存
-            with open(cls.INDEX_FILE, 'w', encoding='utf-8') as f:
-                json.dump(index_data, f, ensure_ascii=False, indent=2)
+            save_json(cls.INDEX_FILE, index_data)
             
             return True
         except Exception as e:

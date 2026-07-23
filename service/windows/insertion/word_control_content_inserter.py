@@ -938,6 +938,12 @@ class WordControlContentInserter:
             # 连接Word
             self._connect_word()
 
+            # import pythoncom
+            # pythoncom.CoInitialize()
+            # import win32com as win32com
+            # word = win32com.client.Dispatch("Word.Application")
+            # word.Visible = False  # 显示Word窗口
+            # word.DisplayAlerts = 0
 
 
             # 验证模板文件存在
@@ -961,6 +967,12 @@ class WordControlContentInserter:
                     delay=0.5
                 )
 
+                # doc = word.Documents.Open(
+                #         str(template_path),
+                #         ConfirmConversions=False,
+                #         ReadOnly=False,
+                #         AddToRecentFiles=False
+                #     )
 
                 # 验证文档对象
                 if doc is None:
@@ -1038,7 +1050,11 @@ class WordControlContentInserter:
 
                     # 插入表格
                     for i in range(cc_collection.Count):
-                        control = cc_collection.Item(i + 1)
+                        try:
+                            control = cc_collection.Item(i + 1)
+                        except Exception as e:
+                            logger.warning(f"  ⚠️ 控件 {control_title} 第{i+1}个无法访问（可能被同名外层控件覆盖），跳过: {e}")
+                            continue
                         success = self._insert_table_to_control(
                             doc, control, table_data, font_info
                         )
@@ -1056,7 +1072,8 @@ class WordControlContentInserter:
 
                 # 原有逻辑：提取占位符
                 placeholders = re.findall(r'\{\{[^}]+\}\}', generated_content)
-                logger.info(f"  发现 {len(placeholders)} 个占位符")
+                if len(placeholders):
+                    logger.info(f"  发现 {len(placeholders)} 个占位符")
 
                 # 从该段落获取 resource_mappings
                 paragraph_mappings = result.get("resource_mappings", {})
@@ -1081,8 +1098,8 @@ class WordControlContentInserter:
                         logger.warning(f'  获取控件字体失败：{font_err}，使用默认值')
 
                     for i in range(cc_collection.Count):
-                        control = cc_collection.Item(i + 1)
                         try:
+                            control = cc_collection.Item(i + 1)
                             # 清理内容中可能导致 COM 错误的字符
                             cleaned_content = self._clean_text_for_word(generated_content)
 
@@ -1125,10 +1142,12 @@ class WordControlContentInserter:
 
                             inserted_controls.append(control_title)
                         except Exception as e:
+                            # import traceback
+                            # traceback.print_exc()
                             logger.error(f"  ❌ 文本插入失败: {e}")
                             logger.error(f"  内容长度: {len(generated_content)} 字符")
                             logger.error(f"  内容前200字符: {generated_content[:200]}")
-                            raise
+                            continue  # 跳过该控件，不中断整篇文档（防护同名嵌套等异常）
                     continue
 
                 # 保存占位符对应的字体格式
@@ -1186,14 +1205,18 @@ class WordControlContentInserter:
 
                 # 在控件内插入内容（占位符作为文本插入）
                 for control in controls:
-                    self.insert_to_control(
-                        doc,
-                        control,
-                        generated_content,
-                        portrait_list,
-                        landscape_list,
-                        font_tuple=(ctrl_font_ascii, ctrl_font_fareast, ctrl_font_size)
-                    )
+                    try:
+                        self.insert_to_control(
+                            doc,
+                            control,
+                            generated_content,
+                            portrait_list,
+                            landscape_list,
+                            font_tuple=(ctrl_font_ascii, ctrl_font_fareast, ctrl_font_size)
+                        )
+                    except Exception as e:
+                        logger.warning(f"  ⚠️ 控件 {control_title} 某个实例插入失败（可能被同名外层控件覆盖），跳过: {e}")
+                        continue
 
                 inserted_controls.append(control_title)
 
@@ -1277,6 +1300,7 @@ class WordControlContentInserter:
                     find_range = doc.Range(search_start, doc.Content.End)
                     find_range.Find.ClearFormatting()
                     find_range.Find.Text = "{{"
+                    find_range.Find.Wrap = 0  # wdFindStop：不回绕，避免替换失败时反复命中同一占位符导致死循环
 
                     if not find_range.Find.Execute():
                         break
@@ -1362,7 +1386,7 @@ class WordControlContentInserter:
                         replace_range = doc.Range(placeholder_start, placeholder_start + len(placeholder))
 
                         try:
-                            replace_range.text = ' '
+                            replace_range.Text = ' '
 
                             if file_ext in ['.docx', '.doc']:
                                 doc_len_before = doc.Content.End
@@ -1385,8 +1409,11 @@ class WordControlContentInserter:
                         except Exception as replace_err:
                             logger.error(f"    ❌ 替换失败: {replace_err}")
                             replace_errors.append(f"{control_title}:{placeholder}")
+                            # 替换失败时跳过该占位符，避免下一轮 Find 再次命中导致死循环
+                            search_start = placeholder_start + len(placeholder)
+                            continue
 
-                        # 更新搜索起点
+                        # 更新搜索起点（替换成功：占位符已被替换为文件内容，从其后继续）
                         search_start = placeholder_start + 1
 
                     except Exception as check_err:
@@ -1635,5 +1662,9 @@ if __name__ == "__main__":
     队列2主要目的：评价艾司奥美拉唑镁肠溶片对健康参与者口服GFH375片的药代动力学影响。"""
     text = new_content.replace('\r\n', '\r')
     print(text)
+    # import pythoncom
+    # pythoncom.CoInitialize()
+    # inserter = WordControlContentInserter()  # 创建实例
+    # inserter.test_word_control_insert()
 
 

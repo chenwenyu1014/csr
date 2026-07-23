@@ -31,6 +31,39 @@ from .file_processor import FileProcessor, PreprocessedDocument
 # 使用标准 logger，日志配置由入口文件统一管理
 logger = logging.getLogger(__name__)
 
+# def _ensure_logging_config() -> None:
+#     try:
+#         root = logging.getLogger()
+#         # if root.handlers:
+#         #     return
+#         level = os.getenv("LOG_LEVEL", "INFO").upper()
+#         try:
+#             lvl = getattr(logging, level, logging.INFO)
+#         except Exception:
+#             lvl = logging.INFO
+#         root.setLevel(lvl)
+#         log_dir = os.getenv("LOG_DIR", "AAA/logs")
+#         try:
+#             os.makedirs(log_dir, exist_ok=True)
+#         except Exception:
+#             pass
+#         fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+#         try:
+#             fh = RotatingFileHandler(os.path.join(log_dir, "windows_preprocessing.log"), maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
+#             fh.setLevel(lvl)
+#             fh.setFormatter(fmt)
+#             root.addHandler(fh)
+#         except Exception:
+#             pass
+#         # ch = logging.StreamHandler()
+#         # ch.setLevel(lvl)
+#         # ch.setFormatter(fmt)
+#         # root.addHandler(ch)
+#     except Exception:
+#         pass
+#
+# _ensure_logging_config()
+
 
 @contextmanager
 def _temp_env(**kwargs):

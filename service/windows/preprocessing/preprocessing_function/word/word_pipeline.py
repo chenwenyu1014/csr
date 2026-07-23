@@ -2,8 +2,10 @@
 from __future__ import annotations
 import logging
 import re
+import shutil
+import copy
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Set
 from docx import Document
 from lxml import etree
 import zipfile
@@ -13,15 +15,21 @@ import tempfile
 WNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 WNS_P = f'{{{WNS}}}'
 
+# DrawingML 和 Relationships 命名空间（用于扫描引用的媒体文件）
+A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+REL_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
+
+# 已压缩的图片扩展名，打包时用 STORED 避免重复压缩
+_MEDIA_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif', '.emf', '.wmf'}
 
 
-# We orchestrate existing FileProcessor internals to avoid duplicating complex logic now.
 from service.windows.preprocessing.file_processor import FileProcessor
 
 logger = logging.getLogger(__name__)
 
 
-def run_docx(word_path: Path | str, work_dir: Path | str, mode: Optional[str] = None) -> Dict[str, Any]:
+def word_run(word_path: Path | str, work_dir: Path | str, mode: Optional[str] = None) -> Dict[str, Any]:
     """
     Word (.docx/.rtf-as-docx-class) pipeline.
     mode: Optional logical hint ('text'|'images'|'tables'), currently passed through to existing logic.
@@ -34,19 +42,343 @@ def run_docx(word_path: Path | str, work_dir: Path | str, mode: Optional[str] = 
     return fp._convert_word_by_kind(word_path, work_dir, content_type_override=normalized)  # type: ignore
 
 
-def run_doc(word_path: Path | str, work_dir: Path | str, mode: Optional[str] = None) -> Dict[str, Any]:
+class WordRegionMarker:
     """
-    Legacy Word (.doc) pipeline.
+    在 Word 文档的表格与图片前后插入标记段落。
+
+    通过解析 document.xml，在顶层表格、顶层图片段落，以及表格单元格内的
+    嵌套表格和图片前后插入 {{Table_N_Start}} / {{Table_N_End}} 等标记，
+    供 WordRegionExtractor 按区域裁剪为独立文档。
     """
-    fp = FileProcessor()
-    word_path = Path(word_path)
-    work_dir = Path(work_dir)
-    normalized = (mode or '').strip().lower() or None
-    if normalized == 'tables':
-        return fp._word_tables_split_to_docx(word_path, work_dir)  # type: ignore
-    if normalized == 'images':
-        return fp._word_doc_images_export_to_docx(word_path, work_dir)  # type: ignore
-    return fp._word_doc_to_markdown(word_path, work_dir)  # type: ignore
+
+    # 需要标记为图片的 OLE 对象 ProgID 列表（排除 Excel 等表格类对象）
+    _IMAGE_OLE_PROGIDS = frozenset([
+        'Visio.Drawing',      # Visio 绘图
+        'MSVisio',            # Visio 的另一种 ProgID 格式
+        'PowerPoint.Show',    # PowerPoint 幻灯片
+        'PowerPoint.Slide',   # PowerPoint 幻灯片
+        'Equation',           # 公式编辑器
+        'WordArt',            # 艺术字
+    ])
+
+    def _create_marker_paragraph_element(self, marker_text: str) -> 'etree._Element':
+        """
+        创建包含标记文本的段落 XML 元素（不添加到文档）。
+
+        Args:
+            marker_text: 标记文本，如 "{{Table_1_Start}}"
+
+        Returns:
+            段落 XML 元素 (w:p)
+        """
+        from lxml import etree
+
+        p = etree.Element(f'{{{WNS}}}p')
+
+        pPr = etree.SubElement(p, f'{{{WNS}}}pPr')
+        jc = etree.SubElement(pPr, f'{{{WNS}}}jc')
+        jc.set(f'{{{WNS}}}val', 'center')
+
+        r = etree.SubElement(p, f'{{{WNS}}}r')
+        t = etree.SubElement(r, f'{{{WNS}}}t')
+        t.text = marker_text
+
+        return p
+
+    def _find_ref_paragraph_before(self, elements: list, target_element):
+        """
+        从目标元素（表格/图片段落）向前查找最近的非空正文段落作为参考段落，
+        用于让标记段落继承周围正文字体样式。
+
+        Args:
+            elements: 文档 body 子元素列表
+            target_element: 目标元素（表格或图片段落）
+
+        Returns:
+            参考段落 XML 元素，若找不到则返回 None
+        """
+        from lxml import etree as _etree
+
+        try:
+            idx = elements.index(target_element)
+        except ValueError:
+            return None
+
+        for search_idx in range(idx - 1, -1, -1):
+            elem = elements[search_idx]
+            local_name = _etree.QName(elem.tag).localname
+            if local_name == 'p':
+                text = self._get_paragraph_xml_text(elem)
+                if text.strip():
+                    return elem
+            elif local_name == 'tbl':
+                continue
+        return None
+
+    def _get_paragraph_xml_text(self, p_element) -> str:
+        """提取段落 XML 元素的纯文本（拼接所有 w:t 节点）。"""
+        t_elements = p_element.findall(f'.//{WNS_P}t')
+        texts = [t.text for t in t_elements if t.text]
+        return ''.join(texts)
+
+    def _create_marker_paragraph(self, doc, text: str, ref_element=None):
+        """
+        创建标记段落：继承参考段落的字体样式并居中对齐。
+
+        Args:
+            doc: Word 文档对象
+            text: 段落文本
+            ref_element: 参考段落 XML 元素（用于继承字体样式）
+
+        Returns:
+            新创建的段落对象
+        """
+        from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+        from lxml import etree as _etree
+
+        if ref_element is not None:
+            try:
+                new_p = copy.deepcopy(ref_element)
+
+                first_run_with_style = None
+                for run in new_p.findall(f'{WNS_P}r'):
+                    rPr = run.find(f'{WNS_P}rPr')
+                    if rPr is not None:
+                        first_run_with_style = run
+                        break
+
+                if first_run_with_style is None:
+                    first_run_with_style = new_p.find(f'{WNS_P}r')
+
+                if first_run_with_style is not None:
+                    rPr = first_run_with_style.find(f'{WNS_P}rPr')
+                    for child in list(first_run_with_style):
+                        first_run_with_style.remove(child)
+                    if rPr is not None:
+                        first_run_with_style.append(rPr)
+                    t_elem = _etree.SubElement(first_run_with_style, f'{WNS_P}t')
+                    t_elem.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                    t_elem.text = text
+
+                    for child in list(new_p):
+                        local_name = _etree.QName(child.tag).localname
+                        if local_name == 'r' and child != first_run_with_style:
+                            new_p.remove(child)
+                        elif local_name not in ('r', 'pPr'):
+                            new_p.remove(child)
+
+                pPr = new_p.find(f'{WNS_P}pPr')
+                if pPr is None:
+                    pPr = _etree.SubElement(new_p, f'{WNS_P}pPr')
+                jc = pPr.find(f'{WNS_P}jc')
+                if jc is None:
+                    jc = _etree.SubElement(pPr, f'{WNS_P}jc')
+                jc.set(f'{WNS_P}val', 'center')
+
+                from docx.text.paragraph import Paragraph
+                return Paragraph(new_p, doc)
+
+            except Exception as e:
+                logger.debug(f"复制段落样式失败，使用默认样式: {e}")
+
+        p = doc.add_paragraph()
+        p.text = text
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        return p
+
+    def _check_paragraph_has_image(self, p_element: 'etree._Element') -> bool:
+        """
+        判断段落是否包含需要标记的图片元素。
+
+        检测标准图片（blip / drawing / pict），以及图像类 OLE 嵌入对象
+        （Visio、PowerPoint、公式、艺术字等），排除 Excel 等表格类对象。
+
+        Args:
+            p_element: 段落 XML 元素 (w:p)
+
+        Returns:
+            是否包含需要标记的图片
+        """
+        for elem in p_element.iter():
+            tag_local = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+
+            if tag_local in ('blip', 'drawing', 'pict'):
+                return True
+
+            if tag_local == 'object':
+                for ole_elem in elem.iter():
+                    ole_tag = ole_elem.tag.split('}')[-1] if '}' in ole_elem.tag else ole_elem.tag
+                    if ole_tag == 'OLEObject':
+                        prog_id = ole_elem.get('ProgID', '')
+                        for image_prog_prefix in self._IMAGE_OLE_PROGIDS:
+                            if prog_id.startswith(image_prog_prefix):
+                                return True
+                        break
+
+        return False
+
+    def _process_nested_table_contents(self, doc: 'Document', tbl_element: 'etree._Element',
+                                        parent_table_idx: int,
+                                        counters: dict) -> None:
+        """
+        递归处理表格单元格内的嵌套内容，在嵌套表格与图片前后插入标记段落。
+
+        Args:
+            doc: Document 对象
+            tbl_element: 表格 XML 元素 (w:tbl)
+            parent_table_idx: 父表格编号
+            counters: 计数器字典，格式 {'nested_table': {parent_idx: count}, 'cell_image': {parent_idx: count}}
+        """
+        if parent_table_idx not in counters['nested_table']:
+            counters['nested_table'][parent_table_idx] = 0
+        if parent_table_idx not in counters['cell_image']:
+            counters['cell_image'][parent_table_idx] = 0
+
+        for tr in tbl_element:
+            if not tr.tag.endswith('tr'):
+                continue
+            for tc in tr:
+                if not tc.tag.endswith('tc'):
+                    continue
+
+                insertions = []
+
+                for idx, child in enumerate(list(tc)):
+                    if child.tag.endswith('tbl'):
+                        counters['nested_table'][parent_table_idx] += 1
+                        nested_idx = counters['nested_table'][parent_table_idx]
+                        marker_name = f"Table_{parent_table_idx}_{nested_idx}"
+
+                        start_marker = self._create_marker_paragraph_element(
+                            f"{{{{{marker_name}_Start}}}}"
+                        )
+                        end_marker = self._create_marker_paragraph_element(
+                            f"{{{{{marker_name}_End}}}}"
+                        )
+
+                        insertions.append((idx, 'before', start_marker))
+                        insertions.append((idx + 1, 'after', end_marker, child))
+
+                        self._process_nested_table_contents(doc, child, nested_idx, counters)
+
+                    elif child.tag.endswith('p'):
+                        if self._check_paragraph_has_image(child):
+                            counters['cell_image'][parent_table_idx] += 1
+                            image_idx = counters['cell_image'][parent_table_idx]
+                            marker_name = f"Image_{parent_table_idx}_{image_idx}"
+
+                            start_marker = self._create_marker_paragraph_element(f"{{{{{marker_name}_Start}}}}")
+                            end_marker = self._create_marker_paragraph_element(f"{{{{{marker_name}_End}}}}")
+
+                            insertions.append((idx, 'before', start_marker))
+                            insertions.append((idx + 1, 'after', end_marker, child))
+
+                for insertion in reversed(insertions):
+                    if len(insertion) == 3:
+                        idx, pos, marker = insertion
+                        if pos == 'before':
+                            tc.insert(idx, marker)
+                    elif len(insertion) == 4:
+                        idx, pos, marker, _ = insertion
+                        if pos == 'after':
+                            tc.insert(idx, marker)
+
+    def mark_tables_and_images(self, word_path: Path, work_dir: Path) -> Optional[Path]:
+        """
+        标记 Word 文档中的表格与图片。
+
+        复制原文档后遍历 body 元素，在表格、图片段落前后插入标记段落，
+        并递归处理表格单元格内的嵌套表格与图片。已存在标记文件时直接复用。
+
+        Returns:
+            标记后的 Word 文件路径；失败返回 None
+        """
+        try:
+            marked_file_path = work_dir / f"{word_path.stem}_marked{word_path.suffix}"
+
+            if marked_file_path.exists():
+                logger.info(f"标记文件已存在，跳过: {marked_file_path} ")
+                return marked_file_path
+
+            try:
+                from docx import Document  # type: ignore
+                from docx.enum.text import WD_PARAGRAPH_ALIGNMENT  # type: ignore
+                import shutil
+
+                marked_file_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(word_path, marked_file_path)
+
+                doc = Document(marked_file_path)
+                table_count = 0
+                image_count = 0
+
+                nested_counters = {
+                    'nested_table': {},
+                    'cell_image': {},
+                }
+
+                body = doc._element.body
+                elements = list(body)
+                new_elements = []
+
+                for element in elements:
+                    if element.tag.endswith('tbl'):
+                        table_count += 1
+                        ref_p = self._find_ref_paragraph_before(elements, element)
+                        start_p = self._create_marker_paragraph(
+                            doc, f"{{{{Table_{table_count}_Start}}}}", ref_p
+                        )
+                        new_elements.append(start_p._element)
+                        new_elements.append(element)
+                        end_p = self._create_marker_paragraph(
+                            doc, f"{{{{Table_{table_count}_End}}}}", ref_p
+                        )
+                        new_elements.append(end_p._element)
+
+                        self._process_nested_table_contents(doc, element, table_count, nested_counters)
+
+                    elif element.tag.endswith('p'):
+                        has_image = self._check_paragraph_has_image(element)
+                        if has_image:
+                            image_count += 1
+                            ref_p = self._find_ref_paragraph_before(elements, element)
+                            start_p = self._create_marker_paragraph(
+                                doc, f"{{{{Image_{image_count}_Start}}}}", ref_p
+                            )
+                            new_elements.append(start_p._element)
+                            new_elements.append(element)
+                            end_p = self._create_marker_paragraph(
+                                doc, f"{{{{Image_{image_count}_End}}}}", ref_p
+                            )
+                            new_elements.append(end_p._element)
+                        else:
+                            new_elements.append(element)
+                    else:
+                        new_elements.append(element)
+
+                body.clear()
+                for elem in new_elements:
+                    body.append(elem)
+
+                doc.save(marked_file_path)
+
+                total_nested_tables = sum(nested_counters['nested_table'].values())
+                total_cell_images = sum(nested_counters['cell_image'].values())
+                logger.info(f"Word标记成功（python-docx）: {table_count}表格, {image_count}顶层图片, "
+                           f"{total_nested_tables}嵌套表格, {total_cell_images}单元格内图片")
+                return marked_file_path
+
+            except Exception as e:
+                logger.error(f"python-docx标记失败: {e}", exc_info=True)
+                return None
+
+        except Exception as e:
+            logger.error(f"Word标记失败: {e}", exc_info=True)
+            return None
+
+
+word_marker = WordRegionMarker()
+
 
 class WordRegionExtractor:
     """
@@ -71,6 +403,8 @@ class WordRegionExtractor:
         """
         从标记的Word文档中提取所有区域，输出为独立Word文件。
 
+        优化：源文档只解压一次，每个区域只打包其实际引用的媒体文件。
+
         Args:
             marked_file: 含标记的源 .docx 路径
             export_dir:  输出目录
@@ -87,20 +421,78 @@ class WordRegionExtractor:
         regions = self._find_regions(doc)
         logger.info(f"共找到 {len(regions)} 个区域: {[r['name'] for r in regions]}")
 
-        results = []
-        for region in regions:
-            output_name = f"{region['name']}_Start"
-            output_file = export_path / f"{output_name}.docx"
-            try:
-                self._export_region_by_clone(source_path, region, output_file)
-                results.append({"name": output_name, "path": str(output_file)})
-                logger.info(f"成功导出: {output_file.name}")
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                logger.error(f"导出区域 {region['name']} 失败: {e}", exc_info=True)
+        # ---- 初始化临时目录变量 ----
+        tmp_dir = None
+        
+        try:
+            # ---- 预解压源文档一次，解析关系映射 ----
+            tmp_dir = tempfile.mkdtemp()
+            logger.info(f"临时目录创建在: {tmp_dir}")
+            
+            extract_dir = Path(tmp_dir) / 'extracted'
+            with zipfile.ZipFile(source_path, 'r') as zf:
+                zf.extractall(extract_dir)
+            logger.info(f"源文档已解压到临时目录: {extract_dir}")
 
-        return results
+            rels_map = self._parse_relationships(extract_dir)
+            common_files = self._classify_source_files(extract_dir)
+            logger.info(f"预分类: {len(common_files)} 个公共文件")
+
+            # ---- 预解析 document.xml（一次解析，避免每个区域重复） ----
+            doc_xml_path = extract_dir / 'word' / 'document.xml'
+            doc_tree = etree.parse(
+                str(doc_xml_path), etree.XMLParser(remove_blank_text=False)
+            )
+            doc_root = doc_tree.getroot()
+            doc_body = doc_tree.find(f'.//{WNS_P}body')
+            if doc_body is None:
+                raise ValueError("document.xml 中找不到 <w:body>")
+            doc_sect_pr = doc_body.find(f'{WNS_P}sectPr')
+            # body 子元素列表（段落+表格），含索引，与 _find_regions 对齐
+            body_children = self._get_indexed_content_elements(list(doc_body))
+            # 提取根元素命名空间声明，后续构建 document.xml 时需要
+            nsmap = doc_root.nsmap
+            logger.info(
+                f"document.xml 预解析完成，body子元素: {len(body_children)}, "
+                f"命名空间: {list(nsmap.keys())}"
+            )
+
+            results = []
+            for region in regions:
+                output_name = f"{region['name']}_Start"
+                output_file = export_path / f"{output_name}.docx"
+                try:
+                    self._export_region_by_clone(
+                        extract_dir, rels_map, common_files,
+                        doc_root, body_children, doc_sect_pr,
+                        nsmap, region, output_file,
+                    )
+                    results.append({"name": output_name, "path": str(output_file)})
+                    logger.info(f"成功导出: {output_file.name}")
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    logger.error(f"导出区域 {region['name']} 失败: {e}", exc_info=True)
+
+            return results
+        
+        except Exception as e:
+            logger.error(f"处理过程中发生错误: {e}", exc_info=True)
+            raise  # 或者 return [] 根据需求决定
+        
+        finally:
+            # ---- 安全清理临时目录 ----
+            if tmp_dir is not None:
+                tmp_path = Path(tmp_dir)
+                if tmp_path.exists():
+                    try:
+                        shutil.rmtree(tmp_path, ignore_errors=True)
+                        logger.debug(f"临时目录已清理: {tmp_dir}")
+                    except PermissionError as e:
+                        logger.warning(f"清理临时目录时权限错误: {e}")
+                    except Exception as e:
+                        logger.warning(f"清理临时目录时发生错误: {e}")
+
 
     def _find_regions(self, doc: Document) -> List[Dict]:
         """
@@ -259,112 +651,298 @@ class WordRegionExtractor:
 
     def _export_region_by_clone(
         self,
-        source_path: Path,
+        extract_dir: Path,
+        rels_map: Dict[str, Tuple[str, str]],
+        common_files: List[Tuple[str, Path]],
+        doc_root: etree._Element,
+        body_children: List[Tuple[int, etree._Element]],
+        doc_sect_pr: Optional[etree._Element],
+        nsmap: Dict,
         region: Dict,
         output_file: Path,
     ) -> None:
         """
-        以源文档为模板，仅保留目标区域内容后输出新文档。
+        从预解压、预解析的源文档中裁剪区域并打包为最小化 docx。
 
-        步骤：
-          1. 复制源文件到临时位置
-          2. 解压，修改 word/document.xml
-          3. 重新打包为最终输出文件
+        使用预解析的 document.xml 树，仅 deep-copy 目标元素，避免重复解析。
         """
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path    = Path(tmp_dir)
-            extract_dir = tmp_path / "extracted"
-
-            # ---- 1. 解压源文档 ----------------------------------------
-            with zipfile.ZipFile(source_path, 'r') as zf:
-                zf.extractall(extract_dir)
-
-            # ---- 2. 修改 document.xml ------------------------------------
-            doc_xml_path = extract_dir / "word" / "document.xml"
-            self._trim_document_xml(doc_xml_path, region)
-
-            # ---- 3. 重新打包为 .docx -------------------------------------
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            self._repack_docx(extract_dir, output_file)
-
-    def _trim_document_xml(self, doc_xml_path: Path, region: Dict) -> None:
-        """
-        解析 document.xml，只保留目标区域内的元素。
-
-        处理两种情况：
-        - 顶层区域：保留 body 直接子元素中索引在范围内的内容
-        - 嵌套区域：提取单元格内的内容，创建包含该内容的最小表格结构
-
-        保留规则：
-          - sectPr（页面/节属性）始终保留，放在最后
-        """
-        parser = etree.XMLParser(remove_blank_text=False)
-        tree   = etree.parse(str(doc_xml_path), parser)
-        body   = tree.find(f'.//{WNS_P}body')
-
-        if body is None:
-            raise ValueError("document.xml 中找不到 <w:body>")
-
-        # 单独摘出 sectPr（可能不存在）
-        sect_pr = body.find(f'{WNS_P}sectPr')
-
+        # 1. 从预解析树构建裁剪后的 document.xml
         if region.get('is_nested', False):
-            # 处理嵌套区域
-            self._trim_nested_region(body, region, sect_pr)
+            trimmed_xml = self._build_nested_region_xml(
+                doc_root, doc_sect_pr, nsmap, region,
+            )
         else:
-            # 处理顶层区域（原有逻辑）
-            self._trim_top_level_region(body, region, sect_pr)
+            trimmed_xml = self._build_top_level_region_xml(
+                doc_root, body_children, doc_sect_pr, nsmap, region,
+            )
 
-        # 写回文件
-        tree.write(
-            str(doc_xml_path),
+        # 2. 扫描裁剪后XML中引用的 rId（用于保留 image 等内容性关系）
+        referenced_rids = self._collect_referenced_rids(trimmed_xml)
+
+        # 3. 构建过滤后的 rels 文件
+        filtered_rels = self._build_filtered_rels(extract_dir, referenced_rids)
+
+        # 4. 解析引用的实际文件路径
+        referenced_files: Set[str] = set()
+        for rid in referenced_rids:
+            if rid in rels_map:
+                target, _ = rels_map[rid]
+                referenced_files.add(f"word/{target}")
+
+        # 5. 创建最小化 docx
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        written: Set[str] = set()
+        with zipfile.ZipFile(output_file, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for arcname, file_path in common_files:
+                zout.write(file_path, arcname)
+                written.add(arcname)
+
+            zout.writestr('word/document.xml', trimmed_xml)
+            written.add('word/document.xml')
+            zout.writestr('word/_rels/document.xml.rels', filtered_rels)
+            written.add('word/_rels/document.xml.rels')
+
+            for arcname in sorted(referenced_files):
+                if arcname in written:
+                    continue
+                file_path = extract_dir / arcname
+                if file_path.is_file():
+                    ext = Path(arcname).suffix.lower()
+                    compress = zipfile.ZIP_STORED if ext in _MEDIA_EXTENSIONS else zipfile.ZIP_DEFLATED
+                    info = zipfile.ZipInfo(arcname)
+                    info.compress_type = compress
+                    with open(file_path, 'rb') as f:
+                        zout.writestr(info, f.read())
+                    written.add(arcname)
+
+    # ---- 基于预解析树的快速 XML 构建（避免重复解析整个文件） ----
+
+    def _build_top_level_region_xml(
+        self,
+        doc_root: etree._Element,
+        body_children: List[Tuple[int, etree._Element]],
+        doc_sect_pr: Optional[etree._Element],
+        nsmap: Dict,
+        region: Dict,
+    ) -> bytes:
+        """
+        从预解析树构建顶层区域的 document.xml，仅 deep-copy 目标元素。
+        """
+        keep_start = region['start_idx']
+        keep_end = region['end_idx']
+
+        new_root = etree.Element(doc_root.tag, nsmap=nsmap)
+        for key, value in doc_root.attrib.items():
+            new_root.set(key, value)
+        new_body = etree.SubElement(new_root, f'{WNS_P}body')
+
+        for idx, elem in body_children:
+            if keep_start <= idx < keep_end:
+                copied = copy.deepcopy(elem)
+                self._remove_internal_markers(copied)
+                new_body.append(copied)
+
+        # sectPr 放最后，删除页眉页脚引用
+        if doc_sect_pr is not None:
+            new_sect_pr = copy.deepcopy(doc_sect_pr)
+            for ref in new_sect_pr.findall(f'{WNS_P}headerReference'):
+                new_sect_pr.remove(ref)
+            for ref in new_sect_pr.findall(f'{WNS_P}footerReference'):
+                new_sect_pr.remove(ref)
+            new_body.append(new_sect_pr)
+
+        return etree.tostring(
+            new_root, xml_declaration=True, encoding='UTF-8', standalone=True,
+        )
+
+    def _build_nested_region_xml(
+        self,
+        doc_root: etree._Element,
+        doc_sect_pr: Optional[etree._Element],
+        nsmap: Dict,
+        region: Dict,
+    ) -> bytes:
+        """
+        从预解析树构建嵌套区域的 document.xml，仅 deep-copy 目标元素。
+        """
+        start_elem = region.get('start_elem')
+        end_elem = region.get('end_elem')
+        cell_path = region.get('cell_path', [])
+        region_type = region.get('type', '')
+
+        if start_elem is None or end_elem is None:
+            raise ValueError(f"嵌套区域 {region['name']} 缺少标记元素引用")
+
+        container = cell_path[-1] if cell_path else None
+        if container is None:
+            raise ValueError(f"嵌套区域 {region['name']} 缺少单元格路径")
+
+        # 获取标记之间的内容元素
+        content_elements = self._get_elements_between_markers(
+            start_elem, end_elem, container,
+        )
+
+        new_root = etree.Element(doc_root.tag, nsmap=nsmap)
+        for key, value in doc_root.attrib.items():
+            new_root.set(key, value)
+
+        new_body = etree.SubElement(new_root, f'{WNS_P}body')
+
+        if region_type == 'table':
+            for elem in content_elements:
+                tbl_elem = copy.deepcopy(elem)
+                self._ensure_tbl_grid(tbl_elem)
+                new_body.append(tbl_elem)
+        else:
+            simple_tbl = self._create_simple_table_for_nested(content_elements)
+            new_body.append(simple_tbl)
+
+        if doc_sect_pr is not None:
+            new_sect_pr = copy.deepcopy(doc_sect_pr)
+            for ref in new_sect_pr.findall(f'{WNS_P}headerReference'):
+                new_sect_pr.remove(ref)
+            for ref in new_sect_pr.findall(f'{WNS_P}footerReference'):
+                new_sect_pr.remove(ref)
+            new_body.append(new_sect_pr)
+
+        return etree.tostring(
+            new_root, xml_declaration=True, encoding='UTF-8', standalone=True,
+        )
+
+    @staticmethod
+    def _classify_source_files(extract_dir: Path) -> List[Tuple[str, Path]]:
+        """
+        预分类解压目录中的文件，返回公共文件列表（一次性，避免每区域重复 rglob）。
+
+        排除：document.xml、rels 文件、media 目录、页眉页脚。
+        这些文件每区域单独处理。
+        """
+        common: List[Tuple[str, Path]] = []
+        for file_path in sorted(extract_dir.rglob('*')):
+            if not file_path.is_file():
+                continue
+            arcname = str(file_path.relative_to(extract_dir)).replace('\\', '/')
+
+            if arcname == 'word/document.xml':
+                continue
+            if arcname == 'word/_rels/document.xml.rels':
+                continue
+            if arcname.startswith('word/media/'):
+                continue
+            if arcname.startswith('word/header') or arcname.startswith('word/footer'):
+                continue
+
+            common.append((arcname, file_path))
+        return common
+
+    # ---- 按需打包辅助方法 ----
+
+    @staticmethod
+    def _parse_relationships(extract_dir: Path) -> Dict[str, Tuple[str, str]]:
+        """
+        解析 word/_rels/document.xml.rels，返回 {rId: (target, type)} 映射。
+        """
+        rels_path = extract_dir / 'word' / '_rels' / 'document.xml.rels'
+        if not rels_path.exists():
+            return {}
+
+        tree = etree.parse(str(rels_path))
+        rels_map: Dict[str, Tuple[str, str]] = {}
+        for rel in tree.getroot():
+            rid = rel.get('Id')
+            target = rel.get('Target', '')
+            rel_type = rel.get('Type', '')
+            if rid:
+                rels_map[rid] = (target, rel_type)
+        return rels_map
+
+    @staticmethod
+    def _collect_referenced_rids(xml_bytes: bytes) -> Set[str]:
+        """
+        扫描裁剪后的 document.xml，收集所有被引用的 rId。
+
+        匹配 r:embed（图片/图表等嵌入资源）和 r:link（超链接）。
+        """
+        referenced: Set[str] = set()
+        for pattern in (rb'r:embed="(rId\d+)"', rb'r:link="(rId\d+)"', rb'r:id="(rId\d+)"'):
+            for match in re.findall(pattern, xml_bytes):
+                referenced.add(match.decode('utf-8'))
+        return referenced
+
+    @staticmethod
+    def _build_filtered_rels(
+        extract_dir: Path,
+        referenced_rids: Set[str],
+    ) -> bytes:
+        """
+        构建过滤后的 document.xml.rels。
+
+        保留策略：基于关系 Type 判断，而非仅按 rId 引用过滤。
+        - 结构性关系（styles/settings/theme/numbering/fontTable/webSettings/
+          footnotes/endnotes/customXml 等）一律保留
+        - image 关系仅保留被 document.xml 内容引用的
+        - header/footer 关系一律移除（sectPr 中已删除引用）
+        """
+        rels_path = extract_dir / 'word' / '_rels' / 'document.xml.rels'
+        ns = 'http://schemas.openxmlformats.org/package/2006/relationships'
+        empty_rels = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<Relationships xmlns="{ns}"></Relationships>'
+        )
+        if not rels_path.exists():
+            return empty_rels.encode('utf-8')
+
+        tree = etree.parse(str(rels_path))
+        root = tree.getroot()
+
+        # OOXML 标准关系类型后缀 — 这些是文档结构性关系，必须保留
+        _STRUCTURAL_SUFFIXES = (
+            '/styles',
+            '/settings',
+            '/theme',
+            '/numbering',
+            '/fontTable',
+            '/webSettings',
+            '/footnotes',
+            '/endnotes',
+            '/customXml',
+            '/comments',
+            '/commentsExtended',
+            '/commentsExtensible',
+            '/commentsIds',
+            '/people',
+        )
+
+        for rel in list(root):
+            rel_type = rel.get('Type', '')
+
+            # 1. header/footer 关系 → 移除
+            if '/header' in rel_type or '/footer' in rel_type:
+                root.remove(rel)
+                continue
+
+            # 2. image 关系 → 仅保留被引用的
+            if '/image' in rel_type:
+                rid = rel.get('Id')
+                if rid not in referenced_rids:
+                    root.remove(rel)
+                continue
+
+            # 3. 结构性关系 → 保留
+            if any(rel_type.endswith(suffix) for suffix in _STRUCTURAL_SUFFIXES):
+                continue
+
+            # 4. 其他类型（如超链接等）→ 仅保留被引用的
+            rid = rel.get('Id')
+            if rid not in referenced_rids:
+                root.remove(rel)
+
+        return etree.tostring(
+            tree,
             xml_declaration=True,
             encoding='UTF-8',
             standalone=True,
         )
-
-    def _trim_top_level_region(self, body: etree._Element, region: Dict,
-                                sect_pr: Optional[etree._Element]) -> None:
-        """
-        处理顶层区域的裁剪
-
-        Args:
-            body: body 元素
-            region: 区域信息字典
-            sect_pr: sectPr 元素（可选）
-        """
-        # 取出所有直接子元素（含 sectPr）
-        all_children = list(body)
-
-        # 过滤出有效的内容元素（段落 + 表格），用于对齐索引
-        indexed_elements = self._get_indexed_content_elements(all_children)
-
-        keep_start = region['start_idx']
-        keep_end   = region['end_idx']
-
-        # 收集要保留的元素
-        kept_elements: List[etree._Element] = []
-        for idx, elem in indexed_elements:
-            if keep_start <= idx < keep_end:
-                kept_elements.append(elem)
-
-        # 清空 body，重新填入
-        for child in list(body):
-            body.remove(child)
-
-        for elem in kept_elements:
-            # 清理元素内部的标记段落（嵌套表格和单元格内图片的标记）
-            self._remove_internal_markers(elem)
-            body.append(elem)
-
-        # sectPr 始终放最后（保持页面设置），但需要删除页眉页脚引用
-        if sect_pr is not None:
-            # 删除 headerReference 和 footerReference，避免导出文档带有页眉页脚
-            for ref in sect_pr.findall(f'{WNS_P}headerReference'):
-                sect_pr.remove(ref)
-            for ref in sect_pr.findall(f'{WNS_P}footerReference'):
-                sect_pr.remove(ref)
-            body.append(sect_pr)
 
     def _remove_internal_markers(self, elem: etree._Element) -> None:
         """
@@ -438,69 +1016,6 @@ class WordRegionExtractor:
         except ValueError:
             return False
 
-    def _trim_nested_region(self, body: etree._Element, region: Dict,
-                            sect_pr: Optional[etree._Element]) -> None:
-        """
-        处理嵌套区域的裁剪
-
-        对于嵌套在表格单元格内的内容：
-        - 嵌套表格 (NestedTable): 直接输出表格本身
-        - 单元格内图片 (CellImage): 创建简单的表格结构包含图片段落
-
-        Args:
-            body: body 元素
-            region: 区域信息字典
-            sect_pr: sectPr 元素（可选）
-        """
-        import copy
-
-        # 找到开始和结束标记之间的内容
-        start_elem = region.get('start_elem')
-        end_elem = region.get('end_elem')
-        cell_path = region.get('cell_path', [])
-        region_type = region.get('type', '')
-
-        if start_elem is None or end_elem is None:
-            raise ValueError(f"嵌套区域 {region['name']} 缺少标记元素引用")
-
-        # 获取标记所在的单元格
-        container = cell_path[-1] if cell_path else None
-
-        if container is None:
-            raise ValueError(f"嵌套区域 {region['name']} 缺少单元格路径")
-
-        # 找到开始标记和结束标记之间的内容元素
-        content_elements = self._get_elements_between_markers(
-            start_elem, end_elem, container
-        )
-
-        # 清空 body
-        for child in list(body):
-            body.remove(child)
-
-        # 根据区域类型决定输出方式
-        if region_type == 'table':
-            # 嵌套表格：直接输出表格元素
-            for elem in content_elements:
-                # 深拷贝以保留完整结构
-                tbl_elem = copy.deepcopy(elem)
-                # 确保表格有必需的 tblGrid 元素
-                self._ensure_tbl_grid(tbl_elem)
-                body.append(tbl_elem)
-        else:
-            # 单元格内图片等其他内容：创建简化的表格结构
-            simple_tbl = self._create_simple_table_for_nested(content_elements)
-            body.append(simple_tbl)
-
-        # sectPr 始终放最后，但需要删除页眉页脚引用
-        if sect_pr is not None:
-            # 删除 headerReference 和 footerReference，避免导出文档带有页眉页脚
-            for ref in sect_pr.findall(f'{WNS_P}headerReference'):
-                sect_pr.remove(ref)
-            for ref in sect_pr.findall(f'{WNS_P}footerReference'):
-                sect_pr.remove(ref)
-            body.append(sect_pr)
-
     def _ensure_tbl_grid(self, tbl_elem: etree._Element) -> None:
         """
         确保表格元素有必需的 tblGrid 子元素
@@ -545,6 +1060,7 @@ class WordRegionExtractor:
             new_tblPr = etree.Element(f'{WNS_P}tblPr')
             tbl_elem.insert(0, new_tblPr)
             tbl_elem.insert(1, tblGrid)
+
 
     def _get_elements_between_markers(self, start_marker: etree._Element,
                                        end_marker: etree._Element,
@@ -659,20 +1175,4 @@ class WordRegionExtractor:
         except Exception:
             return ''
 
-    @staticmethod
-    def _repack_docx(extract_dir: Path, output_file: Path) -> None:
-        """将解压目录重新打包为合法的 .docx 文件。
-
-        注意：[Content_Types].xml 和 _rels/.rels 必须不压缩或正确压缩，
-        此处统一使用 ZIP_DEFLATED，与标准 Office 生成方式一致。
-        """
-        with zipfile.ZipFile(output_file, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for file_path in sorted(extract_dir.rglob('*')):
-                if file_path.is_file():
-                    arcname = file_path.relative_to(extract_dir)
-                    # [Content_Types].xml 有些工具要求 STORED，但 DEFLATED 同样合法
-                    zout.write(file_path, arcname)
 word_region_extractor = WordRegionExtractor()
-
-# Word区域提取器 - 简单可靠的实现
-# 直接使用 python-docx 提取标签之间的内容，不依赖COM

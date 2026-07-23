@@ -11,6 +11,7 @@
 """
 
 # ========== 标准库导入 ==========
+import asyncio
 import hashlib
 import json
 import logging
@@ -50,13 +51,14 @@ class PreprocessingTaskService:
         extract_regions: bool = True,
         extract_assets: bool = True,
         chunking_enabled: bool = True,
-        callback_url: Optional[str] = None
+        callback_url: Optional[str] = None,
+        max_concurrency: int = 5,
     ):
         """
-        异步处理文件列表
-        
-        使用异步 HTTP 调用 Windows Bridge，不阻塞事件循环
-        
+        异步并发处理文件列表
+
+        使用 asyncio.Semaphore 控制并发窗口，所有文件并发发送到 Windows Bridge。
+
         Args:
             task_id: 任务ID
             files_list: 文件列表
@@ -66,85 +68,90 @@ class PreprocessingTaskService:
             extract_assets: 是否提取资源
             chunking_enabled: 是否启用分块
             callback_url: 回调URL
+            max_concurrency: 最大并发数（默认5）
         """
         from service.linux.bridge.windows_bridge_client import WindowsBridgeClient
-        
-        logger.info(f"🚀 [异步] 开始后台处理任务: {task_id}")
-        
-        results = []
+
+        logger.info(
+            f"🚀 开始后台处理任务: {task_id}, "
+            f"文件数: {len(files_list)}, 并发数: {max_concurrency}"
+        )
+
+        client = WindowsBridgeClient(self.settings.windows_bridge_url)
+        semaphore = asyncio.Semaphore(max_concurrency)
         succeeded = 0
         failed = 0
-        
-        # Windows Bridge 客户端
-        client = WindowsBridgeClient(self.settings.windows_bridge_url)
-        
-        for file_item in files_list:
-            # 解析文件项
+        lock = asyncio.Lock()
+
+        async def _process_one(file_item) -> None:
+            """处理单个文件的独立协程"""
+            nonlocal succeeded, failed
+
             filename, file_id = self._parse_file_item(file_item)
             if not filename:
-                continue
-            
-            # 计算文件 SHA256
+                return
+
             sha256_val = self._compute_file_sha256(folder_path, filename)
-            
-            try:
-                logger.info(f"  [异步] 处理文件: {filename}")
-                file_path_rel = str((Path(folder_path) / filename)).replace('\\', '/')
-                
-                # 使用异步方法调用 Windows Bridge
-                data = await client.preprocess_file_async(
-                    file_path=file_path_rel,
-                    folder_path=folder_path,
-                    filename=filename,
-                    file_id=file_id,
-                    force_ocr=force_ocr,
-                    extract_regions=extract_regions,
-                    extract_assets=extract_assets,
-                    chunking_enabled=chunking_enabled
-                )
-                
-                if data is None:
-                    raise RuntimeError("Windows Bridge 无响应")
-                
-                if not data.get('success'):
-                    raise RuntimeError(
-                        data.get('error_message') or data.get('error') or 'Windows Bridge处理失败'
+
+            async with semaphore:
+                try:
+                    logger.info(f"处理文件: {filename}")
+                    file_path_rel = str((Path(folder_path) / filename)).replace('\\', '/')
+
+                    data = await client.preprocess_file_async(
+                        file_path=file_path_rel,
+                        folder_path=folder_path,
+                        filename=filename,
+                        file_id=file_id,
+                        force_ocr=force_ocr,
+                        extract_regions=extract_regions,
+                        extract_assets=extract_assets,
+                        chunking_enabled=chunking_enabled
                     )
-                
-                # 成功
-                result = {
-                    "id": file_id or filename,
-                    "filename": filename,
-                    "status": "success",
-                    "sha256": sha256_val,
-                }
-                if callback_url:
-                    await self._send_single_callback(callback_url, result)
-                succeeded += 1
-                logger.info(f"  ✅ [异步] 成功: {filename}")
-                
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                error_msg = str(e)
-                logger.error(f"  ❌ [异步] 失败：{filename}, 错误：{e}", exc_info=True)
-                result={
-                    "id": file_id or filename,
-                    "filename": filename,
-                    "status": "fail",
-                    "sha256": "",
-                    "err_msg": "预处理异常",
-                    "error": error_msg,
-                }
-                if callback_url:
-                    await self._send_single_callback(callback_url, result)
-                failed += 1
-        
-        logger.info(f"✅ [异步] 任务完成: {task_id}, 成功: {succeeded}, 失败: {failed}")
-        
-        # # 异步回调通知
-        # if callback_url:
-        #     await self._send_callback(callback_url, results)
+
+                    if data is None:
+                        raise RuntimeError("Windows Bridge 无响应")
+
+                    if not data.get('success'):
+                        raise RuntimeError(
+                            data.get('error_message') or data.get('error') or 'Windows Bridge处理失败'
+                        )
+
+                    result = {
+                        "id": file_id or filename,
+                        "filename": filename,
+                        "status": "success",
+                        "sha256": sha256_val,
+                    }
+                    if callback_url:
+                        await self._send_single_callback(callback_url, result)
+                    async with lock:
+                        succeeded += 1
+                    logger.info(f"✅ 处理成功: {filename}")
+
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    error_msg = str(e)
+                    logger.error(f"❌ 处理失败：{filename}, 错误：{e}", exc_info=True)
+                    result = {
+                        "id": file_id or filename,
+                        "filename": filename,
+                        "status": "fail",
+                        "sha256": "",
+                        "err_msg": "预处理异常:"+error_msg,
+                        "error": error_msg,
+                    }
+                    if callback_url:
+                        await self._send_single_callback(callback_url, result)
+                    async with lock:
+                        failed += 1
+
+        # 所有文件并发执行，return_exceptions=True 确保一个失败不影响其他
+        tasks = [_process_one(item) for item in files_list]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        logger.info(f"✅ 任务完成: {task_id}, 成功: {succeeded}, 失败: {failed}")
 
     # ============================================================
     # 私有辅助方法

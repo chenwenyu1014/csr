@@ -36,6 +36,7 @@ async def process_template(
     output_dir: str | None = Form(None, description="输出目录"),
     callback_base_url: str | None = Form(os.getenv("CALLBACK_BASE_URL"), description="回调基础URL"),
     file_id: str | None = Form(None, description="文件ID（用于回调标识）"),
+    template_id: str | None = Form(None, description="模板ID用于回调标识）"),
     auth_token: str | None = Form(None, description="认证Token"),
 ):
     """
@@ -70,10 +71,12 @@ async def process_template(
             "success": true,
             "task_id": "template_xxx",
             "file_id": "xxx",
+            "template_id": "xxx",
             "result": {
                 "file": "原始路径",
                 "processed_file": "处理后路径",
                 "resources": [{"title": "...", "html": "...", "pic": "..."}]
+                "paragraphs_ids":[{"paragraphs_ids":"xxx",...},{}]
             },
             "error": null
         }
@@ -92,6 +95,7 @@ async def process_template(
             output_dir=output_dir,
             callback_base_url=callback_base_url,
             file_id=file_id,
+            template_id=template_id,
             auth_token=auth_token
         )
 
@@ -106,4 +110,78 @@ async def process_template(
         import traceback
         traceback.print_exc()
         logger.error(f"接受模板处理任务失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/template/download")
+async def download_template(
+    file_path: str = Form(..., description="Word文件路径（相对于AAA/）"),
+    paragraph_ids: str = Form(..., description="paragraph_ids JSON字符串"),
+    output_file: str | None = Form(None, description="输出文件路径（可选）"),
+):
+    """
+    模板下载处理
+
+    将经过模板处理后带有内容控件的Word文档，
+    根据传入的paragraph_ids信息，将控件转换回批注，
+    同时清理控件和模板标记。
+
+    请求示例:
+        POST /api/v1/template/download
+        file_path=AAA/Preprocessing/Template/模板/模板_marked.docx
+        paragraph_ids=[{"paragraphId":"方案编号",...}, ...]
+
+    响应:
+        {
+            "success": true,
+            "output_file": "AAA/.../模板_commented.docx",
+            "comments_created": 15,
+            "error": null
+        }
+    """
+    try:
+        import json as _json
+        from service.linux.template.control_to_comment_converter import convert_controls_to_comments
+
+        # 解析 paragraph_ids JSON
+        try:
+            paragraph_ids_list = _json.loads(paragraph_ids)
+            if not isinstance(paragraph_ids_list, list):
+                raise HTTPException(status_code=400, detail="paragraph_ids 必须是 JSON 数组")
+        except _json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"paragraph_ids JSON 解析失败: {e}")
+
+        logger.info(f"接受模板下载任务: 文件={file_path}, 段落标签数={len(paragraph_ids_list)}")
+
+        result = convert_controls_to_comments(
+            file_path=file_path,
+            paragraph_ids=paragraph_ids_list,
+            output_path=output_file,
+        )
+
+        if not result["success"]:
+            failed_step = result.get("failed_step", "")
+            error_msg = result.get("error", "未知错误")
+            if failed_step:
+                error_msg = f"[{failed_step}] {error_msg}"
+            return JSONResponse({
+                "success": False,
+                "output_file": None,
+                "comments_created": 0,
+                "error": error_msg,
+            }, status_code=200)
+
+        return JSONResponse({
+            "success": True,
+            "output_file": result["output_file"],
+            "comments_created": result["comments_created"],
+            "error": None,
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        logger.error(f"模板下载处理失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

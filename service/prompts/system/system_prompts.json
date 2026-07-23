@@ -1,49 +1,5 @@
 {
   "prompt_templates": {
-    "tfl_file_selection": {
-      "name": "TFL文件选择提示词模板",
-      "description": "用于从文件列表中选择最相关的TFL文件的提示词模板",
-      "usage": "TFL文件选择和匹配",
-      "used_by": ["LLMService", "DataExtractorV2"],
-      "template": {
-        "md_file": "prompt/tfl_selection_prompt.md"
-      },
-      "variables": ["title", "file_list"],
-      "file_list_variables": ["index", "filename", "file_title"]
-    },
-    "data_extraction": {
-      "name": "方案原文/结论提取模板",
-      "description": "用于从标记后的方案全文中提取原文或结论（统一模板）",
-      "usage": "方案原文提取与结论生成",
-      "used_by": ["DataExtractorV2"],
-      "template": {
-        "md_file": "prompt/study_plan_extraction_prompt.md"
-      },
-      "variables": ["user_query", "process_type", "scheme_content", "project_desc"]
-    },
-    
-    
-    "tfl_processing": {
-      "name": "TFL处理提示词模板",
-      "description": "用于TFL表格数据分析处理的提示词模板",
-      "usage": "TFL表格数据分析处理",
-      "used_by": ["TFLProcessingService"],
-      "template": {
-        "md_file": "prompt/tfl_processing_prompt.md"
-      },
-      "variables": ["user_prompt", "example_template", "content"]
-    },
-    "tfl_verification": {
-      "name": "TFL验证提示词模板",
-      "description": "用于验证多个模型分析结果的提示词模板",
-      "usage": "验证多个模型的分析结果",
-      "used_by": ["TFLProcessingService"],
-      "template": {
-        "md_file": "prompt/tfl_validate_prompt.md"
-      },
-      "variables": ["results"]
-    }
-    ,
     "csr_generation": {
       "name": "CSR生成提示词模板",
       "description": "用于根据提取数据生成CSR段落的提示词模板",
@@ -63,13 +19,12 @@
         "md_file": "../generation/table.md"
       },
       "variables": ["generate_prompt", "scheme_data", "html","example", "project_desc"]
-    }
-    ,
+    },
     "data_source_validation": {
       "name": "数据源校验提示词模板",
       "description": "根据用户的校验逻辑（Rules）和文件名称列表，对各分类的数据源是否符合进行校验（语义+命名规范）",
       "usage": "数据源命名与分类校验",
-      "used_by": ["DataSourceValidator"],
+      "used_by": ["DataSourceService"],
       "template": {
         "md_file": "../validation/data_source_validation.md"
       },
@@ -79,7 +34,7 @@
       "name": "数据源匹配提示词模板",
       "description": "根据用户的匹配规则（Rules），从文件列表中找出所有符合要求的文件",
       "usage": "数据源文件匹配",
-      "used_by": ["DataSourceValidator"],
+      "used_by": ["DataSourceService"],
       "template": {
         "md_file": "../validation/data_source_matching.md"
       },
@@ -103,7 +58,7 @@
       "template": {
         "md_file": "../extraction/chunk_based.md"
       },
-      "variables": ["extraction_query", "selected_chunks_content", "project_desc"]
+      "variables": ["extraction_query", "selected_chunks_content", "project_desc", "extraction_mode"]
     },
     "chunk_filtering_pdf": {
       "name": "PDF文档分块筛选提示词模板",
@@ -123,7 +78,7 @@
       "template": {
         "md_file": "../extraction/chunk_based_pdf.md"
       },
-      "variables": ["extraction_query", "selected_chunks_content", "project_desc"]
+      "variables": ["extraction_query", "selected_chunks_content", "project_desc", "extraction_mode"]
     },
     "excel_extraction": {
       "name": "Excel数据提取模板",
@@ -133,7 +88,7 @@
       "template": {
         "md_file": "../extraction/excel_extraction_prompt.md"
       },
-      "variables": ["extraction_query", "sheet_name", "source_file", "sheet_content", "project_desc"]
+      "variables": ["extraction_query", "sheet_content", "project_desc"]
     },
     "extraction_validation": {
       "name": "提取结果校验模板",
@@ -141,9 +96,40 @@
       "usage": "提取结果质量校验",
       "used_by": ["ExtractionValidationService"],
       "template": {
-        "md_file": "../validation/extraction_validation_prompt.md"
+        "md_file": "../validation/extraction_validation.md"
       },
       "variables": ["extraction_query", "source_content", "extracted_content"]
+    },
+
+    "tag_name_compression": {
+      "name": "段落标签名压缩模板",
+      "description": "将批注选定的一大段正文提炼为简短段落标签名（paragraph_id），保留原文语言、不翻译、不含字段名",
+      "usage": "长正文 tagName 派生时调用 LLM 提炼",
+      "used_by": ["TemplateCommentParser"],
+      "template": {
+        "md_file": "../validation/tag_name_compression.md"
+      },
+      "variables": ["selected_text", "comment_text"]
+    },
+    "file_validation": {
+      "name": "文件校验提示词模板",
+      "description": "根据推荐文件分组列表，判断用户上传的文件名是否属于推荐类型",
+      "usage": "文件名校验与推荐分组匹配",
+      "used_by": ["DataSourceService"],
+      "template": {
+        "md_file": "../validation/file_validation.md"
+      },
+      "variables": ["file_group", "file_names", "project_desc"]
+    },
+    "manifest_generation": {
+      "name": "清单生成提示词模板",
+      "description": "根据模板ID和文件匹配逻辑，生成推荐上传的文件分组清单",
+      "usage": "推荐文件清单生成",
+      "used_by": ["DataSourceService"],
+      "template": {
+        "md_file": "../validation/manifest_generation.md"
+      },
+      "variables": ["first_match", "project_desc"]
     },
     "chunk_section_summary": {
     "name": "分块章节摘要模板",

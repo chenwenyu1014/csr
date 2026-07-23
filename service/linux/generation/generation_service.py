@@ -19,29 +19,19 @@ import time as time_module
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, Future
 
 # ========== 本地导入 ==========
 from config import get_settings
-from utils.context_manager import set_current_output_dir, get_current_output_dir
+from utils.context_manager import (
+    set_current_output_dir,
+    get_current_output_dir,
+    set_project_desc,
+    set_combination_id,
+    inherit_context,
+)
 from utils.task_logger import TaskLogger, set_task_logger, clear_task_logger
-
-# 导入耗时记录工具
-try:
-    from utils.timing import Timer, generation_timer, log_timing, print_global_summary
-except ImportError:
-    class Timer:
-        def __init__(self, *args, **kwargs): pass
-        def start(self): return self
-        def stop(self): return 0
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        @property
-        def duration(self): return 0
-        @property
-        def duration_str(self): return "0ms"
-    generation_timer = None
-    def log_timing(*args, **kwargs): pass
-    def print_global_summary(): pass
+from utils.output_manager import save_json
 
 # ========== 模块配置 ==========
 logger = logging.getLogger(__name__)
@@ -58,11 +48,14 @@ class GenerationService:
     def __init__(self):
         """初始化生成服务"""
         self.settings = settings
-    
-    # ============================================================
-    # 公开方法 - 同步执行
-    # ============================================================
-    
+        # 有界任务线程池：限制同时执行的任务数，防止突发流量下线程失控
+        # 池满时新任务进队列等待，接口仍立即返回 task_id
+        max_tasks = max(1, settings.generation_max_concurrent_tasks)
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_tasks,
+            thread_name_prefix="generation-task"
+        )
+        logger.info(f"生成服务任务线程池初始化: max_workers={max_tasks}")
     
     # ============================================================
     # 公开方法 - 异步执行（后台线程）
@@ -82,7 +75,7 @@ class GenerationService:
         project_name: Optional[str] = None,
         auth_token: Optional[str] = None,
         skip_validation: bool = True  # 默认跳过校验
-    ) -> threading.Thread:
+    ) -> Future:
         """
         启动后台线程执行异步生成任务
 
@@ -103,18 +96,14 @@ class GenerationService:
         Returns:
             启动的线程对象
         """
-        thread = threading.Thread(
-            target=self._run_async,
-            args=(
-                task_id, cfg_obj, base_data_dir, output_dir,
-                combinationId, project_desc, callback_url,
-                result_callback_url, project_id, project_name, auth_token,
-                skip_validation
-            ),
-            daemon=True
+        future = self._executor.submit(
+            inherit_context(self._run_async),
+            task_id, cfg_obj, base_data_dir, output_dir,
+            combinationId, project_desc, callback_url,
+            result_callback_url, project_id, project_name, auth_token,
+            skip_validation
         )
-        thread.start()
-        return thread
+        return future
     
     def start_compose_async_task(
         self,
@@ -129,8 +118,9 @@ class GenerationService:
         project_name: Optional[str] = None,
         auth_token: Optional[str] = None,
         callback_url: Optional[str] = None,
+        package_id: Optional[str] = None,
         skip_validation: bool = True  # 默认跳过校验
-    ) -> threading.Thread:
+    ) -> Future:
         """
         启动后台线程执行异步完整流程任务（生成 + 插入）
 
@@ -146,23 +136,20 @@ class GenerationService:
             project_name: 项目名称（用于RAGFlow知识库查找）
             auth_token: 认证Token
             callback_url: 完成时回调URL
+            package_id: 报告包ID（有值时回调到报告包批量生成接口，dataJson与form-data均带package_id）
             skip_validation: 是否跳过提取校验（默认True）
 
         Returns:
             启动的线程对象
         """
-        thread = threading.Thread(
-            target=self._run_compose_async,
-            args=(
-                task_id, cfg_obj, base_data_dir, output_dir,
-                combinationId, project_desc, template_file,
-                project_id, project_name, auth_token, callback_url,
-                skip_validation
-            ),
-            daemon=True
+        future = self._executor.submit(
+            inherit_context(self._run_compose_async),
+            task_id, cfg_obj, base_data_dir, output_dir,
+            combinationId, project_desc, template_file,
+            project_id, project_name, auth_token, callback_url,
+            package_id, skip_validation
         )
-        thread.start()
-        return thread
+        return future
     
     # ============================================================
     # 私有方法 - 异步任务执行
@@ -233,23 +220,16 @@ class GenerationService:
             
             fc = FlowConfig(
                 config_path=str(cfg_path),
-                base_data_dir=base_data_dir or self.settings.base_data_dir,
+                base_data_dir=self.settings.base_data_dir,
                 cache_dir=self.settings.cache_dir,
                 output_dir=output_dir or self.settings.compose_output_dir,
-                word_template_file=None,
-                word_output_file=None,
-                enable_word_integration=False,
                 skip_validation=skip_validation,  # 传递跳过校验参数
                 project_id=project_id,  # 项目ID（用于回调标识）
                 project_name=project_name  # 项目名称（用于RAGFlow）
             )
-            
-            fc.early_export_regions = True
-            fc.compose_insert_url = None
-            
+
             controller = CSRFlowController(fc)
-            # controller.word_post_processor = None
-            
+
             try:
                 # 设置实时阶段回调
                 controller.set_stage_callbacks(
@@ -279,9 +259,8 @@ class GenerationService:
 
                 # 保存插入数据到文件，
                 insertion_config = result.get("insertion_config", {})
-                data_json_str = json.dumps(insertion_config, ensure_ascii=False, indent=2)
                 insertion_data_path = run_dir / "inputs" / "insertion_data.json"
-                insertion_data_path.write_text(data_json_str, encoding='utf-8')
+                save_json(insertion_data_path, insertion_config)
                 task_logger.info("插入数据已保存", path=str(insertion_data_path))
                 
                 # 更新每个段落的标签状态
@@ -329,6 +308,7 @@ class GenerationService:
         project_name: Optional[str] = None,
         auth_token: Optional[str] = None,
         callback_url: Optional[str] = None,
+        package_id: Optional[str] = None,
         skip_validation: bool = True  # 默认跳过校验
     ):
         """
@@ -369,23 +349,16 @@ class GenerationService:
             
             fc = FlowConfig(
                 config_path=str(cfg_path),
-                base_data_dir=base_data_dir or self.settings.base_data_dir,
+                base_data_dir= self.settings.base_data_dir,
                 cache_dir=self.settings.cache_dir,
                 output_dir=output_dir or self.settings.compose_output_dir,
-                word_template_file=None,
-                word_output_file=None,
-                enable_word_integration=False,
                 skip_validation=skip_validation,  # 传递跳过校验参数
                 project_id=project_id,  # 项目ID（用于回调标识）
                 project_name=project_name  # 项目名称（用于RAGFlow）
             )
-            
-            fc.early_export_regions = True
-            fc.compose_insert_url = None
-            
+
             controller = CSRFlowController(fc)
-            # controller.word_post_processor = None
-            
+
             try:
                 flow_steps = "执行生成流程"
                 # 执行生成
@@ -402,6 +375,7 @@ class GenerationService:
                         "status": "失败",
                         "task_id": task_id,
                         "project_id": project_id,
+                        "package_id": package_id,
                         "err_msg": "生成流程失败",
                         "error": error_msg
                     })
@@ -419,12 +393,12 @@ class GenerationService:
                     task_logger.info("开始步骤2: 模板插入", template_file=template_file)
 
                     insertion_config = result.get("insertion_config", {})
-                    data_json_str = json.dumps(insertion_config, ensure_ascii=False,indent=2)
 
                     # 保存插入数据到文件，避免日志输出过大
                     insertion_data_path = run_dir / "inputs" / "insertion_data.json"
-                    insertion_data_path.write_text(data_json_str, encoding='utf-8')
+                    save_json(insertion_data_path, insertion_config)
                     task_logger.info("插入数据已保存", path=str(insertion_data_path))
+                    data_json_str = json.dumps(insertion_config, ensure_ascii=False,indent=2)
 
                     # 仅记录简要信息，不输出完整JSON
                     logger.info(f"[Compose异步] 步骤2: 模板插入 - 插入数据已保存到: {insertion_data_path}")
@@ -456,7 +430,9 @@ class GenerationService:
                 result["status"] = "完成"
                 result["task_id"] = task_id
                 result["project_id"] = project_id
-                
+                if package_id:
+                    result["package_id"] = package_id
+
                 task_manager.complete_task(task_id, result)
                 self._send_compose_callback(callback_url, auth_token, result)
                 
@@ -478,6 +454,7 @@ class GenerationService:
                 "status": "失败",
                 "task_id": task_id,
                 "project_id": project_id,
+                "package_id": package_id,
                 "err_msg": "任务执行失败"+flow_steps,
                 "error": str(e)
             })
@@ -492,17 +469,17 @@ class GenerationService:
     # ============================================================
     
     def _setup_environment(
-        self, 
-        cfg_obj: dict, 
-        combinationId: Optional[str], 
+        self,
+        cfg_obj: dict,
+        combinationId: Optional[str],
         project_desc: Optional[str]
     ):
-        """设置环境变量"""
-        os.environ["CURRENT_PROJECT_DESC"] = str(
+        """设置项目上下文（contextvars，并发任务隔离）"""
+        set_project_desc(str(
             (project_desc or "") or (cfg_obj.get("project_desc", "") or "")
-        )
+        ))
         _cid = combinationId or cfg_obj.get("combinationId")
-        os.environ["CURRENT_COMBINATION_ID"] = str(_cid or "")
+        set_combination_id(str(_cid or ""))
     
     def _create_output_dir(self, output_dir: Optional[str]) -> Path:
         """创建输出目录（使用线程安全的方式设置当前输出目录）"""
@@ -521,7 +498,7 @@ class GenerationService:
     def _save_config(self, run_dir: Path, cfg_obj: dict) -> Path:
         """保存配置文件"""
         cfg_path = run_dir / "inputs" / "paragraphs.json"
-        cfg_path.write_text(json.dumps(cfg_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+        save_json(cfg_path, cfg_obj)
         return cfg_path
     
     # ============================================================
@@ -702,10 +679,12 @@ class GenerationService:
         """
         发送完整流程的完成回调
         
-        回调接口: POST http://192.168.3.32:8088/ky/sys/projectCreateManage/getReportAIResult
+        回调接口:
+            - 无 package_id: POST .../ky/sys/projectCreateManage/getReportAIResult
+            - 有 package_id: POST .../ky/report/reportPackage/getReportAIResult
         参数格式: form-data
         参数:
-            - dataJson: 生成结果JSON字符串
+            - dataJson: 生成结果JSON字符串（有 package_id 时顶层含 package_id）
             - project_id: 项目ID
         """
         if not callback_url:
@@ -715,13 +694,15 @@ class GenerationService:
         try:
             import httpx
             
-            # 提取 project_id
+            # 提取 project_id / package_id（仅用于日志）
             project_id = data.get("project_id", "")
+            package_id = data.get("package_id", "")
             
             # 将完整结果转为JSON字符串
             data_json_str = json.dumps(data, ensure_ascii=False)
             
             # 构建 form-data 请求参数
+            # package_id 仅放在 dataJson 顶层，不作为 form-data 字段
             form_data = {
                 "dataJson": data_json_str,
                 "project_id": project_id
@@ -733,8 +714,7 @@ class GenerationService:
                 headers["X-Access-Token"] = auth_token
             
             logger.info(f"[Compose回调] 发送回调到: {callback_url}")
-            logger.info(f"[Compose回调] project_id: {project_id}")
-            # logger.info(f"[Compose回调] 数据: {data_json_str[:200]}")
+            logger.info(f"[Compose回调] project_id: {project_id}, package_id: {package_id}")
             logger.info(f"[Compose回调] 数据: status={data.get('status')}, success={data.get('success')}")
             
             with httpx.Client(timeout=30.0) as client:

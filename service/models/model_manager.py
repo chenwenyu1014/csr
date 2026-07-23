@@ -79,9 +79,9 @@ class ModelManager:
         
         Args:
             task_type: 任务类型，支持：
-                - "extraction": 数据提取任务（默认 deepseek-v3.2）
-                - "validation": 数据验证任务（默认 qwen3-max）
-                - "generation": 内容生成任务（默认 qwen3-max）
+                - "extraction": 数据提取任务
+                - "validation": 数据验证任务
+                - "generation": 内容生成任务
                 - "default": 默认任务（使用全局配置）
             model_name: 指定模型名称（可选，会覆盖任务类型的默认值）
         
@@ -90,36 +90,40 @@ class ModelManager:
         """
         # 构建缓存键
         cache_key = f"{task_type}:{model_name or 'auto'}"
-        
-        # 如果已缓存，直接返回
+
+        # 如果已缓存，直接返回（无锁快速路径）
         if cache_key in self._llm_instances:
             return self._llm_instances[cache_key]
-        
-        # 创建新实例
-        from config import get_settings
-        from service.models.llm_service import LLMService
-        
-        config = get_settings()
-        
-        # 根据任务类型选择模型（使用 settings.py 中的属性方法）
-        if model_name is None:
-            model_map = {
-                "extraction": config.extraction_model_name,  # 默认 deepseek-v3.2
-                "validation": config.validation_model_name,  # 默认使用 extraction_model
-                "generation": config.generation_model_name,  # 默认使用 llm_model
-                "default": config.llm_model_name
-            }
-            model_name = model_map.get(task_type, config.llm_model_name)
-        
-        logger.info(f"创建LLM实例: task_type={task_type}, model={model_name}")
-        
-        # 创建并缓存实例
-        self._llm_instances[cache_key] = LLMService(
-            api_key=config.dashscope_api_key,
-            model_name=model_name
-        )
-        
-        return self._llm_instances[cache_key]
+
+        # 加锁后再检查一次，防止并发下重复创建实例
+        with self._lock:
+            if cache_key in self._llm_instances:
+                return self._llm_instances[cache_key]
+
+            from config import get_settings
+            from service.models.llm_service import LLMService
+
+            config = get_settings()
+
+            # 根据任务类型选择模型（使用 settings.py 中的属性方法）
+            if model_name is None:
+                model_map = {
+                    "extraction": config.extraction_model,
+                    "validation": config.validation_model,
+                    "generation": config.generation_model,
+                    "default": config.llm_model
+                }
+                model_name = model_map.get(task_type, config.llm_model)
+
+            logger.info(f"创建LLM实例: task_type={task_type}, model={model_name}")
+
+            # 创建并缓存实例
+            self._llm_instances[cache_key] = LLMService(
+                api_key=config.llm_api_key,
+                model_name=model_name
+            )
+
+            return self._llm_instances[cache_key]
     
     def get_vision(self, timeout: int = 600) -> 'VisionModelService':
         """

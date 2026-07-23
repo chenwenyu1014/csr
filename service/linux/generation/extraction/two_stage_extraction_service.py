@@ -14,8 +14,9 @@ from typing import Dict, Any, List, Optional
 
 from service.models import get_llm_service
 from service.prompts.system_prompt_manager import system_prompt_manager
-from utils.context_manager import get_current_output_dir
+from utils.context_manager import get_current_output_dir, get_project_desc
 from utils.task_logger import get_task_logger
+from utils.output_manager import save_json, save_text
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,8 @@ class TwoStageExtractionService:
                            extraction_query: str,
                            task_name: Optional[str] = None,
                            doc_type: str = "word",
-                           ragflow_content: Optional[str] = None) -> Dict[str, Any]:
+                           ragflow_content: Optional[str] = None,
+                           extraction_mode: str = "") -> Dict[str, Any]:
         """
         从文档分块中进行两阶段提取
 
@@ -169,7 +171,8 @@ class TwoStageExtractionService:
                 extraction_query,
                 task_name,
                 doc_type,
-                ragflow_content
+                ragflow_content,
+                extraction_mode
             )
             
             if not extraction_result.get("success"):
@@ -442,21 +445,25 @@ class TwoStageExtractionService:
             variables = {
                 "extraction_query": extraction_query,
                 "chunks_list": chunks_list,
-                "project_desc": os.getenv("CURRENT_PROJECT_DESC", "")
+                "project_desc": get_project_desc()
             }
             
             logger.info(f"🔧 使用提示词模板: {template_name}")
             logger.info(f"🔧 提取查询: {extraction_query}")
             logger.info(f"🔧 Chunks列表长度: {len(chunks_list)}字符")
             
-            prompt = system_prompt_manager.build_prompt(template_name, variables)
-            
+            messages = system_prompt_manager.build_messages(template_name, variables)
+            system_prompt = messages.get("system", "")
+            user_prompt = messages.get("user", "")
+            # 留痕用完整文本（system + user）；调用模型时只传 user，system 走独立参数以命中缓存
+            prompt = (system_prompt + "\n\n" + user_prompt) if system_prompt else user_prompt
+
             logger.info(f"📝 筛选提示词已构建，长度: {len(prompt)}字符")
             # logger.info(f"📝 筛选提示词（前500字符）:\n{prompt[:500]}")
-            
+
             # 调用模型
             logger.info(f"🤖 正在调用LLM进行分块筛选...")
-            model_output = self.llm.generate_single(prompt)
+            model_output = self.llm.generate_single(user_prompt, system=system_prompt)
             
             # ✅ 调试：输出LLM原始响应
             logger.info(f"🔍 LLM原始输出长度: {len(model_output)}字符")
@@ -477,7 +484,7 @@ class TwoStageExtractionService:
 
                 if attempt < max_retries:
                     logger.info(f"🔄 发起第 {attempt + 1} 次重试 ...")
-                    current_output = self.llm.generate_single(prompt)
+                    current_output = self.llm.generate_single(user_prompt, system=system_prompt)
                     logger.info(f"🔍 重试后 LLM 输出长度: {len(current_output)}")
                     all_attempts_outputs.append(current_output)
 
@@ -729,7 +736,8 @@ class TwoStageExtractionService:
                                      extraction_query: str,
                                      task_name: Optional[str] = None,
                                      doc_type: str = "word",
-                                     ragflow_content: Optional[str] = None) -> Dict[str, Any]:
+                                     ragflow_content: Optional[str] = None,
+                                     extraction_mode: str = "") -> Dict[str, Any]:
         """
         阶段2：从筛选的分块中提取内容
         
@@ -764,12 +772,17 @@ class TwoStageExtractionService:
             variables = {
                 "extraction_query": extraction_query,
                 "selected_chunks_content": selected_chunks_text,
-                "project_desc": os.getenv("CURRENT_PROJECT_DESC", "")
+                "project_desc": get_project_desc(),
+                "extraction_mode": extraction_mode
             }
-            prompt = system_prompt_manager.build_prompt(template_name, variables)
+            messages = system_prompt_manager.build_messages(template_name, variables)
+            system_prompt = messages.get("system", "")
+            user_prompt = messages.get("user", "")
+            # 留痕用完整文本（system + user）；调用模型时只传 user，system 走独立参数以命中缓存
+            prompt = (system_prompt + "\n\n" + user_prompt) if system_prompt else user_prompt
 
             # 调用模型
-            model_output = self.llm.generate_single(prompt)
+            model_output = self.llm.generate_single(user_prompt, system=system_prompt)
 
             # ✅ 保存提取阶段完整溯源数据
             from datetime import datetime
@@ -928,7 +941,6 @@ class TwoStageExtractionService:
     def _save_loaded_chunks_data(self, chunks_index: Dict[str, Any], chunks_index_path: str) -> None:
         """保存读取的chunks数据（始终保存）"""
         try:
-            import json
             from datetime import datetime
             
             base_dir,paragraph_id  = self._get_paragraph_prompts_dir()
@@ -959,8 +971,7 @@ class TwoStageExtractionService:
             # 保存摘要JSON
             json_filename = f"chunks_loaded_{paragraph_id}_{timestamp}.json"
             json_filepath = provenance_dir / json_filename
-            with open(json_filepath, 'w', encoding='utf-8') as f:
-                json.dump(chunks_summary, f, ensure_ascii=False, indent=2)
+            save_json(json_filepath, chunks_summary)
             
             logger.info(f"✅ 读取的chunks数据已保存: {json_filepath.name}")
         except Exception as e:
@@ -971,7 +982,6 @@ class TwoStageExtractionService:
     def _save_filtering_result(self, result: Dict[str, Any]) -> None:
         """保存筛选阶段完整溯源数据（始终保存）"""
         try:
-            import json
             from datetime import datetime
             
             base_dir,paragraph_id  = self._get_paragraph_prompts_dir()
@@ -988,20 +998,17 @@ class TwoStageExtractionService:
             # 1. 保存完整溯源数据JSON
             json_filename = f"filtering_provenance_{paragraph_id}_{timestamp}.json"
             json_filepath = provenance_dir / json_filename
-            with open(json_filepath, 'w', encoding='utf-8') as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
+            save_json(json_filepath, result)
             
             # 2. 保存提示词TXT
             prompt_filename = f"filtering_prompt_{paragraph_id}_{timestamp}.txt"
             prompt_filepath = prompts_dir / prompt_filename
-            with open(prompt_filepath, 'w', encoding='utf-8') as f:
-                f.write(result.get("full_prompt", ""))
+            save_text(prompt_filepath, result.get("full_prompt", ""))
             
             # 3. 保存模型输出TXT
             output_filename = f"filtering_output_{paragraph_id}_{timestamp}.txt"
             output_filepath = outputs_dir / output_filename
-            with open(output_filepath, 'w', encoding='utf-8') as f:
-                f.write(result.get("model_output", ""))
+            save_text(output_filepath, result.get("model_output", ""))
             
             logger.info(f"✅ 筛选阶段溯源数据已保存: {json_filepath.name}")
         except Exception as e:
@@ -1012,7 +1019,6 @@ class TwoStageExtractionService:
     def _save_extraction_result(self, result: Dict[str, Any]) -> None:
         """保存提取阶段完整溯源数据（始终保存）"""
         try:
-            import json
             from datetime import datetime
             
             base_dir, paragraph_id = self._get_paragraph_prompts_dir()
@@ -1031,20 +1037,17 @@ class TwoStageExtractionService:
             
             json_filename = f"extraction_provenance_{paragraph_id}_{timestamp}.json"
             json_filepath = provenance_dir / json_filename
-            with open(json_filepath, 'w', encoding='utf-8') as f:
-                json.dump(save_result, f, ensure_ascii=False, indent=2)
+            save_json(json_filepath, save_result)
             
             # 2. 保存提示词TXT
             prompt_filename = f"extraction_prompt_{paragraph_id}_{timestamp}.txt"
             prompt_filepath = prompts_dir / prompt_filename
-            with open(prompt_filepath, 'w', encoding='utf-8') as f:
-                f.write(result.get("full_prompt", ""))
+            save_text(prompt_filepath, result.get("full_prompt", ""))
             
             # 3. 保存模型输出TXT
             output_filename = f"extraction_output_{paragraph_id}_{timestamp}.txt"
             output_filepath = outputs_dir / output_filename
-            with open(output_filepath, 'w', encoding='utf-8') as f:
-                f.write(result.get("model_output", ""))
+            save_text(output_filepath, result.get("model_output", ""))
             
             logger.info(f"✅ 提取阶段溯源数据已保存: {json_filepath.name}")
         except Exception as e:

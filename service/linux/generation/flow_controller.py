@@ -17,10 +17,15 @@ from dataclasses import dataclass  # 标准库：配置/结果的数据类
 
 from service.linux.generation.pipeline import CSRGenerationPipeline  # 核心：加载段落并负责生成/处理流水线
 from service.linux.generation.data_extractor import DataExtractorV2  # 核心：各数据类型的提取（方案/TFL等）
+# from service.windows.insertion.word_post_processor import CSRWordPostProcessor  # 核心：对生成结果做后处理
 from service.linux.generation.paragraph_generation_service import ParagraphGenerationService  # 核心：段落生成服务
 from utils.config_parser import ConfigParser  # 解析段落配置 JSON
-from service.models import create_llm_service, create_vision_model_service  # 初始化模型/视觉服务
-from utils.context_manager import set_current_output_dir, get_current_output_dir  # 工具：线程安全的上下文管理
+from service.models import get_llm_service, get_vision_service # 初始化模型/视觉服务
+from utils.context_manager import (  # 工具：线程安全的上下文管理
+    set_current_output_dir,
+    get_current_output_dir,
+    set_session_id,
+)
 
 from utils.output_manager import (  # 工具：输出目录与文件落盘
     save_json,
@@ -41,22 +46,10 @@ def _task_log_error(message: str, exc: Exception = None, **extra):
 class FlowConfig:
     """流程配置"""
     config_path: str = None  # 段落配置路径（已废弃）
-    base_data_dir: str = "data/rtf&index"
+    base_data_dir: str = "AAA/project_data"
     cache_dir: str = "cache"
     output_dir: str = "output"
     use_mock_services: bool = False
-    log_level: str = "INFO"
-    # Word集成配置
-    word_template_file: Optional[str] = None  # Word模板文件路径
-    word_output_file: Optional[str] = None  # Word输出文件路径
-    word_placeholder_format: str = "{{%s}}"  # Word占位符格式
-    enable_word_integration: bool = False  # 是否启用Word集成
-    # 全局：无论是否走"原文"分支，都先对方案Word做一次标记与导出
-    premark_scheme_tables_images: bool = True
-    # 是否在流程开头就按标签导出（固定为开启，尾部仅做映射）
-    early_export_regions: bool = True
-    # 外部插入工具接口（若不为空则主流程末尾会打包并调用）
-    compose_insert_url: Optional[str] = None
     # 是否跳过提取校验阶段（设为True可加快处理速度，但可能降低提取质量）
     skip_validation: bool = True  # 默认跳过校验，加快处理速度
     project_id: Optional[str] = None # 项目ID (用于回调标识)
@@ -84,7 +77,6 @@ class CSRFlowController:
         # 4. 记录启动信息（现在会写入session.log）
         self._log_session_start()
         # 5. 初始化其他组件
-        self._initialize_detailed_logger()
         self._initialize_services()
         self._initialize_pipeline()
     
@@ -129,6 +121,8 @@ class CSRFlowController:
             pass
         # 使用线程安全的方式设置当前输出目录
         set_current_output_dir(session_dir)
+        # 注入会话上下文（基于 contextvars），供 SessionFilter 按会话隔离日志
+        set_session_id(session_dir)
         # 保存实例属性
         self.session_dir = session_dir
 
@@ -136,7 +130,6 @@ class CSRFlowController:
         try:
             import sys
             import platform
-            import json as _json
             from pathlib import Path as _Path
             import shutil as _shutil
 
@@ -183,8 +176,7 @@ class CSRFlowController:
             except Exception:
                 pass
             # 写入 environment.json
-            with open(inputs_dir / "environment.json", "w", encoding="utf-8") as f:
-                f.write(_json.dumps(env_snapshot, ensure_ascii=False, indent=2))
+            save_json(inputs_dir / "environment.json", env_snapshot)
 
         except Exception as e:
             import traceback
@@ -237,35 +229,30 @@ class CSRFlowController:
                     super().emit(record)
                     self.flush()  # 立即将缓冲区内容写入文件
             
-            # 会话过滤器：基于会话目录过滤，支持主线程及其创建的所有子线程
-            # 不再使用线程ID过滤，而是使用环境变量中的会话目录匹配
+            # 会话过滤器：基于 session_id 上下文过滤，支持主线程及其创建的所有子线程
+            # 通过 contextvars 中的 session_id 识别当前日志归属的任务，
+            # 仅当与本站点的 session_dir 匹配时才写入本站点的 session.log / system.log
             class SessionFilter(logging.Filter):
-                """基于会话目录的日志过滤器（支持多线程）"""
+                """基于会话 ID 的日志过滤器（支持多线程/子线程）"""
                 def __init__(self, session_dir: str):
                     super().__init__()
                     self.session_dir = session_dir
                 
                 def filter(self, record):
-                    # 检查当前线程的输出目录是否匹配当前会话
                     try:
-                        from utils.context_manager import get_current_output_dir
-                        current_dir = get_current_output_dir(default="")
-                        if current_dir and current_dir == self.session_dir:
-                            return True
+                        from utils.context_manager import get_session_id
+                        sid = get_session_id(default="")
                     except Exception:
-                        pass
-                    
-                    # 兜底：检查环境变量（子线程可能继承）
-                    try:
-                        env_dir = os.getenv("CURRENT_OUTPUT_DIR", "")
-                        if env_dir and env_dir == self.session_dir:
-                            return True
-                    except Exception:
-                        pass
-                    
-                    # 默认接受（避免过度过滤导致日志丢失）
-                    # 在单任务模式下，接受所有日志
-                    return True
+                        # 读取上下文失败，安全拒绝：不写入任何会话文件，避免串台
+                        return False
+
+                    # 无会话上下文（API 路由线程、全局回调线程池、第三方库日志等）
+                    # 一律拒绝写入会话文件，仅保留控制台 / 服务级日志，避免污染各任务 session.log
+                    if not sid:
+                        return False
+
+                    # 仅本任务的日志写入本会话文件；其他并发任务的日志拒绝写入
+                    return sid == self.session_dir
             
             # 创建会话过滤器
             session_filter = SessionFilter(session_dir)
@@ -283,6 +270,13 @@ class CSRFlowController:
             sys_fh.addFilter(session_filter)  # 使用会话过滤器（支持子线程）
 
             root_logger = logging.getLogger()
+            # 把业务顶层命名空间设为 DEBUG，让业务模块的 debug() 能进 system.log；root 维持 INFO 不动
+            self._debug_namespaces = ("service", "utils", "api")
+            self._prev_ns_levels = {}
+            for ns in self._debug_namespaces:
+                ns_logger = logging.getLogger(ns)
+                self._prev_ns_levels[ns] = ns_logger.level  # 记录原值，cleanup 还原
+                ns_logger.setLevel(logging.DEBUG)
             # 直接添加 handler（每个会话有独立的文件路径，不需要检查重复）
             root_logger.addHandler(main_fh)
             self._session_file_handlers.append(main_fh)
@@ -301,20 +295,15 @@ class CSRFlowController:
         # 这里不再重复配置，避免清理已有的 handler
         logger.info("流程控制器初始化完成（使用统一日志配置）")
     
-    def _initialize_detailed_logger(self):
-        """简化日志系统"""
-        self.detailed_logger = None
-        logger.info("日志系统初始化完成")
-        
     def _initialize_services(self):
         """初始化所有服务"""
         try:
             # 初始化LLM服务
-            self.llm_service = create_llm_service()
+            self.llm_service = get_llm_service()
             logger.info("LLM服务初始化完成")
             
             # 初始化视觉服务
-            self.vision_service = create_vision_model_service()
+            self.vision_service = get_vision_service()
             logger.info("视觉服务初始化完成")
             
             # 初始化数据提取器
@@ -325,14 +314,10 @@ class CSRFlowController:
             # 注入服务
             self.data_extractor.llm_service = self.llm_service
             self.data_extractor.vision_service = self.vision_service
-            # 简化日志注入
-            self.data_extractor.detailed_logger = None
             logger.info("数据提取器初始化完成")
             
             # 初始化段落生成服务（已合并ContentGenerator功能）
             self.paragraph_generation_service = ParagraphGenerationService()
-            # 简化日志注入
-            self.paragraph_generation_service.detailed_logger = None
             logger.info("段落生成服务初始化完成")
             
             # 初始化配置解析器（如果提供config_path）
@@ -365,9 +350,6 @@ class CSRFlowController:
             # 将服务注入到pipeline的data_extractor中
             self.pipeline.data_extractor.llm_service = self.llm_service
             self.pipeline.data_extractor.vision_service = self.vision_service
-            # 简化日志注入
-            self.pipeline.data_extractor.detailed_logger = None
-            self.pipeline.paragraph_generation_service.detailed_logger = None
             logger.info("流水线初始化完成")
         except Exception as e:
             import traceback
@@ -477,8 +459,6 @@ class CSRFlowController:
             timings: Dict[str, Any] = {
                 "start_ts": time.time()
             }
-            # artifacts: Dict[str, Any] = {
-
             # 落盘本次运行汇总（JSON）
             save_json(run_output_path, run_summary)
 
@@ -669,10 +649,6 @@ class CSRFlowController:
                 run_log_path = logs_dir / f"run_{run_timestamp}.log"
                 save_text(run_log_path, f"run: {run_timestamp}\nsuccess: {success_count}/{total_count}\n")
 
-
-            # except Exception as e:
-            #     logger.warning(f"构建session_report失败: {e}")
-
             # 构建更清晰的分层溯源（provenance）：
             # 1) 顶层为每个段落的最终结果
             # 2) 其下为生成前给到模型的输入（生成提示词 + 提取到的输入数据拆分为scheme/tfl）
@@ -817,8 +793,6 @@ class CSRFlowController:
                             if not any(p for p in extraction_prompt_files if f'data_extraction_prompt_{pid}_{dt}_' in p):
                                 extraction_prompt_files.extend([str(p) for p in all_prompt_files if p.name.startswith(f'extraction_prompt_{dt}_')])
 
-                        # 按提取项细化：为每个 item 附带其配置与提示词文件（基于顺序与类型匹配）
-
                         # ✅ 增强溯源：收集提取和生成的详细溯源
                         extraction_traceability = r.get('extraction_traceability', {})
                         generation_traceability = r.get('generation_traceability', {})
@@ -860,6 +834,10 @@ class CSRFlowController:
                 }
                 prov_path = outputs_dir / f'provenance_{run_timestamp}.json'
                 save_json(prov_path, provenance_payload)
+                # try:
+                #     artifacts['outputs'].append(str(prov_path))
+                # except Exception:
+                #     pass
                 try:
                     run_summary['provenance_file'] = str(prov_path)
                 except Exception:
@@ -888,17 +866,13 @@ class CSRFlowController:
                 if tfl_selections_required:
                     sel_path = outputs_dir / f'tfl_selections_{run_timestamp}.json'
                     save_json(sel_path, { 'timestamp': run_timestamp, 'items': tfl_selections_required })
+                    # try:
+                    #     artifacts['outputs'].append(str(sel_path))
+                    # except Exception:
+                    #     pass
             except Exception as _e:
                 logger.warning(f"保存 tfl_selections 清单失败: {_e}")
 
-            # 构建并保存本次运行的"完整JSON"（先合并标签与导出，再标准化为对外结构）
-
-            
-            # ====== Word集成已移至独立接口 ======
-            # 生成阶段只负责内容生成，不执行插入
-            # 插入操作由 /api/v1/template/insert 或完整流程接口调用
-            # logger.info("✅ 内容生成完成，跳过插入（由独立接口处理）")
-            # 在完成外部阶段后，刷新 run_output 文件（带上快捷指针）
             try:
                 save_json(run_output_path, run_summary)
             except Exception:
@@ -925,6 +899,21 @@ class CSRFlowController:
                 # _add('complete_json', run_summary.get('complete_json_file'))
                 # _add('insert_payload', run_summary.get('insert_payload_file'))
                 # _add('bundle_zip', run_summary.get('bundle_file'))
+                # try:
+                #     if run_summary.get('bundle_file'):
+                #         sha = Path(str(run_summary['bundle_file']) + '.sha256')
+                #         _add('bundle_zip.sha256', str(sha) if sha.exists() else None)
+                # except Exception:
+                #     pass
+                # _add('external_result_docx', run_summary.get('external_result_file'))
+                # try:
+                #     if run_summary.get('external_result_file'):
+                #         sha = Path(str(run_summary['external_result_file']) + '.sha256')
+                #         _add('external_result_docx.sha256', str(sha) if sha.exists() else None)
+                # except Exception:
+                #     pass
+                # _add('external_insert_meta', run_summary.get('external_insert_meta_file'))
+                # 目录指引
                 index_lines.append("")
                 index_lines.append("目录指引：")
                 _add('prompts_dir', str(run_dir / 'prompts') if (run_dir / 'prompts').exists() else None)
@@ -967,10 +956,6 @@ class CSRFlowController:
     
     def cleanup(self):
         """清理资源，包括移除会话级别的日志 Handler"""
-        # 清理 detailed_logger
-        if hasattr(self, 'detailed_logger') and self.detailed_logger:
-            self.detailed_logger.cleanup()
-        
         # 移除并关闭会话级别的文件日志 Handler
         if hasattr(self, '_session_file_handlers') and self._session_file_handlers:
             # 在移除 handler 之前，先记录清理完成的日志
@@ -994,8 +979,17 @@ class CSRFlowController:
             self._session_file_handlers.clear()
         
         # 清除线程本地的输出目录（避免影响同一线程后续任务）
-        from utils.context_manager import clear_thread_output_dir
+        from utils.context_manager import clear_thread_output_dir, clear_session_id
         clear_thread_output_dir()
+        # 清除会话上下文（避免影响同一线程后续任务的日志过滤归属）
+        clear_session_id()
+
+        # 还原业务命名空间 logger 级别（避免长跑服务下 DEBUG 残留）
+        for ns, prev in getattr(self, "_prev_ns_levels", {}).items():
+            try:
+                logging.getLogger(ns).setLevel(prev)
+            except Exception:
+                pass
     
     
     def _build_resource_mappings_for_results(self, results: List[Dict[str, Any]]) -> None:

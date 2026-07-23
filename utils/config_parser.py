@@ -128,7 +128,38 @@ class ConfigParser:
         
         return paragraph
     
-
+# def main():
+#     """测试解析功能"""
+#     # config_path = "../configs/paragraphs-v1.1(1).json"  # 已废弃
+#     config_path = None  # 需要从API接口传入配置
+#
+#     try:
+#         parser = ConfigParser(config_path)
+#
+#         print("=== 原始数据项解析 ===")
+#         raw_items = parser.get_raw_data_items()
+#         print(f"总共解析出 {len(raw_items)} 个数据项:")
+#
+#         for i, item in enumerate(raw_items, 1):
+#             print(f"\n数据项 {i} (段落: {item['paragraph_id']}):")
+#             # 只显示非空字段
+#             for key, value in item.items():
+#                 if key not in ['paragraph_id'] and value is not None:
+#                     print(f"  {key}: {value}")
+#
+#         print("\n=== 按类型分组 ===")
+#         type_groups = parser.get_data_by_type_structured()
+#         for data_type, items in type_groups.items():
+#             print(f"\n{data_type} 类型: {len(items)} 个数据项")
+#
+#         print("\n=== JSON格式输出 ===")
+#         import json
+#         print(json.dumps(raw_items, ensure_ascii=False, indent=2))
+#
+#     except Exception as e:
+#         print(f"解析失败: {e}")
+#
+#
 if __name__ == '__main__':
     CP = ConfigParser(r'..\tests\test.json')
     g=CP.parse()

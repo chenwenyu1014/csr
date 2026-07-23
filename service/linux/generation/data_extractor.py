@@ -34,6 +34,7 @@ import traceback
 
 from config import get_settings
 from utils.task_logger import get_task_logger
+from utils.context_manager import get_request_id, inherit_context
 
 # 导入耗时记录工具
 from utils.timing import Timer, generation_timer
@@ -46,16 +47,7 @@ def _task_log_error(message: str, exc: Exception = None, **extra):
         task_logger.error(message, exc=exc, logger_name="data_extractor", **extra)
 
 
-# Fallback：当 utils.timing 导入失败时使用的空函数
-def log_timing(*args, **kwargs): pass
-
 logger = logging.getLogger(__name__)
-
-# 可选依赖：用于读取 Excel 索引表
-try:
-    import pandas as _pd  # type: ignore
-except Exception:  # pragma: no cover
-    _pd = None  # type: ignore
 
 
 class DataExtractorV2:
@@ -72,27 +64,16 @@ class DataExtractorV2:
     4. 完整的溯源信息记录
     """
     
-    def __init__(self, base_data_dir: str = "data/rtf&index", index_path: Optional[str] = None, cache_dir: str = "cache"):
+    def __init__(self, base_data_dir: str = "AAA/project_data", cache_dir: str = "AAA/cache"):
         """
         初始化数据提取器
 
         Args:
             base_data_dir: 基础数据目录，存储待处理的文档文件
-            index_path: TFL索引表路径（可选，默认从base_data_dir/index.xlsx加载）
             cache_dir: 缓存目录，用于存储处理后的中间结果
         """
         # 基础数据目录
         self.base_data_dir = Path(base_data_dir)
-
-        # TFL 索引表（相对路径优先，未提供则使用默认位置）
-        # 若未显式提供索引路径，则尝试自动加载 data/rtf_files/index.xlsx
-        if index_path is None:
-            default_idx = (self.base_data_dir / "index.xlsx").resolve()
-            self.index_path = default_idx if default_idx.exists() else None
-        else:
-            self.index_path = Path(index_path)
-        # 索引数据框（延迟加载）
-        self._index_df = None
 
         # ========== 文件缓存目录配置 ==========
         # 创建缓存目录结构，用于存储处理后的中间结果
@@ -124,8 +105,6 @@ class DataExtractorV2:
         }
 
         # ========== 日志和上下文 ==========
-        # 详细日志系统（可选）
-        self.detailed_logger = None
         # 线程本地上下文：存放当前段落ID，避免并发冲突
         self._context = threading.local()
 
@@ -182,15 +161,14 @@ class DataExtractorV2:
         # 将请求ID注入线程本地上下文，方便在子线程中进行事件流推送
         try:
             try:
-                from utils.request_context import get_request_id  # type: ignore
+                from utils.context_manager import get_request_id  # type: ignore
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                from utils.request_context import get_request_id  # type: ignore
+                from utils.context_manager import get_request_id  # type: ignore
             rid0 = get_request_id()
             if not rid0:
-                import os as _os
-                rid0 = _os.getenv("CURRENT_REQUEST_ID")
+                rid0 = get_request_id()
             if rid0:
                 setattr(self._context, 'request_id', rid0)
         except Exception as e:
@@ -295,28 +273,22 @@ class DataExtractorV2:
         _rid_for_agg = None
         try:
             try:
-                from utils.request_context import get_request_id  # type: ignore
+                from utils.context_manager import get_request_id  # type: ignore
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                from utils.request_context import get_request_id  # type: ignore
+                from utils.context_manager import get_request_id  # type: ignore
             _rid_for_agg = get_request_id()
         except Exception as e:
             import traceback
             traceback.print_exc()
             _rid_for_agg = None
         if not _rid_for_agg:
-            try:
-                import os as _os
-                _rid_for_agg = _os.getenv("CURRENT_REQUEST_ID")
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                _rid_for_agg = None
+            _rid_for_agg = get_request_id()
 
         if max_workers > 0:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_idx = {executor.submit(_worker, i, it): i for i, it in items}
+                future_to_idx = {executor.submit(inherit_context(_worker), i, it): i for i, it in items}
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]
                     try:
@@ -732,22 +704,14 @@ class DataExtractorV2:
             from service.linux.generation.extraction.two_stage_extraction_service import two_stage_extraction_service
             from service.linux.generation.extraction.validated_extraction_service import validated_extraction_service
 
-            # 若是原文模式，在提示词中附加保证提取原文本内容
+            # 提取模式信号：原文模式 / 引用图表模式
+            extraction_modes = []
             if original_mode:
-                extraction_query_with_instruction = (
-                    f"{extract_prompt}\n\n"
-                    "【重要】当前为原文模式，请保留原文措辞，不要改写或总结。"
-                )
-            else:
-                extraction_query_with_instruction = extract_prompt
-            # 若是引用图表，在提示词中附加保留占位符说明
+                extraction_modes.append("原文模式")
             if insert_original:
-                extraction_query_with_instruction = (
-                    f"{extraction_query_with_instruction}\n\n"
-                    "【重要】当前为引用图表模式，请保留原文中的所有占位符标签，如 {{{{Table_1_Start}}}}、{{{{Table_1_End}}}}、"
-                    "{{{{Image_1_Start}}}}、{{{{Image_1_End}}}} 等。不要删除或修改这些标签，保持原样。"
-                    "提取过程中如果遇到提取的文本前后有这些标志也要保留。\n"
-                )
+                extraction_modes.append("引用图表模式")
+            extraction_mode = "、".join(extraction_modes)
+            extraction_query_with_instruction = extract_prompt
 
             # 环境上下文：段落ID
             import os
@@ -844,7 +808,8 @@ class DataExtractorV2:
                             "extraction_query": extraction_query_with_instruction,
                             "task_name": None,
                             "doc_type": doc_type,
-                            "ragflow_content": file_ragflow_content  #  添加RAGFlow检索的信息
+                            "ragflow_content": file_ragflow_content,  #  添加RAGFlow检索的信息
+                            "extraction_mode": extraction_mode  #  提取模式信号，仅 stage2 使用
                         },
                         source_content="",
                         doc_type=doc_type,
@@ -890,7 +855,7 @@ class DataExtractorV2:
 
                 results_list = []
                 with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-                    future_to_cf = {executor.submit(_extract_single_file, cf): cf for cf in chunks_files}
+                    future_to_cf = {executor.submit(inherit_context(_extract_single_file), cf): cf for cf in chunks_files}
                     for future in as_completed(future_to_cf):
                         try:
                             result = future.result()
@@ -1450,6 +1415,7 @@ class DataExtractorV2:
         # 设置 file_type 为 rtf
         data_item["file_type"] = "rtf"
         return self._handle_excel_type(data_item)
+
 
 
     def _extract_placeholders_from_content(self, content: str) -> List[str]:

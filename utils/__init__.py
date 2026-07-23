@@ -5,19 +5,10 @@
 提供项目中常用的工具函数和类。
 
 主要组件：
-- context_manager: 运行时上下文管理
-- path_utils: 路径处理工具
-- event_bus: 事件总线
-- request_context: 请求上下文
+- context_manager: 运行时上下文管理（含请求ID、会话ID、输出目录、段落ID等 contextvars 及跨线程传播）
 - json_logging: JSON日志
 - timing: 耗时记录工具
 """
-
-# ========== 事件总线 ==========
-from .event_bus import event_bus, EventBus
-
-# ========== 请求上下文 ==========
-from .request_context import request_id_ctx, get_request_id
 
 # ========== 日志 ==========
 from .json_logging import setup_json_logging
@@ -38,8 +29,10 @@ from .task_logger import (
     task_exception,
 )
 
-# ========== 上下文管理 ==========
+# ========== 上下文管理（含请求ID、会话ID等 contextvars） ==========
 from .context_manager import (
+    request_id_ctx,
+    get_request_id,
     set_current_output_dir,
     get_current_output_dir,
     set_project_desc,
@@ -48,22 +41,7 @@ from .context_manager import (
     get_combination_id,
     set_project_context,
     clear_project_context,
-    save_context,
-    restore_context,
-)
-
-# ========== 路径工具 ==========
-from .path_utils import (
-    normalize_path,
-    normalize_aaa_path,
-    to_absolute_path,
-    ensure_dir_exists,
-    ensure_parent_dir_exists,
-    get_prompts_dir,
-    get_session_dir,
-    get_cache_dir,
-    safe_file_name,
-    get_unique_file_path,
+    inherit_context,
 )
 
 # ========== 耗时记录工具 ==========
@@ -85,14 +63,10 @@ from .timing import (
 
 
 __all__ = [
-    # 事件总线
-    "event_bus",
-    "EventBus",
-    
     # 请求上下文
     "request_id_ctx",
     "get_request_id",
-    
+
     # 日志
     "setup_json_logging",
     "setup_logging",
@@ -120,20 +94,7 @@ __all__ = [
     "get_combination_id",
     "set_project_context",
     "clear_project_context",
-    "save_context",
-    "restore_context",
-    
-    # 路径工具
-    "normalize_path",
-    "normalize_aaa_path",
-    "to_absolute_path",
-    "ensure_dir_exists",
-    "ensure_parent_dir_exists",
-    "get_prompts_dir",
-    "get_session_dir",
-    "get_cache_dir",
-    "safe_file_name",
-    "get_unique_file_path",
+    "inherit_context",
     
     # 耗时记录工具
     "Timer",

@@ -31,6 +31,7 @@ import asyncio
 from typing import Optional, Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
 
+from utils import inherit_context
 from .task_manager import TaskManager, TaskStage, get_task_manager
 from utils.task_logger import get_task_logger
 
@@ -70,6 +71,11 @@ STAGE_TO_TAG_STATUS = {
     TaskStage.FAILED: "生成失败",
 }
 
+def _submit_progress(fn, *args):
+    """
+    提交回调任务到全局线程池，并继承提交方会话上下文（session_id）。
+    """
+    _executor.submit(inherit_context(fn), *args)
 
 class ProgressCallback:
     """
@@ -365,10 +371,10 @@ class ProgressCallback:
         # 如果有指定的 tag_ids，更新它们
         if self.tag_ids:
             for tag_id in self.tag_ids:
-                _executor.submit(self._update_tag_status_sync, tag_id, tag_status)
+                _submit_progress(self._update_tag_status_sync, tag_id, tag_status)
         else:
             # 否则使用 task_id 作为标签ID
-            _executor.submit(self._update_tag_status_sync, self.task_id, tag_status)
+            _submit_progress(self._update_tag_status_sync, self.task_id, tag_status)
     
     async def _send_callback_async(self, payload: dict):
         """异步发送回调"""
@@ -432,7 +438,7 @@ class ProgressCallback:
         
         # 在线程池中异步发送，不阻塞主流程
         if self.callback_url:
-            _executor.submit(self._send_callback_sync, payload)
+            _submit_progress(self._send_callback_sync, payload)
         
         # 更新标签状态
         if update_tag_status:
@@ -470,7 +476,7 @@ class ProgressCallback:
                 progress=100
                 # 不包含 result，保持轻量
             )
-            _executor.submit(self._send_callback_sync, status_payload)
+            _submit_progress(self._send_callback_sync, status_payload)
             logger.info(f"状态完成回调已发送: {self.task_id}")
         
         # 2. 发送结果回调（重量，包含完整数据）
@@ -482,7 +488,7 @@ class ProgressCallback:
                 "message": message,
                 **result  # 展开完整结果
             }
-            _executor.submit(self._send_result_callback_sync, result_payload)
+            _submit_progress(self._send_result_callback_sync, result_payload)
             logger.info(f"结果回调已发送: {self.task_id}")
         
         # 3. 为每个段落调用标签结果接口
@@ -591,7 +597,7 @@ class ProgressCallback:
                 }
                 
                 # 异步发送该段落的结果
-                _executor.submit(self._send_tag_result_sync, paragraph_id, paragraph_result)
+                _submit_progress(self._send_tag_result_sync, paragraph_id, paragraph_result)
             
             logger.info(f"所有段落结果已提交队列")
             
@@ -614,7 +620,7 @@ class ProgressCallback:
         )
         
         if self.callback_url:
-            _executor.submit(self._send_callback_sync, payload)
+            _submit_progress(self._send_callback_sync, payload)
         
         # 更新标签状态为失败
         self._update_all_tags_status(TaskStage.FAILED)
@@ -633,7 +639,7 @@ class ProgressCallback:
             tag_id: 标签ID（如 paragraph_id）
             status: 状态值（如 "开始提取", "提取完毕", "开始生成", "生成完毕"）
         """
-        _executor.submit(self._update_tag_status_sync, tag_id, status)
+        _submit_progress(self._update_tag_status_sync, tag_id, status)
     
     def notify_extraction_started(self, message: str = "开始提取数据"):
         """通知开始提取阶段"""
@@ -687,9 +693,9 @@ class ProgressCallback:
         """使用自定义状态更新所有标签"""
         if self.tag_ids:
             for tag_id in self.tag_ids:
-                _executor.submit(self._update_tag_status_sync, tag_id, status)
+                _submit_progress(self._update_tag_status_sync, tag_id, status)
         else:
-            _executor.submit(self._update_tag_status_sync, self.task_id, status)
+            _submit_progress(self._update_tag_status_sync, self.task_id, status)
 
 
 def create_progress_callback(

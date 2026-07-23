@@ -1,15 +1,17 @@
 """
 CSR API Service - 主应用入口
 
-这是CSR文档生成系统的FastAPI主应用，包含以下8个核心接口：
-1. validation - 数据源验证接口
+这是CSR文档生成系统的FastAPI主应用，包含以下10个核心接口：
+1. constraint_validation - 数据源约束验证接口
 2. generation - 内容生成接口
 3. compose - 文档合成接口
 4. preprocessing - 预处理接口
 5. insertion - 内容插入接口
-6. allocation - 数据分配接口
+6. allocation - 文件分配接口
 7. postprocessing - 后处理接口
 8. template - 模板处理接口
+9. file_validation - 文件校验接口
+10. manifest - 清单生成接口
 
 主要功能：
 - 提供RESTful API接口
@@ -22,7 +24,9 @@ import os
 import time
 import uuid
 import logging
+import threading
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,7 +34,7 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv, find_dotenv
 
 from config import get_settings
-from utils import request_id_ctx,setup_logging
+from utils import request_id_ctx, setup_logging
 
 # ========== 环境变量预加载 ==========
 # 预加载环境变量，优先查找当前工作目录下的.env文件
@@ -54,12 +58,75 @@ setup_logging(service_name="API")
 # 获取当前模块的日志记录器
 logger = logging.getLogger(__name__)
 
+
+# ========== Lifespan 生命周期管理 ==========
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    应用生命周期管理函数（替代已废弃的 on_event）
+
+    yield 之前：应用启动时执行（原 startup_event）
+    yield 之后：应用关闭时执行（原 shutdown_event）
+    """
+    # ===== Startup =====
+    logger.info("CSR API Service启动中...")
+    logger.info(f"输出目录: {settings.compose_output_dir}")
+    logger.info(f"数据目录: {settings.base_data_dir}")
+
+    # 确保必要的目录存在
+    settings.ensure_dirs()
+
+    # 延迟导入所有API路由模块（避免循环依赖）
+    from api.linux import (
+        constraint_validation,  # 数据源约束验证接口
+        generation,             # 内容生成接口
+        compose,                # 文档合成接口
+        preprocessing,          # 预处理接口
+        insertion,              # 内容插入接口
+        allocation,             # 文件分配接口
+        postprocessing,         # 后处理接口
+        template,               # 模板处理接口
+        file_validation,        # 文件校验接口
+        manifest,               # 清单生成接口
+    )
+
+    # 注册所有路由到主应用，统一使用 /api/v1 前缀
+    app.include_router(constraint_validation.router, prefix="/api/v1", tags=["validation"])
+    app.include_router(generation.router,            prefix="/api/v1", tags=["generation"])
+    app.include_router(compose.router,               prefix="/api/v1", tags=["compose"])
+    app.include_router(preprocessing.router,         prefix="/api/v1", tags=["preprocessing"])
+    app.include_router(insertion.router,             prefix="/api/v1", tags=["insertion"])
+    app.include_router(allocation.router,            prefix="/api/v1", tags=["allocation"])
+    app.include_router(postprocessing.router,        prefix="/api/v1", tags=["postprocessing"])
+    app.include_router(template.router,              prefix="/api/v1", tags=["template"])
+    app.include_router(file_validation.router,       prefix="/api/v1", tags=["validation"])
+    app.include_router(manifest.router,              prefix="/api/v1", tags=["manifest"])
+
+    logger.info("所有路由注册完成")
+
+    yield  # ← 分界线：yield 前是 startup，yield 后是 shutdown
+
+    # ===== Shutdown =====
+    logger.info("CSR API Service关闭中...")
+
+    # 打印当前活跃线程（用于调试）
+    active_threads = threading.enumerate()
+    non_main_threads = [t for t in active_threads if t.name != "MainThread"]
+    if non_main_threads:
+        logger.info(f"当前活跃的后台线程 ({len(non_main_threads)}个):")
+        for t in non_main_threads:
+            logger.info(f"  - {t.name} (daemon={t.daemon}, alive={t.is_alive()})")
+
+    logger.info("CSR API Service关闭完成")
+
+
 # ========== FastAPI应用创建 ==========
-# 创建FastAPI应用实例
+# 创建FastAPI应用实例，传入 lifespan 生命周期管理函数
 app = FastAPI(
     title="CSR API Service",
     version="1.0.0",
-    description="六大核心接口的独立服务"
+    description="六大核心接口的独立服务",
+    lifespan=lifespan,
 )
 
 # ========== CORS中间件配置 ==========
@@ -68,10 +135,10 @@ app = FastAPI(
 if settings.enable_cors:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],          # 允许所有来源
-        allow_credentials=True,       # 允许携带凭证
-        allow_methods=["*"],          # 允许所有HTTP方法
-        allow_headers=["*"],          # 允许所有请求头
+        allow_origins=["*"],      # 允许所有来源
+        allow_credentials=True,   # 允许携带凭证
+        allow_methods=["*"],      # 允许所有HTTP方法
+        allow_headers=["*"],      # 允许所有请求头
     )
 
 
@@ -117,12 +184,12 @@ async def add_request_id(request: Request, call_next):
             logging.getLogger("server.access").info(
                 "request.done",
                 extra={
-                    "event": "request.done",
-                    "path": request.url.path,      # 请求路径
-                    "method": request.method,      # HTTP方法
-                    "status": status,              # 响应状态码
-                    "duration_ms": duration_ms,    # 处理耗时
-                    "request_id": rid,             # 请求ID
+                    "event":       "request.done",
+                    "path":        request.url.path,   # 请求路径
+                    "method":      request.method,     # HTTP方法
+                    "status":      status,             # 响应状态码
+                    "duration_ms": duration_ms,        # 处理耗时
+                    "request_id":  rid,                # 请求ID
                 }
             )
         except Exception:
@@ -159,72 +226,6 @@ def healthz():
         "service": "CSR API Service",
         "version": "1.0.0",
     })
-
-
-# ========== 应用启动事件 ==========
-# 注意：这里使用延迟导入来避免循环依赖
-@app.on_event("startup")
-async def startup_event():
-    """
-    应用启动时的初始化函数
-    
-    执行以下操作：
-    1. 记录启动日志
-    2. 确保必要的目录存在
-    3. 注册所有API路由模块
-    """
-    logger.info("CSR API Service启动中...")
-    logger.info(f"输出目录: {settings.compose_output_dir}")
-    logger.info(f"数据目录: {settings.base_data_dir}")
-    
-    # 确保必要的目录存在
-    settings.ensure_dirs()
-    
-    # 延迟导入所有API路由模块（避免循环依赖）
-    from api.linux import (
-        validation,      # 数据源验证接口
-        generation,      # 内容生成接口
-        compose,         # 文档合成接口
-        preprocessing,   # 预处理接口
-        insertion,       # 内容插入接口
-        allocation,      # 数据分配接口
-        postprocessing,  # 后处理接口
-        template         # 模板处理接口
-    )
-    
-    # 注册所有路由到主应用，统一使用/api/v1前缀
-    app.include_router(validation.router, prefix="/api/v1", tags=["validation"])
-    app.include_router(generation.router, prefix="/api/v1", tags=["generation"])
-    app.include_router(compose.router, prefix="/api/v1", tags=["compose"])
-    app.include_router(preprocessing.router, prefix="/api/v1", tags=["preprocessing"])
-    app.include_router(insertion.router, prefix="/api/v1", tags=["insertion"])
-    app.include_router(allocation.router, prefix="/api/v1", tags=["allocation"])
-    app.include_router(postprocessing.router, prefix="/api/v1", tags=["postprocessing"])
-    app.include_router(template.router, prefix="/api/v1", tags=["template"])
-    
-    logger.info("所有路由注册完成")
-
-
-# ========== 应用关闭事件 ==========
-@app.on_event("shutdown")
-async def shutdown_event():
-    """
-    应用关闭时的清理函数
-    
-    执行资源清理操作，如关闭数据库连接、清理临时文件等。
-    """
-    import threading
-    logger.info("CSR API Service关闭中...")
-    
-    # 打印当前活跃线程（用于调试）
-    active_threads = threading.enumerate()
-    non_main_threads = [t for t in active_threads if t.name != "MainThread"]
-    if non_main_threads:
-        logger.info(f"当前活跃的后台线程 ({len(non_main_threads)}个):")
-        for t in non_main_threads:
-            logger.info(f"  - {t.name} (daemon={t.daemon}, alive={t.is_alive()})")
-    
-    logger.info("CSR API Service关闭完成")
 
 
 # ========== 主程序入口 ==========

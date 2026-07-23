@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import base64
 import json
+import logging
 import time
 import threading
 import asyncio
@@ -39,22 +40,8 @@ import requests
 from requests.exceptions import RequestException, ProxyError, SSLError, ConnectionError, ReadTimeout, HTTPError
 
 # 导入耗时记录工具
-try:
-    from utils.timing import Timer, model_timer, log_timing
-except ImportError:
-    # 如果导入失败，提供空实现
-    class Timer:
-        def __init__(self, *args, **kwargs): pass
-        def start(self): return self
-        def stop(self): return 0
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        @property
-        def duration(self): return 0
-        @property
-        def duration_str(self): return "0ms"
-    model_timer = None
-    def log_timing(*args, **kwargs): pass
+from utils.timing import Timer, model_timer
+from utils.output_manager import save_json
 
 
 # ========== 单例配置管理 ==========
@@ -81,7 +68,7 @@ def _init_once() -> None:
     
     支持的LLM服务：
     - DashScope（阿里云通义千问），兼容OpenAI API格式
-    - 默认模型：qwen3-max
+    - 默认模型：qwen3.6-flash
     """
     if _Singleton.initialized:
         return
@@ -103,12 +90,12 @@ def _init_once() -> None:
     # API密钥（优先级：环境变量 > 配置 > 空）
     api_key = (
         os.getenv("DASHSCOPE_API_KEY")
-        or (getattr(_cfg_default, "dashscope_api_key", None) or "")
+        or (getattr(_cfg_default, "llm_api_key", None) or "")
     )
     # 模型名称（优先级：环境变量 > 配置 > 默认值）
     model_name = (
         os.getenv("QWEN_MODEL")
-        or (getattr(_cfg_default, "llm_model_name", None) or "qwen3-max")
+        or (getattr(_cfg_default, "llm_model", None) or "qwen3.6-flash")
     )
     # 超时时间（默认300秒）
     try:
@@ -149,18 +136,29 @@ class _RateLimiter:
     - LLM_MAX_CONCURRENCY: 最大并发数（默认4）
     - LLM_MAX_QPS: 最大QPS（默认3.0）
     """
-    def __init__(self) -> None:
-        """初始化限流器"""
-        # 可配置并发与QPS
-        try:
-            self.max_concurrency = max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "4")))
-        except Exception:
-            self.max_concurrency = 4
-        try:
-            self.max_qps = float(os.getenv("LLM_MAX_QPS", "3"))
-        except Exception:
-            self.max_qps = 3.0
-        
+    def __init__(self, max_concurrency: Optional[int] = None, max_qps: Optional[float] = None) -> None:
+        """初始化限流器
+
+        Args:
+            max_concurrency: 最大并发数，None时读全局环境变量LLM_MAX_CONCURRENCY
+            max_qps: 最大QPS，None时读全局环境变量LLM_MAX_QPS
+        """
+        # 可配置并发与QPS（支持传入自定义值，用于按模型限流）
+        if max_concurrency is not None:
+            self.max_concurrency = max(1, max_concurrency)
+        else:
+            try:
+                self.max_concurrency = max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "4")))
+            except Exception:
+                self.max_concurrency = 4
+        if max_qps is not None:
+            self.max_qps = float(max_qps)
+        else:
+            try:
+                self.max_qps = float(os.getenv("LLM_MAX_QPS", "3"))
+            except Exception:
+                self.max_qps = 3.0
+
         # 并发控制：使用信号量限制同时进行的请求数
         self._sem = threading.Semaphore(self.max_concurrency)
         # QPS控制：使用锁保护时间戳队列
@@ -221,24 +219,221 @@ class _RateLimiter:
             pass
 
 
-_RATE_LIMITER: Optional[_RateLimiter] = None
+# ========== 按模型独立配置加载 ==========
+_MODEL_CONFIGS: Optional[Dict[str, Dict]] = None
+_MODEL_CONFIGS_LOCK = threading.Lock()
 
 
-def _rate_limiter() -> _RateLimiter:
-    global _RATE_LIMITER
-    if _RATE_LIMITER is None:
-        _RATE_LIMITER = _RateLimiter()
-    return _RATE_LIMITER
+def _load_model_configs() -> Dict[str, Dict]:
+    """加载按模型的独立配置（限流/思考模式/超时/重试等）
+
+    优先级：环境变量 LLM_MODEL_CONFIGS_FILE > config settings > 内联JSON
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    # 1. 优先：独立配置文件
+    file_path = os.getenv("LLM_MODEL_CONFIGS_FILE", "")
+    if not file_path:
+        try:
+            from config import get_settings
+            file_path = getattr(get_settings(), "llm_model_configs_file", "")
+        except Exception:
+            file_path = ""
+    if file_path:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                configs = json.load(f)
+            _logger.info(f"✅ 加载模型配置文件: {file_path}")
+            return configs if isinstance(configs, dict) else {}
+        except FileNotFoundError:
+            _logger.warning(f"⚠️ 模型配置文件不存在: {file_path}，回退到默认")
+        except json.JSONDecodeError as e:
+            _logger.error(f"❌ 模型配置文件JSON解析失败: {file_path}: {e}")
+
+    # 2. 回退：内联JSON环境变量
+    raw = os.getenv("LLM_MODEL_CONFIGS", "")
+    if not raw:
+        try:
+            from config import get_settings
+            raw = getattr(get_settings(), "llm_model_configs", "")
+        except Exception:
+            raw = ""
+    if not raw:
+        return {}
+    try:
+        configs = json.loads(raw)
+        return configs if isinstance(configs, dict) else {}
+    except Exception:
+        _logger.warning("⚠️ LLM_MODEL_CONFIGS 解析失败，回退到全局默认")
+        return {}
+
+
+def _model_config(model_name: str) -> Dict[str, Any]:
+    """获取指定模型的完整配置（未配置的模型返回空dict，调用方回退到全局默认）"""
+    global _MODEL_CONFIGS
+    if _MODEL_CONFIGS is None:
+        with _MODEL_CONFIGS_LOCK:
+            if _MODEL_CONFIGS is None:
+                _MODEL_CONFIGS = _load_model_configs()
+    return _MODEL_CONFIGS.get(model_name, {})
+
+
+# ========== 按模型限流管理器 ==========
+class _ModelRateLimiterManager:
+    """按模型名称管理独立的限流器实例"""
+
+    def __init__(self) -> None:
+        self._limiters: Dict[str, _RateLimiter] = {}
+        self._lock = threading.Lock()
+
+    def get(self, model_name: str) -> _RateLimiter:
+        """获取指定模型的限流器（懒创建，缓存复用）"""
+        if model_name in self._limiters:
+            return self._limiters[model_name]
+
+        with self._lock:
+            if model_name in self._limiters:
+                return self._limiters[model_name]
+
+            # 从模型配置中提取限流参数
+            cfg = _model_config(model_name)
+            rl_cfg = cfg.get("rate_limit", {}) if cfg else {}
+            qps = rl_cfg.get("qps") if isinstance(rl_cfg, dict) else None
+            concurrency = rl_cfg.get("concurrency") if isinstance(rl_cfg, dict) else None
+
+            if qps is not None or concurrency is not None:
+                limiter = _RateLimiter(max_concurrency=concurrency, max_qps=qps)
+                logging.getLogger(__name__).info(
+                    f"创建模型专属限流器: {model_name} "
+                    f"(QPS={limiter.max_qps}, 并发={limiter.max_concurrency})"
+                )
+            else:
+                # 回退到全局默认值（读LLM_MAX_QPS/LLM_MAX_CONCURRENCY）
+                limiter = _RateLimiter()
+                logging.getLogger(__name__).info(
+                    f"创建默认限流器: {model_name} "
+                    f"(QPS={limiter.max_qps}, 并发={limiter.max_concurrency})"
+                )
+
+            self._limiters[model_name] = limiter
+            return limiter
+
+    def stats(self) -> Dict[str, Any]:
+        """返回所有限流器配置信息（用于调试/监控）"""
+        result = {}
+        for name, limiter in self._limiters.items():
+            result[name] = {
+                "qps": limiter.max_qps,
+                "concurrency": limiter.max_concurrency,
+            }
+        return result
+
+
+_RATE_LIMITER_MANAGER: Optional[_ModelRateLimiterManager] = None
+
+
+def _rate_limiter_for(model_name: str) -> _RateLimiter:
+    """获取指定模型的限流器实例（按模型独立限流）"""
+    global _RATE_LIMITER_MANAGER
+    if _RATE_LIMITER_MANAGER is None:
+        _RATE_LIMITER_MANAGER = _ModelRateLimiterManager()
+    return _RATE_LIMITER_MANAGER.get(model_name)
+
+
+def _rate_limiter_stats() -> Dict[str, Any]:
+    """返回限流器统计信息"""
+    global _RATE_LIMITER_MANAGER
+    if _RATE_LIMITER_MANAGER is None:
+        _RATE_LIMITER_MANAGER = _ModelRateLimiterManager()
+    return _RATE_LIMITER_MANAGER.stats()
+
+
+# ========== 模型配置应用辅助函数 ==========
+def _apply_model_config(model_name: str,
+                        temperature: Optional[float],
+                        max_tokens: Optional[int],
+                        extra: Optional[Dict[str, Any]],
+                        timeout: Optional[int]) -> Dict[str, Any]:
+    """应用模型配置默认值（调用方显式传参优先）
+
+    合并规则：调用方显式参数 > 模型配置默认值
+
+    Returns:
+        dict: 包含合并后的 temperature, max_tokens, extra, timeout
+    """
+    cfg = _model_config(model_name)
+    if not cfg:
+        return {
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "extra": extra or {},
+            "timeout": timeout,
+        }
+
+    # temperature: 调用方未传时用配置默认
+    final_temp = temperature if temperature is not None else cfg.get("temperature")
+
+    # max_tokens: 调用方未传时用配置默认（null表示不限制）
+    if max_tokens is not None:
+        final_max_tokens = max_tokens
+    else:
+        final_max_tokens = cfg.get("max_tokens")
+
+    # timeout: 调用方未传时用配置默认
+    final_timeout = timeout if timeout is not None else cfg.get("timeout")
+
+    # extra: 合并配置中的 enable_thinking 等（调用方extra优先，不覆盖）
+    final_extra: Dict[str, Any] = {}
+    if "enable_thinking" in cfg:
+        final_extra["enable_thinking"] = cfg["enable_thinking"]
+    if extra:
+        final_extra.update(extra)  # 调用方的extra覆盖配置默认
+
+    return {
+        "temperature": final_temp,
+        "max_tokens": final_max_tokens,
+        "extra": final_extra,
+        "timeout": final_timeout,
+    }
+
+
+def _get_model_retry_config(model_name: str, default_retries: int, default_backoff: float) -> tuple:
+    """获取模型的重试配置（环境变量优先 > 模型配置 > 默认值）"""
+    cfg = _model_config(model_name)
+    retry_cfg = cfg.get("retry", {}) if cfg else {}
+    if not isinstance(retry_cfg, dict):
+        retry_cfg = {}
+
+    # 环境变量优先
+    try:
+        max_retries = int(os.getenv("LLM_RETRY_MAX", str(retry_cfg.get("max_retries", default_retries))))
+    except Exception:
+        max_retries = default_retries
+    try:
+        backoff = float(os.getenv("LLM_RETRY_BACKOFF", str(retry_cfg.get("backoff", default_backoff))))
+    except Exception:
+        backoff = default_backoff
+
+    return max_retries, backoff
 
 
 def ensure_ready() -> Dict[str, Any]:
     """返回当前服务配置与可用性信息。"""
     _init_once()
+    # 确保模型配置已加载
+    global _MODEL_CONFIGS
+    if _MODEL_CONFIGS is None:
+        with _MODEL_CONFIGS_LOCK:
+            if _MODEL_CONFIGS is None:
+                _MODEL_CONFIGS = _load_model_configs()
     return {
         "llm_ready": bool(_Singleton.llm_cfg.get("api_key")),
         "vision_ready": bool(_Singleton.vision_cfg.get("endpoint")),
         "llm_cfg": {k: ("***" if k == "api_key" and v else v) for k, v in _Singleton.llm_cfg.items()},
         "vision_cfg": {k: ("***" if k == "api_key" and v else v) for k, v in _Singleton.vision_cfg.items()},
+        "model_configs_loaded": bool(_MODEL_CONFIGS),
+        "rate_limiter_stats": _rate_limiter_stats(),
     }
 
 
@@ -298,20 +493,16 @@ def generate_raw(prompt: str,
     api_timer = Timer(f"LLM API调用({model_name})", parent="模型生成")
     api_timer.start()
     
+    # 应用模型配置默认值（超时等，调用方传参优先）
+    _resolved_timeout = _apply_model_config(model_name, None, None, None, None)["timeout"] or cfg["timeout"]
+
     def _post_with_retry(max_retries: int = 3, backoff: float = 1.5):
         last_err: Optional[Exception] = None
-        # 环境变量可覆盖重试策略
-        try:
-            max_retries = int(os.getenv("LLM_RETRY_MAX", str(max_retries)))
-        except Exception:
-            pass
-        try:
-            backoff = float(os.getenv("LLM_RETRY_BACKOFF", str(backoff)))
-        except Exception:
-            pass
+        # 重试策略：环境变量 > 模型配置 > 默认值
+        max_retries, backoff = _get_model_retry_config(model_name, max_retries, backoff)
 
         for attempt in range(1, max_retries + 1):
-            rl = _rate_limiter()
+            rl = _rate_limiter_for(model_name)
             _skip_rl = bool(skip_rate_limit)
             
             # 等待限流计时
@@ -327,7 +518,7 @@ def generate_raw(prompt: str,
                 # HTTP请求计时
                 http_timer = Timer("HTTP请求", parent="模型生成")
                 http_timer.start()
-                r = requests.post(url, headers=headers, json=payload, timeout=cfg["timeout"])
+                r = requests.post(url, headers=headers, json=payload, timeout=_resolved_timeout)
                 http_timer.stop()
                 
                 # 特判429，遵循 Retry-After
@@ -408,7 +599,8 @@ def generate(prompt: str,
              extra: Optional[Dict[str, Any]] = None,
              model: Optional[str] = None,
              skip_rate_limit: Optional[bool] = None,
-             rate_limit_category: Optional[str] = None) -> str:
+             rate_limit_category: Optional[str] = None,
+             timeout: Optional[int] = None) -> str:
     """调用 Qwen 文本模型（DashScope 兼容 OpenAI Chat Completions）。"""
     _init_once()
     cfg = _Singleton.llm_cfg
@@ -423,6 +615,9 @@ def generate(prompt: str,
     task_id = uuid.uuid4().hex[:8]
     # 开始计时
     model_name = model or cfg["model"]
+    # 应用模型配置默认值（超时/思考模式/温度等，调用方传参优先）
+    _resolved = _apply_model_config(model_name, temperature, max_tokens, extra, timeout)
+    request_timeout = _resolved["timeout"] or cfg["timeout"]
     prompt_len = len(prompt)
     gen_timer = Timer(f"文本生成({model_name})", parent="模型生成")
     gen_timer.start()
@@ -446,32 +641,26 @@ def generate(prompt: str,
         "model": (model or cfg["model"]),
         "messages": msgs,
     }
-    if temperature is not None:
-        payload["temperature"] = temperature
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-    if extra:
-        payload.update(extra)
+    # 应用模型配置默认值（调用方显式参数已在_apply_model_config中保留优先）
+    if _resolved["temperature"] is not None:
+        payload["temperature"] = _resolved["temperature"]
+    if _resolved["max_tokens"] is not None:
+        payload["max_tokens"] = _resolved["max_tokens"]
+    if _resolved["extra"]:
+        payload.update(_resolved["extra"])
     raw_payload = payload.copy()
     def _post_with_retry(max_retries: int = 3, backoff: float = 1.5):
         last_err: Optional[Exception] = None
-        # 环境变量可覆盖重试策略
-        try:
-            max_retries = int(os.getenv("LLM_RETRY_MAX", str(max_retries)))
-        except Exception:
-            pass
-        try:
-            backoff = float(os.getenv("LLM_RETRY_BACKOFF", str(backoff)))
-        except Exception:
-            pass
-        
+        # 重试策略：环境变量 > 模型配置 > 默认值
+        max_retries, backoff = _get_model_retry_config(model_name, max_retries, backoff)
+
         for attempt in range(1, max_retries + 1):
-            rl = _rate_limiter()
+            rl = _rate_limiter_for(model_name)
             _skip_rl = bool(skip_rate_limit)
             if not _skip_rl:
                 rl.acquire()
             try:
-                r = requests.post(url, headers=headers, json=payload) # , timeout=cfg["timeout"]
+                r = requests.post(url, headers=headers, json=payload, timeout=request_timeout)
                 if r.status_code == 429:
                     retry_after = r.headers.get("Retry-After")
                     try:
@@ -518,11 +707,9 @@ def generate(prompt: str,
         if not RAW_RESPONSE_SAVE_DIR:
             return
         try:
-            os.makedirs(RAW_RESPONSE_SAVE_DIR, exist_ok=True)
             filename = f"llm_raw_{task_id}_turn{turn}.json"
             filepath = os.path.join(RAW_RESPONSE_SAVE_DIR, filename)
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            save_json(filepath, data)
             _logger.debug(f"💾 原始响应已保存: {filepath}")
         except Exception as save_err:
             _logger.warning(f"⚠️ 原始响应保存失败: {save_err}")
@@ -615,6 +802,11 @@ def stream_generate(prompt: str,
         # 未配置时直接结束（避免抛错中断主流程）
         return
 
+    model_name = model or cfg["model"]
+    # 应用模型配置默认值（超时/思考模式/温度等，调用方传参优先）
+    _resolved = _apply_model_config(model_name, temperature, max_tokens, extra, None)
+    _resolved_timeout = _resolved["timeout"] or cfg["timeout"]
+
     url = f"{cfg['api_base'].rstrip('/')}/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -634,19 +826,19 @@ def stream_generate(prompt: str,
         "messages": msgs,
         "stream": True,
     }
-    if temperature is not None:
-        payload["temperature"] = temperature
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-    if extra:
-        payload.update(extra)
+    if _resolved["temperature"] is not None:
+        payload["temperature"] = _resolved["temperature"]
+    if _resolved["max_tokens"] is not None:
+        payload["max_tokens"] = _resolved["max_tokens"]
+    if _resolved["extra"]:
+        payload.update(_resolved["extra"])
 
-    rl = _rate_limiter()
+    rl = _rate_limiter_for(model_name)
     _skip_rl = bool(skip_rate_limit)
     if not _skip_rl:
         rl.acquire()
     try:
-        with requests.post(url, headers=headers, json=payload, timeout=cfg["timeout"], stream=True) as r:
+        with requests.post(url, headers=headers, json=payload, timeout=_resolved_timeout, stream=True) as r:
             r.raise_for_status()
             for raw_line in r.iter_lines(decode_unicode=True):
                 if not raw_line:

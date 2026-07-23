@@ -18,7 +18,7 @@ class CustomJsonFormatter(jsonlogger.JsonFormatter):
         log_record["logger"] = record.name
         
         # 添加请求ID（如果有）
-        from .request_context import get_request_id
+        from .context_manager import get_request_id
         request_id = get_request_id()
         if request_id:
             log_record["request_id"] = request_id

@@ -23,6 +23,7 @@
 - 支持流式输出（可选）
 """
 
+import html
 import logging
 import os
 from pathlib import Path
@@ -32,11 +33,12 @@ from datetime import datetime
 
 from service.models import get_llm_service
 from service.prompts.system_prompt_manager import system_prompt_manager
-from utils.context_manager import get_current_output_dir
+from utils.context_manager import get_current_output_dir, get_project_desc
 from utils.task_logger import get_task_logger
 
 # 导入耗时记录工具
 from utils.timing import Timer, generation_timer
+from utils.output_manager import save_json, save_text
 
 
 def _task_log_error(message: str, exc: Exception = None, **extra):
@@ -84,8 +86,6 @@ class ParagraphGenerationService:
         """
         # 使用统一的模型管理器获取LLM实例
         self.llm = get_llm_service("generation", model_name)
-        # 可选的详细日志系统（用于保存提示词和输出）
-        self.detailed_logger = None
         logger.info("段落生成服务已初始化，使用统一模型管理器")
 
     def _save_prompt_to_file(self, paragraph_id: Optional[str], prompt: str) -> Optional[Path]:
@@ -103,8 +103,7 @@ class ParagraphGenerationService:
             pid = (paragraph_id or "unknown").strip() or "unknown"
             filename = f"generation_prompt_{pid}_{ts}_{r6}.txt"
             prompt_file = prompts_dir / filename
-            with open(prompt_file, 'w', encoding='utf-8') as f:
-                f.write(prompt)
+            save_text(prompt_file, prompt)
             logger.debug(f"生成提示词已保存: {prompt_file}")
             return prompt_file
         except Exception as e:
@@ -128,8 +127,7 @@ class ParagraphGenerationService:
             pid = (paragraph_id or "unknown").strip() or "unknown"
             filename = f"generation_output_{pid}_{ts}_{r6}.txt"
             out_file = outputs_dir / filename
-            with open(out_file, 'w', encoding='utf-8') as f:
-                f.write(content if content is not None else "")
+            save_text(out_file, content if content is not None else "")
             logger.debug(f"生成原始输出已保存: {out_file}")
             return out_file
         except Exception as e:
@@ -262,17 +260,18 @@ class ParagraphGenerationService:
                 "generate_prompt": generate_prompt,
                 "scheme_data": scheme_data,  # ✅ 直接传递，空值由模板处理
                 "example": example,
-                "project_desc": os.getenv("CURRENT_PROJECT_DESC", "")
+                "project_desc": get_project_desc()
             }
             if is_table:
                 variables["html"] = html
 
             # 构建提示词计时
             with Timer("构建生成提示词", parent="段落生成") as prompt_timer:
-                generation_prompt = system_prompt_manager.build_prompt(
-                    template_name,
-                    variables
-                )
+                messages = system_prompt_manager.build_messages(template_name, variables)
+                system_prompt = messages.get("system", "")
+                user_prompt = messages.get("user", "")
+                # 留痕用完整文本（system + user）；调用模型时只传 user，system 走独立参数以命中缓存
+                generation_prompt = (system_prompt + "\n\n" + user_prompt) if system_prompt else user_prompt
 
             logger.info(f"📝 生成提示词长度: {len(generation_prompt)}字符 [构建耗时: {prompt_timer.duration_str}]")
             # logger.info(f"📝 生成提示词预览（最后500字符）:\n{generation_prompt[-500:]}")
@@ -294,21 +293,14 @@ class ParagraphGenerationService:
             }
 
             # 保存提示词（用于调试）
-            prompt_path: Optional[Path] = None
-            if self.detailed_logger:
-                self.detailed_logger.save_prompt("paragraph_generation", generation_prompt, {
-                    "paragraph_id": paragraph_id,
-                    "prompt_length": len(generation_prompt)
-                })
-            else:
-                prompt_path = self._save_prompt_to_file(paragraph_id, generation_prompt)
+            prompt_path = self._save_prompt_to_file(paragraph_id, generation_prompt)
 
             # 阶段提示：开始生成
             logger.info("正在生成段落...")
 
             # 3. 调用模型生成 (带耗时记录)
             with Timer("LLM模型生成", parent="段落生成") as llm_timer:
-                model_output = self.llm.generate_single(generation_prompt)
+                model_output = self.llm.generate_single(user_prompt, system=system_prompt)
 
             logger.info(f"⏱️ LLM生成完成 [耗时: {llm_timer.duration_str}, 输出: {len(model_output)}字符]")
 
@@ -402,7 +394,6 @@ class ParagraphGenerationService:
                 }
             }
 
-
     def _save_provenance_data(self, paragraph_id: Optional[str], provenance_data: Dict[str, Any],
                               extracted_data: Dict[str, Any]) -> Optional[Path]:
         """保存完整的生成阶段溯源数据到JSON文件
@@ -416,8 +407,6 @@ class ParagraphGenerationService:
             保存的文件路径
         """
         try:
-            import json
-
             # 使用线程安全的方式获取当前会话目录
             session_dir = get_current_output_dir(default="output")
             safe_para_id = (paragraph_id or "unknown").replace("/", "_").replace("\\", "_")
@@ -450,8 +439,7 @@ class ParagraphGenerationService:
             }
 
             # 保存到文件
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(full_provenance, f, ensure_ascii=False, indent=2)
+            save_json(filepath, full_provenance)
 
             logger.info(f"✅ 生成阶段溯源数据已保存: {filepath}")
             return filepath
@@ -472,21 +460,28 @@ class ParagraphGenerationService:
 
     def _build_structured_scheme_data(self, extracted_items: List[Dict[str, Any]]) -> str:
         """
-        按结构化格式构建 scheme_data（有生成逻辑时使用）
+        将提取结果按 item_id 分组，构建结构化的 XML 格式参考资料字符串，
+        作为 scheme_data 喂给段落生成提示词。
 
         格式示例：
-        ## 参考资料
-        ### 参考资料编号: 1
-        来源目录: 临床研究方案
-        来源文件: xxxxI期临床方案.docx
-        内容:
-        提取的内容...
+        <reference id="1" source="临床研究方案">
+          <content file="xxxxI期临床方案.docx">
+          ...内容...
+          </content>
+        </reference>
+
+        过滤规则：
+        - 仅 status="success" 的 item 参与分组。
+        - Excel：只输出 available=True 且内容非空白（strip 后）的 sheet；
+          某文件若没有有效 sheet 则整张文件不输出。
+        - Word/PDF：内容非空白（strip 后）才输出。
+        - 某 item 若没有任何有效文件内容，则整条 <reference> 不输出。
 
         Args:
             extracted_items: 提取结果列表
 
         Returns:
-            结构化的参考资料文本
+            结构化的 XML 字符串；无任何有效内容时返回空字符串。
         """
         # 按 item_id 分组
         grouped_items: Dict[int, Dict[str, Any]] = {}
@@ -549,61 +544,81 @@ class ParagraphGenerationService:
                 }
                 grouped_items[item_id]["files"].append(file_entry)
 
-        # 构建文本
+        # 构建 XML
         if not grouped_items:
             return ""
 
-        result = "参考资料\n"
+        result_parts: List[str] = []
 
         for item_id in sorted(grouped_items.keys()):
             group = grouped_items[item_id]
 
-            # 临时存储当前item的输出，用于判断是否有有效内容
-            item_output_parts = []
-            item_output_parts.append(f"参考资料编号: {item_id}\n")
-            item_output_parts.append(f"来源目录: {group['directory']}\n")
+            # 属性值：转义双引号，None/空 给默认值
+            safe_id = html.escape(str(item_id), quote=True)
+            safe_directory = html.escape(
+                str(group.get("directory") or "未知目录"), quote=True
+            )
+
+            # 临时存储当前 item 的 XML 片段；若无有效内容则整条丢弃
+            item_parts: List[str] = [f'<reference id="{safe_id}" source="{safe_directory}">\n']
 
             has_valid_files = False
 
-            for file_entry in group["files"]:
-                file_output = f"来源文件: {file_entry['source_file']}\n"
+            files = group.get("files")
+            if files:
+                for file_entry in files:
+                    safe_file_name = html.escape(
+                        str(file_entry.get("source_file") or "未知文件"), quote=True
+                    )
 
-                # Excel 格式：按 sheet 展示（只展示 available=True 且有内容的 sheet）
-                if file_entry.get("sheet_info"):
-                    sheet_contents = []
-                    for idx, sheet in enumerate(file_entry["sheet_info"], 1):
-                        sheet_name = sheet.get("sheet_name", f"Sheet{idx}")
-                        sheet_content = sheet.get("content", "")
-                        # 检查 available 字段，只展示有效内容
-                        available = sheet.get("available", False)
-                        # 如果 available 是字符串，转换为布尔值
-                        if isinstance(available, str):
-                            available = available.lower() == "true"
+                    # ---- Excel 格式（有 sheet_info） ----
+                    if file_entry.get("sheet_info"):
+                        sheet_contents: List[str] = []
 
-                        # 只展示 available=True 且有内容的 sheet
-                        if available and sheet_content:
-                            sheet_contents.append(f"sheet{idx}: {sheet_name}\n{sheet_content}\n")
+                        for idx, sheet in enumerate(file_entry["sheet_info"], 1):
+                            # sheet_name 可能为 None/空，给默认名
+                            sheet_name = sheet.get("sheet_name") or f"Sheet{idx}"
+                            safe_sheet_name = html.escape(str(sheet_name))
 
-                    # 只有当存在有效的sheet内容时才添加文件信息
-                    if sheet_contents:
-                        file_output += "内容:\n"
-                        file_output += "".join(sheet_contents)
-                        file_output += "\n"
-                        item_output_parts.append(file_output)
-                        has_valid_files = True
-                else:
-                    # Word/PDF 格式：只有内容非空才添加
-                    if file_entry['content']:
-                        file_output += f"内容:\n{file_entry['content']}\n\n"
-                        item_output_parts.append(file_output)
-                        has_valid_files = True
+                            # content 兼容非字符串类型，避免 .strip() 崩溃
+                            sheet_content = sheet.get("content", "")
+                            if not isinstance(sheet_content, str):
+                                sheet_content = str(sheet_content) if sheet_content else ""
 
-            # 只有当该item下有有效文件内容时，才添加到最终结果
+                            # available 兼容 bool / str
+                            available = sheet.get("available", False)
+                            if isinstance(available, str):
+                                available = available.lower() == "true"
+
+                            # 只收集 available=True 且内容非空白的 sheet
+                            if available and sheet_content.strip():
+                                sheet_contents.append(
+                                    f"### Sheet: {safe_sheet_name}\n{sheet_content}\n"
+                                )
+
+                        if sheet_contents:
+                            item_parts.append(f'  <content file="{safe_file_name}">\n')
+                            item_parts.extend(sheet_contents)
+                            item_parts.append("  </content>\n")
+                            has_valid_files = True
+
+                    # ---- Word/PDF 等普通文本格式 ----
+                    else:
+                        raw_content = file_entry.get("content", "")
+                        if not isinstance(raw_content, str):
+                            raw_content = str(raw_content) if raw_content else ""
+                        if raw_content.strip():
+                            item_parts.append(f'  <content file="{safe_file_name}">\n')
+                            item_parts.append(f"{raw_content}\n")
+                            item_parts.append("  </content>\n")
+                            has_valid_files = True
+
+            # 只有存在有效内容时，才闭合标签并加入最终结果
             if has_valid_files:
-                result += "".join(item_output_parts)
-                result += "\n"
+                item_parts.append("</reference>")
+                result_parts.append("".join(item_parts))
 
-        return result.rstrip()
+        return "\n\n".join(result_parts)
 
 
 # 创建全局服务实例

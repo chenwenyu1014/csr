@@ -15,22 +15,8 @@ import requests
 import logging
 
 # 导入耗时记录工具
-try:
-    from utils.timing import Timer, generation_timer, log_timing
-except ImportError:
-    # 如果导入失败，提供空实现
-    class Timer:
-        def __init__(self, *args, **kwargs): pass
-        def start(self): return self
-        def stop(self): return 0
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        @property
-        def duration(self): return 0
-        @property
-        def duration_str(self): return "0ms"
-    generation_timer = None
-    def log_timing(*args, **kwargs): pass
+from utils.timing import Timer, generation_timer
+from utils.context_manager import get_project_desc, get_combination_id
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +24,6 @@ class SystemPromptManager:
     """系统提示词管理器"""
     
     def __init__(self, system_config_file: str = "service/prompts/system/system_prompts.json"):
-        # system_config_file = Path(__file__).parent.parent.parent / system_config_file
         self.system_config_file = Path(system_config_file)
         self.system_config = self._load_system_config()
     
@@ -61,6 +46,26 @@ class SystemPromptManager:
         if template_data:
             return template_data
         return None
+    
+    
+    # 系统/用户提示词分隔标记：标记之上为可缓存的静态系统指令，之下为每次变化的用户数据
+    SYSTEM_USER_DELIMITER = "===USER_DATA==="
+
+    def _split_system_user(self, content: str) -> tuple:
+        """按分隔标记把渲染后的提示词拆成 (system, user)。无标记时 system 为空、user 为整段。"""
+        if not content or self.SYSTEM_USER_DELIMITER not in content:
+            return "", content
+        system, _, user = content.partition(self.SYSTEM_USER_DELIMITER)
+        return system.rstrip("\n").rstrip(), user.lstrip("\n").rstrip()
+
+    def build_messages(self, template_id: str, variables: Dict[str, Any]) -> Dict[str, str]:
+        """构建 system / user 双段提示词。
+
+        返回 {"system": str, "user": str}：system 为分隔标记之上的静态指令（可缓存前缀），
+        user 为之下的动态数据。模板未使用分隔标记时 system 为空、user 为整段渲染结果。
+        """
+        system, user = self._split_system_user(self.build_prompt(template_id, variables))
+        return {"system": system, "user": user}
 
     def build_prompt(self, template_id: str, variables: Dict[str, Any]) -> str:
         """构建完整的提示词"""
@@ -72,11 +77,7 @@ class SystemPromptManager:
         if not template:
             build_timer.stop()
             return ""
-        
-        template_parts = template.get("template", {})
-        if not template_parts:
-            template_parts = {}
-        
+
         # 安全格式化：占位符缺失时以空串兜底，避免整段失败
         class _SafeDict(dict):
             def __missing__(self, key):
@@ -105,11 +106,11 @@ class SystemPromptManager:
             except Exception:
                 return text or ""
 
-        # 注入项目背景变量（若缺失则从环境变量CURRENT_PROJECT_DESC回退）
+        # 注入项目背景变量（若缺失则从上下文回退）
         try:
             if not (isinstance((variables or {}).get("project_desc", ""), str) and (variables or {}).get("project_desc", "").strip()):
                 variables = dict(variables or {})
-                variables["project_desc"] = os.getenv("CURRENT_PROJECT_DESC", "") or ""
+                variables["project_desc"] = get_project_desc()
         except Exception:
             pass
 
@@ -122,12 +123,12 @@ class SystemPromptManager:
 
         # 优先从远端提示词服务获取模板（通过 combinationId + usedBy）
         try:
-            combination_id = str(os.getenv("CURRENT_COMBINATION_ID", "")).strip()
+            combination_id = str(get_combination_id()).strip()
         except Exception:
             combination_id = ""
         if not combination_id:
             try:
-                logger.debug(f"[PromptFetch] CURRENT_COMBINATION_ID not set; using local template for {template_id}")
+                logger.debug(f"[提示词获取] 未设置 CURRENT_COMBINATION_ID，使用本地模板: {template_id}")
             except Exception:
                 pass
         if combination_id:
@@ -140,7 +141,7 @@ class SystemPromptManager:
                 # 先尝试 POST（表单），失败或空则回退 GET
                 try:
                     logger.info(
-                        f"[PromptFetch] POST requesting usedBy={template_id} combinationId={combination_id} url={service_url}"
+                        f"[提示词获取] POST 请求中 usedBy={template_id} combinationId={combination_id} url={service_url}"
                     )
                     post_timer = Timer("POST请求提示词", parent="远程提示词")
                     post_timer.start()
@@ -153,7 +154,7 @@ class SystemPromptManager:
                         timeout=10,
                     )
                     post_timer.stop()
-                    logger.info(f"[PromptFetch] POST response status={resp_post.status_code} [耗时: {post_timer.duration_str}]")
+                    logger.info(f"[提示词获取] POST 响应状态码={resp_post.status_code} [耗时: {post_timer.duration_str}]")
                     if resp_post.status_code == 200:
                         data = resp_post.json() if hasattr(resp_post, "json") else None
                         if isinstance(data, dict):
@@ -161,7 +162,7 @@ class SystemPromptManager:
                             content = result.get("promptContent")
                             try:
                                 logger.info(
-                                    f"[PromptFetch] remote promptContent length={len(content) if isinstance(content, str) else 0}"
+                                    f"[提示词获取] 远程 promptContent 长度={len(content) if isinstance(content, str) else 0}"
                                 )
                             except Exception:
                                 pass
@@ -175,21 +176,21 @@ class SystemPromptManager:
                             else:
                                 try:
                                     logger.info(
-                                        f"[PromptFetch] POST returned empty promptContent, try GET fallback for {template_id}"
+                                        f"[提示词获取] POST 返回空 promptContent，尝试 GET 回退: {template_id}"
                                     )
                                 except Exception:
                                     pass
                     else:
                         try:
                             logger.warning(
-                                f"[PromptFetch] POST non-200 status: {resp_post.status_code}; try GET fallback"
+                                f"[提示词获取] POST 非 200 状态码: {resp_post.status_code}；尝试 GET 回退"
                             )
                         except Exception:
                             pass
                 except Exception as e_post:
                     try:
                         logger.warning(
-                            f"[PromptFetch] POST request failed: {e_post}; try GET fallback", exc_info=True
+                            f"[提示词获取] POST 请求失败: {e_post}；尝试 GET 回退", exc_info=True
                         )
                     except Exception:
                         pass
@@ -197,7 +198,7 @@ class SystemPromptManager:
                 # GET 回退
                 try:
                     logger.info(
-                        f"[PromptFetch] GET requesting usedBy={template_id} combinationId={combination_id} url={service_url}"
+                        f"[提示词获取] GET 请求中 usedBy={template_id} combinationId={combination_id} url={service_url}"
                     )
                     get_timer = Timer("GET请求提示词", parent="远程提示词")
                     get_timer.start()
@@ -210,7 +211,7 @@ class SystemPromptManager:
                         timeout=10,
                     )
                     get_timer.stop()
-                    logger.info(f"[PromptFetch] GET response status={resp_get.status_code} [耗时: {get_timer.duration_str}]")
+                    logger.info(f"[提示词获取] GET 响应状态码={resp_get.status_code} [耗时: {get_timer.duration_str}]")
                     if resp_get.status_code == 200:
                         data = resp_get.json() if hasattr(resp_get, "json") else None
                         if isinstance(data, dict):
@@ -218,7 +219,7 @@ class SystemPromptManager:
                             content = result.get("promptContent")
                             try:
                                 logger.info(
-                                    f"[PromptFetch] remote promptContent length={len(content) if isinstance(content, str) else 0}"
+                                    f"[提示词获取] 远程 promptContent 长度={len(content) if isinstance(content, str) else 0}"
                                 )
                             except Exception:
                                 pass
@@ -232,21 +233,21 @@ class SystemPromptManager:
                             else:
                                 try:
                                     logger.info(
-                                        f"[PromptFetch] empty promptContent, will fallback to local for {template_id}"
+                                        f"[提示词获取] promptContent 为空，将回退到本地模板: {template_id}"
                                     )
                                 except Exception:
                                     pass
                     else:
                         try:
                             logger.warning(
-                                f"[PromptFetch] GET non-200 status: {resp_get.status_code}; will fallback to local"
+                                f"[提示词获取] GET 非 200 状态码: {resp_get.status_code}；将回退到本地模板"
                             )
                         except Exception:
                             pass
                 except Exception as e_get:
                     try:
                         logger.warning(
-                            f"[PromptFetch] GET request failed: {e_get}; falling back to local", exc_info=True
+                            f"[提示词获取] GET 请求失败: {e_get}；回退到本地模板", exc_info=True
                         )
                     except Exception:
                         pass
@@ -255,20 +256,20 @@ class SystemPromptManager:
                 # 忽略远端异常，回退到本地模板
                 remote_timer.stop()
                 try:
-                    logger.warning(f"[PromptFetch] remote fetch failed: {e}; falling back to local", exc_info=True)
+                    logger.warning(f"[提示词获取] 远程获取失败: {e}；回退到本地模板", exc_info=True)
                 except Exception:
                     pass
                 pass
 
         # 若配置了 md_file，则优先读取并渲染整份MD
-        md_file = template.get("md_file") or template_parts.get("md_file")
+        md_file = (template.get("template") or {}).get("md_file")
         if md_file:
             try:
                 base_dir = self.system_config_file.parent
                 from pathlib import Path as _Path
                 md_path = (base_dir / md_file).resolve()
                 try:
-                    logger.info(f"[PromptFetch] using local md template: {md_path}")
+                    logger.info(f"[提示词获取] 使用本地 MD 模板: {md_path}")
                 except Exception:
                     pass
                 
@@ -285,63 +286,21 @@ class SystemPromptManager:
                     generation_timer.record(f"提示词构建(本地MD)-{template_id}", build_timer.duration, parent="提示词")
                 logger.info(f"✅ 提示词构建完成(本地MD) [模板: {template_id}, 耗时: {build_timer.duration_str}, 长度: {len(result)}字符]")
                 return result
-            except Exception as e:
-                # 失败则退回到分段模板渲染
+            except OSError as e:
+                # 本地 MD 读取失败：当前所有模板均以 md_file 为唯一来源，无分段兜底，
+                # 此处返回空串（与历史行为一致），由上层感知并处理。
                 try:
-                    logger.warning(f"[PromptFetch] reading local md template failed: {e}; will fallback to structured parts")
+                    logger.error(f"[提示词获取] 读取本地 MD 模板失败: {e}；返回空串", exc_info=True)
                 except Exception:
                     pass
-                pass
+                build_timer.stop()
+                return ""
 
-        # 构建提示词（分段拼接）
-        with Timer("拼接提示词分段", parent="提示词") as concat_timer:
-            prompt_parts = []
-
-            # 添加头部（如果有）
-            if "header" in template_parts:
-                header = _safe_format(template_parts["header"], variables)
-                if header:
-                    prompt_parts.append(header)
-
-            # 添加选择要求/提取要求/总结要求（如果有）
-            for key in ["selection_requirements", "extraction_requirements", "summary_requirements"]:
-                if key in template_parts:
-                    requirements = _safe_format(template_parts[key], variables)
-                    if requirements:
-                        prompt_parts.append(requirements)
-
-            # 添加文件列表头部（如果有）
-            if "file_list_header" in template_parts:
-                flh = template_parts["file_list_header"]
-                if flh:
-                    prompt_parts.append(flh)
-
-            # 添加文件列表（如果有）
-            if "file_list" in variables:
-                file_list = variables["file_list"]
-                if file_list:
-                    prompt_parts.append(file_list)
-
-            # 添加内容头部和内容（如果有）
-            for key in ["content_header", "content"]:
-                if key in template_parts:
-                    content_part = _safe_format(template_parts[key], variables)
-                    if content_part:
-                        prompt_parts.append(content_part)
-
-            # 添加尾部（如果有）
-            if "footer" in template_parts:
-                footer = template_parts["footer"]
-                if footer:
-                    prompt_parts.append(footer)
-
-            result = _with_project_desc("\n\n".join(prompt_parts), variables)
-
+        # 未配置 md_file：无可用模板来源，返回空串
         build_timer.stop()
-        if generation_timer:
-            generation_timer.record(f"提示词构建(本地分段)-{template_id}", build_timer.duration, parent="提示词")
-        logger.info(f"✅ 提示词构建完成(本地分段) [模板: {template_id}, 耗时: {build_timer.duration_str}, 长度: {len(result)}字符]")
-        return result
+        logger.warning(f"[提示词获取] 模板未配置 md_file，返回空串: {template_id}")
+        return ""
+    
 
 # 创建全局实例
 system_prompt_manager = SystemPromptManager()

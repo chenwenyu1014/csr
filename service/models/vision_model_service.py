@@ -31,6 +31,7 @@ import requests
 import tempfile
 import os
 import subprocess
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -333,15 +334,138 @@ class VisionModelService:
             }
     
     def _call_ocr_service(self, file_path: Path) -> Dict[str, Any]:
-        """调用OCR服务解析文件"""
+        """调用OCR服务解析文件（异步轮询方式）"""
+        job_id = None  # 提前初始化，避免异常路径中引用未定义变量
         try:
             file_size = 0
             try:
                 file_size = file_path.stat().st_size
             except Exception:
                 pass
-            logger.info(f"OCR请求 {self.base_url}/parse | file={file_path.name} | size={file_size}")
-            # 准备文件上传
+            
+            logger.info(f"OCR请求 {self.base_url}/parse_async | file={file_path.name} | size={file_size}")
+            
+            # ======== 步骤1: 提交异步任务 ========
+            with open(file_path, 'rb') as f:
+                content_type = 'application/pdf' if file_path.suffix.lower() == '.pdf' else 'application/octet-stream'
+                files = {'file': (file_path.name, f, content_type)}
+                submit_resp = requests.post(
+                    f"{self.base_url}/parse_async",
+                    files=files,
+                    data={'nohf': 'true'}, # 是否去除页眉页脚
+                    timeout=30  # 提交几秒就返回，timeout设短
+                )
+            
+            # 如果异步端点不存在，回退到同步方式
+            if submit_resp.status_code == 404:
+                logger.info("异步端点不可用，回退到同步方式 /parse")
+                return self._call_ocr_sync(file_path, file_size)
+            
+            if submit_resp.status_code != 200:
+                logger.warning(f"异步提交失败({submit_resp.status_code})，回退到同步方式")
+                return self._call_ocr_sync(file_path, file_size)
+            
+            job_data = submit_resp.json()
+            job_id = job_data["job_id"]
+            logger.info(f"OCR任务已提交，job_id: {job_id}")
+            
+            # ======== 步骤2: 轮询处理状态 ========
+            start_time = time.time()
+            poll_interval = 15  # 每15秒查一次
+            poll_count = 0
+            while True:
+                elapsed = time.time() - start_time
+                if elapsed > self.timeout:
+                    return {"status": "error", "error": f"OCR处理超时({self.timeout}秒)"}
+                
+                status_resp = requests.get(
+                    f"{self.base_url}/parse_status/{job_id}",
+                    timeout=10
+                )
+                if status_resp.status_code != 200:
+                    logger.warning(f"状态查询异常: {status_resp.status_code}")
+                    time.sleep(poll_interval)
+                    continue
+                
+                status_data = status_resp.json()
+                status = status_data["status"]
+                
+                if status == "done":
+                    logger.info(f"OCR处理完成，共 {status_data.get('total_pages', 0)} 页，耗时 {int(elapsed)}秒")
+                    break
+                elif status == "error":
+                    error_msg = status_data.get("error", "未知错误")
+                    logger.error(f"OCR处理失败: {error_msg}")
+                    return {"status": "error", "error": f"OCR服务处理错误: {error_msg}"}
+                else:
+                    poll_count += 1
+                    if poll_count%2 == 0:
+                        logger.info(f"OCR处理中... 状态: {status}, {job_id} 已等待 {int(elapsed)}秒")
+                    time.sleep(poll_interval)
+            
+            # ======== 步骤3: 获取最终结果 ========
+            result_resp = requests.get(
+                f"{self.base_url}/parse_result/{job_id}",
+                timeout=120  # 结果可能较大，给多一点时间
+            )
+            
+            if result_resp.status_code == 200:
+                content = result_resp.text
+                # 步骤4: 清理服务器端文件（数据安全）
+                try:
+                    requests.delete(
+                        f"{self.base_url}/parse_cleanup/{job_id}",
+                        timeout=10
+                    )
+                    logger.info(f"已清理服务器端任务文件: {job_id}")
+                except Exception as e:
+                    logger.warning(f"清理服务器文件失败(不影响结果): {e}")
+                    
+                return {
+                    "status": "success",
+                    "content": content,
+                    "visual_elements": [
+                        {
+                            "type": "text",
+                            "content": "OCR提取的文档内容",
+                            "position": "全文",
+                            "confidence": 0.95
+                        }
+                    ],
+                    "structured_content": content
+                }
+            
+            # 获取失败也要清理服务器端文件（数据安全）
+            if job_id:
+                try:
+                    requests.delete(
+                        f"{self.base_url}/parse_cleanup/{job_id}",
+                        timeout=10
+                    )
+                    logger.info(f"已清理服务器端任务文件: {job_id}")
+                except Exception as e:
+                    logger.warning(f"清理服务器文件失败(不影响结果): {e}")
+
+            return {"status": "error",
+                    "error": f"获取OCR结果失败: {result_resp.status_code} - {result_resp.text[:300]}"}
+        
+        except Exception as e:
+            if isinstance(e, (requests.ConnectionError, requests.Timeout, ConnectionResetError)):
+                logger.warning(f"调用OCR服务连接失败: {type(e).__name__}: {e}")
+            else:
+                logger.error(f"调用OCR服务异常: {e}", exc_info=True)
+            # 异常时也尝试清理已提交的任务（防数据残留）
+            if job_id:
+                try:
+                    requests.delete(f"{self.base_url}/parse_cleanup/{job_id}", timeout=10)
+                except Exception:
+                    pass
+            return {"status": "error", "error": str(e)}
+    
+    def _call_ocr_sync(self, file_path: Path, file_size: int) -> Dict[str, Any]:
+        """回退：同步方式调用OCR（原逻辑，兼容旧服务器）"""
+        try:
+            # 原来的 multipart 方式
             with open(file_path, 'rb') as f:
                 content_type = 'application/pdf' if file_path.suffix.lower() == '.pdf' else 'application/octet-stream'
                 files = {'file': (file_path.name, f, content_type)}
@@ -350,7 +474,7 @@ class VisionModelService:
                     files=files,
                     timeout=self.timeout
                 )
-                logger.info(f"OCR响应状态: {response.status_code}")
+                logger.info(f"OCR同步响应状态: {response.status_code}")
                 if response.status_code == 200:
                     content = response.text
                     return {
@@ -366,45 +490,17 @@ class VisionModelService:
                         ],
                         "structured_content": content
                     }
-                # 非200时，尝试raw方式重试
-                logger.info("尝试使用raw application/pdf方式重试OCR...")
-                with open(file_path, 'rb') as f2:
-                    raw_resp = requests.post(
-                        f"{self.base_url}/parse",
-                        data=f2,
-                        headers={"Content-Type": "application/pdf"},
-                        timeout=self.timeout
-                    )
-                logger.info(f"OCR raw重试响应状态: {raw_resp.status_code}")
-                if raw_resp.status_code == 200:
-                    content = raw_resp.text
-                    return {
-                        "status": "success",
-                        "content": content,
-                        "visual_elements": [
-                            {
-                                "type": "text",
-                                "content": "OCR提取的文档内容",
-                                "position": "全文",
-                                "confidence": 0.95
-                            }
-                        ],
-                        "structured_content": content
-                    }
-                # 仍失败，返回两次响应的关键信息
-                err1 = f"{response.status_code} - {response.text[:300]}" if response is not None else "no response"
-                err2 = f"{raw_resp.status_code} - {raw_resp.text[:300]}" if raw_resp is not None else "no response"
+                # 非200（如502）：返回明确的错误字典，避免上层拿到 None
                 return {
                     "status": "error",
-                    "error": f"OCR服务错误(multipart/raw): {err1} | {err2}"
+                    "error": f"OCR同步调用失败: {response.status_code} - {response.text[:300]}"
                 }
         except Exception as e:
-            logger.error(f"调用OCR服务失败: {e}", exc_info=True)
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-    
+            if isinstance(e, (requests.ConnectionError, requests.Timeout, ConnectionResetError)):
+                logger.warning(f"调用OCR服务连接失败: {type(e).__name__}: {e}")
+            else:
+                logger.error(f"调用OCR服务异常: {e}", exc_info=True)
+            return {"status": "error", "error": str(e)}
     def _process_image_file(self, file_path: Path) -> Dict[str, Any]:
         """处理图像文件"""
         try:
@@ -540,56 +636,6 @@ class VisionModelService:
         except Exception as e:
             logger.error(f"视觉模型API调用失败: {e}", exc_info=True)
             return f"[视觉模型API] 调用失败: {str(e)}"
-
-
-class MockVisionModelService(VisionModelService):
-    """模拟视觉模型服务，用于测试和开发"""
-    
-    def __init__(self):
-        super().__init__()
-        logger.info("使用模拟视觉模型服务")
-    
-    def _process_rtf_file(self, file_path: Path, file_content: str) -> Dict[str, Any]:
-        """模拟处理RTF文件"""
-        return {
-            "status": "success",
-            "file_type": "rtf",
-            "file_name": file_path.name,
-            "content": file_content[:1000] + "..." if len(file_content) > 1000 else file_content,
-            "visual_elements": [
-                {
-                    "type": "table",
-                    "content": "模拟提取的表格内容",
-                    "position": "文档中部",
-                    "confidence": 0.95
-                }
-            ],
-            "structured_content": "模拟的结构化内容"
-        }
-    
-    def call_vision_api(self, file_path: Path, prompt: str = "") -> str:
-        """模拟API调用"""
-        return f"[模拟视觉模型] 文件: {file_path.name}\n提示词: {prompt}\n模拟处理完成"
-
-
-# 工厂函数
-def create_vision_model_service(use_mock: bool = False, **kwargs) -> VisionModelService:
-    """
-    创建视觉模型服务实例
-    
-    Args:
-        use_mock: 是否使用模拟服务
-        **kwargs: 其他参数
-        
-    Returns:
-        视觉模型服务实例
-    """
-    if use_mock:
-        return MockVisionModelService()
-    else:
-        return VisionModelService(**kwargs)
-
-
 
 
 

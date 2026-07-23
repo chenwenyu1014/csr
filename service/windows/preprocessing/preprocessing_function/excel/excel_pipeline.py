@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 from enum import Enum
+from utils.output_manager import save_text
 
 from openpyxl import load_workbook
 from openpyxl.utils import coordinate_to_tuple
@@ -21,7 +22,7 @@ class ContentType(Enum):
     STRUCTURED = "structured"
 
 
-def run(excel_path: Path | str, work_dir: Path | str) -> Dict[str, Any]:
+def excel_run(excel_path: Path | str, work_dir: Path | str) -> Dict[str, Any]:
     excel_path = Path(excel_path)
     work_dir = Path(work_dir)
 
@@ -670,7 +671,7 @@ def convert_excel_sheets_to_markdown(
                 # 保存为 Markdown 文件
                 safe_sheet_name = re.sub(r'[<>:"/\\|?*]', '_', sheet_name)
                 md_file = output_dir / f"{safe_sheet_name}.md"
-                md_file.write_text(md, encoding='utf-8')
+                save_text(md_file, md)
 
                 # 统计行列数
                 lines = md.split('\n')

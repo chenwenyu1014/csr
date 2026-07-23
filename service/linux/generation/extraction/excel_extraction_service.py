@@ -24,7 +24,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import get_settings
 from service.models import get_llm_service
 from service.prompts.system_prompt_manager import system_prompt_manager
-from utils.context_manager import get_current_output_dir
+from utils.context_manager import get_current_output_dir, get_project_desc, inherit_context
+from utils.output_manager import save_json, save_text
 
 logger = logging.getLogger(__name__)
 
@@ -208,14 +209,16 @@ class ExcelExtractionService:
             pass
 
         return None
-    def _call_model_with_json_retry(self, prompt: str, sheet_name: str, max_retries: int = 2) -> Dict[str, Any]:
+    def _call_model_with_json_retry(self, prompt: str, sheet_name: str, max_retries: int = 2,
+                                    system: str = "") -> Dict[str, Any]:
         """
         调用模型并解析 JSON，支持重试机制
 
         Args:
-            prompt: 提示词
+            prompt: 用户段提示词
             sheet_name: Sheet 名称（用于日志和兜底）
             max_retries: 最大重试次数（默认2次，共3次尝试）
+            system: 系统提示词（可选，作为可缓存前缀单独传入）
 
         Returns:
             Dict: 包含解析结果和重试信息
@@ -225,7 +228,7 @@ class ExcelExtractionService:
                 - retry_attempts: 重试次数
         """
         all_attempts_outputs = []
-        current_output = self.llm.generate_single(prompt)
+        current_output = self.llm.generate_single(prompt, system=system)
         all_attempts_outputs.append(current_output)
 
         parsed = None
@@ -247,7 +250,7 @@ class ExcelExtractionService:
 
             if attempt < max_retries:
                 logger.info(f"🔄 发起第 {attempt + 2} 次模型调用...")
-                current_output = self.llm.generate_single(prompt)
+                current_output = self.llm.generate_single(prompt, system=system)
                 all_attempts_outputs.append(current_output)
             else:
                 # 达到最大重试次数
@@ -340,11 +343,11 @@ class ExcelExtractionService:
 
             # 保存提示词
             prompt_file = prompts_dir / f"excel_prompt_{paragraph_id}_{safe_sheet}_{timestamp}.txt"
-            prompt_file.write_text(prompt, encoding='utf-8')
+            save_text(prompt_file, prompt)
             
             # 保存输出
             output_file = outputs_dir / f"excel_output_{paragraph_id}_{safe_sheet}_{timestamp}.txt"
-            output_file.write_text(output, encoding='utf-8')
+            save_text(output_file, output)
 
             # 保存溯源JSON
             provenance_data = {
@@ -359,7 +362,7 @@ class ExcelExtractionService:
                 "output_file": str(output_file)
             }
             provenance_file = provenance_dir / f"excel_provenance_{paragraph_id}_{safe_sheet}_{timestamp}.json"
-            provenance_file.write_text(json.dumps(provenance_data, ensure_ascii=False, indent=2), encoding='utf-8')
+            save_json(provenance_file, provenance_data)
 
             logger.info(f"✅ Excel提取提示词已保存: {prompt_file.name}")
 
@@ -470,7 +473,7 @@ class ExcelExtractionService:
                 logger.info(f"📊 多Sheet并发提取: {len(md_files)}个Sheet, 并发数: {actual_workers}")
                 
                 with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-                    future_to_md = {executor.submit(_extract_sheet_task, md): md for md in md_files}
+                    future_to_md = {executor.submit(inherit_context(_extract_sheet_task), md): md for md in md_files}
                     for future in as_completed(future_to_md):
                         md_file = future_to_md[future]
                         try:
@@ -644,7 +647,7 @@ class ExcelExtractionService:
 
             # 2. 构建提示词（仅传递提取需求和Sheet内容）
             # 将标题前置到内容，确保模型看到标题
-            sheet_content_with_title = f"# 【sheet_name:{sheet_name}】\n\nsheet_content:\n{sheet_content}"
+            sheet_content_with_title = f"【sheet_name】\n{sheet_name}\n【sheet_content】:\n{sheet_content}"
 
             # 提示词为空，直接返回原文内容
             if not extraction_query:
@@ -666,15 +669,19 @@ class ExcelExtractionService:
             variables = {
                 "extraction_query": extraction_query,
                 "sheet_content": sheet_content_with_title,
-                "project_desc": os.getenv("CURRENT_PROJECT_DESC", "")
+                "project_desc": get_project_desc()
             }
-            prompt = system_prompt_manager.build_prompt("excel_extraction", variables)
+            messages = system_prompt_manager.build_messages("excel_extraction", variables)
+            system_prompt = messages.get("system", "")
+            user_prompt = messages.get("user", "")
+            # 留痕用完整文本（system + user）；调用模型时只传 user，system 走独立参数以命中缓存
+            prompt = (system_prompt + "\n\n" + user_prompt) if system_prompt else user_prompt
 
             # 3. 调用模型并解析 JSON（带重试机制）
             logger.info(f"调用模型提取Sheet: {sheet_name}")
             logger.info(f"📝 Excel提取提示词长度: {len(prompt)}字符")
 
-            parse_result = self._call_model_with_json_retry(prompt, sheet_name, max_retries=2)
+            parse_result = self._call_model_with_json_retry(user_prompt, sheet_name, max_retries=2, system=system_prompt)
 
             # 4. 构建解析后的字段
             parsed_fields = self._build_parsed_result(parse_result, sheet_name)

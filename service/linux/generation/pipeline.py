@@ -28,6 +28,7 @@ from utils.tag_error_manager import (
     is_tag_failed
 )
 from utils.ragflow_client import ragflow_client
+from utils.context_manager import inherit_context
 logger = logging.getLogger(__name__)
 
 
@@ -44,7 +45,7 @@ class CSRGenerationPipeline:
 
     def __init__(self,
                  config_path: str = None,  # 段落配置路径（已废弃）
-                 base_data_dir: str = "data/rtf&index",
+                 base_data_dir: str = "AAA/project_data",
                  cache_dir: str = "cache",
                  use_mock_services: bool = False,
                  model_service=None,
@@ -310,44 +311,8 @@ class CSRGenerationPipeline:
                 extracted = _extract_para(para)
                 extracted_by_id[para.id] = extracted
         else:
-            # 获取当前上下文以传递到子线程
-            current_rid = None
-            current_output_dir = None
-            current_session_id = None
-            try:
-                import os as _os
-                current_rid = _os.getenv("CURRENT_REQUEST_ID")
-                current_output_dir = _os.getenv("CURRENT_OUTPUT_DIR")
-                current_session_id = _os.getenv("CURRENT_SESSION_ID")
-            except:
-                pass
-
-            def _extract_para_with_context(para, rid, output_dir, session_id):
-                """包装函数：设置上下文后执行提取（确保子线程能继承日志上下文）"""
-                # 设置request_id上下文
-                if rid:
-                    try:
-                        import os as _os
-                        _os.environ["CURRENT_REQUEST_ID"] = rid
-                    except:
-                        pass
-
-                # 设置output_dir上下文
-                if output_dir:
-                    try:
-                        from utils.context_manager import set_current_output_dir
-                        set_current_output_dir(output_dir)
-                    except:
-                        pass
-
-                # 设置session_id上下文（确保子线程的日志能被SessionFilter捕获）
-                if session_id:
-                    try:
-                        from utils.context_manager import set_session_id
-                        set_session_id(session_id)
-                    except:
-                        pass
-
+            def _extract_para_with_lock(para):
+                """包装函数：请求间隔控制后执行提取（上下文由 inherit_context 继承）"""
                 # 请求间隔控制
                 with _extract_request_lock:
                     elapsed = time.time() - _extract_last_request_time[0]
@@ -360,8 +325,10 @@ class CSRGenerationPipeline:
             logger.info(f"📂 阶段A并发提取: {len(self.paragraphs)}个段落, 并发数: {actual_extract_workers}")
 
             with ThreadPoolExecutor(max_workers=actual_extract_workers) as executor:
-                future_to_para = {executor.submit(_extract_para_with_context, p, current_rid, current_output_dir,
-                                                  current_session_id): p for p in self.paragraphs}
+                future_to_para = {
+                    executor.submit(inherit_context(_extract_para_with_lock), p): p
+                    for p in self.paragraphs
+                }
                 for future in as_completed(future_to_para):
                     para = future_to_para[future]
                     try:
@@ -492,6 +459,11 @@ class CSRGenerationPipeline:
                         # TFL占位符
                         all_parts.extend(tfl_placeholders)
                         logger.info(f"✅ 已附加{len(tfl_placeholders)}个TFL占位符到段落末尾: {tfl_placeholders}")
+                    # word 可以提取到表格占位符，不需要手动添加
+                    # if placeholders_to_insert:
+                    #     # 图表占位符
+                    #     all_parts.extend(placeholders_to_insert)
+                    #     logger.info(f"✅ 已附加{len(placeholders_to_insert)}个图表占位符到段落末尾: {placeholders_to_insert}")
 
 
                 generated_content = "\n\n".join(all_parts).strip()
@@ -500,36 +472,6 @@ class CSRGenerationPipeline:
                 if not para.insert_original:
                     # word在提取的时候文本中可能包含了占位符，非图表引用模式要移除掉文件中原有的占位符{{}}
                     generated_content = re.sub(r"\{\{(Table|Image)_\d+_start\}\}", "", generated_content)
-
-                # 流式事件：生成阶段（跳过模型）也推送汇总文本预览
-                try:
-                    try:
-                        from utils.request_context import get_request_id  # type: ignore
-                    except Exception:
-                        from utils.request_context import get_request_id  # type: ignore
-                    try:
-                        from utils.event_bus import event_bus  # type: ignore
-                    except Exception:
-                        from utils.event_bus import event_bus  # type: ignore
-                    rid = None
-                    try:
-                        rid = get_request_id()
-                    except Exception:
-                        rid = None
-                    if not rid or rid == "-":
-                        import os as _os
-                        rid = _os.getenv("CURRENT_REQUEST_ID")
-                    if rid and rid != "-" and event_bus:
-                        preview = generated_content if generated_content else None
-                        event_bus.emit(rid, {
-                            "type": "generation_paragraph",
-                            "paragraph_id": paragraph_id,
-                            "skipped_generation": True,
-                            "content_preview": preview,
-                        })
-                except Exception as e:
-                    traceback.print_exc()
-                    pass
 
                 # 标记标签成功（跳过生成也算成功）
                 error_manager.mark_success(paragraph_id)
@@ -608,36 +550,6 @@ class CSRGenerationPipeline:
                         "extracted_data": extracted_data
                     }
 
-                # 流式事件：生成阶段内容预览
-                try:
-                    try:
-                        from utils.request_context import get_request_id  # type: ignore
-                    except Exception:
-                        from utils.request_context import get_request_id  # type: ignore
-                    try:
-                        from utils.event_bus import event_bus  # type: ignore
-                    except Exception:
-                        from utils.event_bus import event_bus  # type: ignore
-                    rid = None
-                    try:
-                        rid = get_request_id()
-                    except Exception:
-                        rid = None
-                    if not rid or rid == "-":
-                        import os as _os
-                        rid = _os.getenv("CURRENT_REQUEST_ID")
-                    if rid and rid != "-" and event_bus:
-                        preview = generated_content if generated_content else None
-                        event_bus.emit(rid, {
-                            "type": "generation_paragraph",
-                            "paragraph_id": paragraph_id,
-                            "skipped_generation": False,
-                            "content_preview": preview,
-                        })
-                except Exception as  e:
-                    traceback.print_exc()
-                    pass
-
                 # 标记标签成功
                 error_manager.mark_success(paragraph_id)
 
@@ -669,34 +581,8 @@ class CSRGenerationPipeline:
                 res = _generate_para(para)
                 results.append(res)
         else:
-            # 获取当前request_id和output_dir以传递到线程
-            current_rid_b = None
-            current_output_dir_b = None
-            try:
-                import os as _os
-                current_rid_b = _os.getenv("CURRENT_REQUEST_ID")
-                current_output_dir_b = _os.getenv("CURRENT_OUTPUT_DIR")
-            except:
-                pass
-
-            def _generate_para_with_context(para, rid, output_dir):
-                """包装函数：设置上下文后执行生成（确保子线程能继承日志上下文）"""
-                # 设置request_id上下文
-                if rid:
-                    try:
-                        import os as _os
-                        _os.environ["CURRENT_REQUEST_ID"] = rid
-                    except:
-                        pass
-
-                # 🆕 设置output_dir上下文（确保子线程的日志能被SessionFilter捕获）
-                if output_dir:
-                    try:
-                        from utils.context_manager import set_current_output_dir
-                        set_current_output_dir(output_dir)
-                    except:
-                        pass
-
+            def _generate_para_with_lock(para):
+                """包装函数：请求间隔控制后执行生成（上下文由 inherit_context 继承）"""
                 # 请求间隔控制
                 with _generate_request_lock:
                     elapsed = time.time() - _generate_last_request_time[0]
@@ -710,8 +596,9 @@ class CSRGenerationPipeline:
 
             with ThreadPoolExecutor(max_workers=actual_generate_workers) as executor:
                 future_to_para = {
-                    executor.submit(_generate_para_with_context, p, current_rid_b, current_output_dir_b): p for p in
-                    self.paragraphs}
+                    executor.submit(inherit_context(_generate_para_with_lock), p): p
+                    for p in self.paragraphs
+                }
                 for future in as_completed(future_to_para):
                     para = future_to_para[future]
                     try:
@@ -739,13 +626,6 @@ class CSRGenerationPipeline:
                         }
                     results.append(res)
 
-        # 统一保存提取数据（保持接口语义）
-        all_extracted_data = [
-            {"paragraph_id": pid, "extracted_data": data}
-            for pid, data in extracted_by_id.items()
-        ]
-        if all_extracted_data:
-            self.save_extracted_data(all_extracted_data)
 
         # 输出错误摘要
         error_summary = error_manager.get_summary()
@@ -759,12 +639,6 @@ class CSRGenerationPipeline:
 
         return results
 
-    def save_extracted_data(self, extracted_data_list: List[Dict[str, Any]]):
-        """
-        保留接口（不再单独落盘文件）。
-        统一由上层流程在一次运行结束时集中保存。
-        """
-        logger.debug("skip saving extracted data to standalone file; unified output manager will handle run summary")
 
     def get_paragraph_list(self) -> List[Dict[str, Any]]:
         """
@@ -815,20 +689,13 @@ class CSRGenerationPipeline:
             包含file_type, chunks_file, source_file等字段的字典，如果找不到则返回None
             返回的字典会保留原始data_item中的extract、original_mode、quote字段
         """
-        import json
-
-        # 新格式：使用datas字段指定文件列表
+        # 使用datas字段指定文件列表
         datas = data_item.get("datas", [])
         if not datas:
-            # 兼容旧格式：使用type字段
-            item_type = data_item.get("type", "")
-            if not item_type:
-                logger.warning("数据项缺少datas或type字段，无法enrichment")
-                return None
-            # 旧逻辑继续往下走
-            return self._enrich_by_type(data_item, item_type)
+            logger.warning("数据项缺少datas字段，无法enrichment")
+            return None
 
-        # 新逻辑：从datas中提取文件名
+        # 从datas中提取文件名
         file_names = []
         for data_obj in datas:
             if isinstance(data_obj, dict):
@@ -1218,7 +1085,7 @@ class CSRGenerationPipeline:
                                 'path': res_path,
                                 'source_file': current_source_file
                             })
-                            logger.info(f"  ✓ 添加资源: {label} -> {full_path.name}")
+                            # logger.info(f"  ✓ 添加资源: {label} -> {full_path.name}")
                         else:
                             logger.warning(f"  ⚠️ 资源文件不存在: {region_path}")
 
@@ -1301,6 +1168,7 @@ class CSRGenerationPipeline:
                 enriched['regions'] = all_regions  # 多个返回数组
 
         logger.info(f"✓ 构建文档结构: {len(chunks_file_list)} 个chunks文件, {len(available_resources)} 个可用资源")
+
         return enriched
 
     def _build_table_structure(self, table_files: List, base_dir: Path, original_data_item: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -1444,135 +1312,6 @@ class CSRGenerationPipeline:
             }
         except Exception as e:
             logger.warning(f"RAGFlow 单文件检索失败: {file_name} - {e}")
-            return None
-
-    def _enrich_by_type(self, data_item: Dict[str, Any], item_type: str) -> Optional[Dict[str, Any]]:
-        """
-        【已废弃】兼容旧逻辑：根据type字段查找
-        
-        ⚠️ 此方法已废弃，请使用datas字段明确指定文件名
-        保留此方法仅为向后兼容，建议迁移到新的datas字段
-        """
-        logger.warning(f"⚠️ 使用了已废弃的type字段匹配逻辑 (type={item_type})，建议改用datas字段")
-        import json
-
-        if not item_type:
-            return None
-
-        # type到file_type的映射（语义匹配）
-        type_mapping = {
-            "方案": ["word", "doc", "docx"],
-            "伦理资料": ["word", "doc", "docx"],
-            "原文": ["word", "doc", "docx"],
-            "pdf": ["pdf"],
-            "excel": ["excel", "xlsx"],
-            "rtf": ["rtf", "excel"]  # RTF转Excel处理
-        }
-
-        # 获取base_data_dir
-        base_dir = Path(getattr(self.data_extractor, 'base_data_dir', 'AAA/Preprocessing'))
-        if not base_dir.exists():
-            logger.warning(f"预处理目录不存在: {base_dir}")
-            return None
-
-        logger.debug(f"正在enrichment type={item_type}, 在目录: {base_dir}")
-
-        # 预先确定expected_file_types（避免未定义错误）
-        expected_file_types = type_mapping.get(item_type, [item_type.lower()])
-
-        # 遍历查找preprocessed.json文件
-        try:
-            candidates = []
-
-            for preprocessed_file in base_dir.rglob('preprocessed.json'):
-                try:
-                    with open(preprocessed_file, 'r', encoding='utf-8') as f:
-                        pp_data = json.load(f)
-
-                    # 检查file_type是否存在
-                    file_type = pp_data.get('file_type')
-                    if not file_type:
-                        continue
-
-                    # 检查file_type是否匹配item_type（expected_file_types已在外层定义）
-                    is_match = False
-                    for expected in expected_file_types:
-                        if expected.lower() in file_type.lower() or file_type.lower() in expected.lower():
-                            is_match = True
-                            break
-
-                    if not is_match:
-                        logger.debug(f"跳过不匹配的文件: file_type={file_type}, 期望={expected_file_types}")
-                        continue
-
-                    # 构建enrichment数据
-                    enriched = {
-                        'file_type': file_type
-                    }
-
-                    # 添加chunks_file（优先structured_chunks_file）
-                    structured_chunks = pp_data.get('processing_info', {}).get('structured_chunks_file')
-                    if structured_chunks:
-                        # 尝试绝对路径
-                        if Path(structured_chunks).exists():
-                            enriched['chunks_file'] = str(Path(structured_chunks).absolute())
-                        else:
-                            # 相对于preprocessed.json的路径
-                            chunks_path = preprocessed_file.parent / structured_chunks
-                            if chunks_path.exists():
-                                enriched['chunks_file'] = str(chunks_path.absolute())
-
-                    # 如果没有structured_chunks_file，尝试chunks_file
-                    if 'chunks_file' not in enriched:
-                        chunks_file = pp_data.get('processing_info', {}).get('chunks_file')
-                        if chunks_file:
-                            if Path(chunks_file).exists():
-                                enriched['chunks_file'] = str(Path(chunks_file).absolute())
-                            else:
-                                chunks_path = preprocessed_file.parent / chunks_file
-                                if chunks_path.exists():
-                                    enriched['chunks_file'] = str(chunks_path.absolute())
-
-                    # 添加source_file
-                    source_file = pp_data.get('source_file')
-                    if source_file:
-                        enriched['source_file'] = source_file
-
-                    # 添加到候选列表
-                    if 'chunks_file' in enriched:
-                        candidates.append((preprocessed_file, enriched, pp_data))
-                        logger.debug(
-                            f"找到匹配的preprocessed.json: {preprocessed_file.parent.name}, file_type={file_type}")
-
-                except Exception as e:
-                    traceback.print_exc()
-                    logger.debug(f"读取preprocessed.json失败 ({preprocessed_file}): {e}")
-                    continue
-
-            # 如果有多个候选，选择最合适的
-            if candidates:
-                # 优先选择文件名包含type关键字的
-                for preprocessed_file, enriched, pp_data in candidates:
-                    source_file = pp_data.get('source_file', '')
-                    if item_type.lower() in source_file.lower():
-                        logger.info(
-                            f"✓ Enrichment成功 (type={item_type}): file_type={enriched['file_type']}, source={Path(source_file).name}")
-                        return enriched
-
-                # 否则返回第一个
-                enriched = candidates[0][1]
-                pp_data = candidates[0][2]
-                logger.info(
-                    f"✓ Enrichment成功 (type={item_type}): file_type={enriched['file_type']}, source={Path(pp_data.get('source_file', '')).name}")
-                return enriched
-
-            # 没找到任何匹配的preprocessed.json
-            logger.warning(f"❌ 未找到匹配的preprocessed.json (type={item_type})，期望file_type: {expected_file_types}")
-            return None
-
-        except Exception as e:
-            traceback.print_exc()
-            logger.error(f"Enrichment过程异常: {e}", exc_info=True)
             return None
 
     def _remove_md_formatting(self,text: str) -> str:
